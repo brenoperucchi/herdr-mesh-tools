@@ -43,6 +43,18 @@ SPACES = [
         ("acervo-rev", "codex", REV_EFFORT),
         ("acervo-rev-2", "claude", ["--model", "opus"]),
     ]),
+    # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
+    # Claude, porque e' o projeto que testa o papel de orquestrador externo.
+    ("claude-bridge", f"{HOME}/.claude-bridge", [
+        ("claude-bridge-exec", "codex", []),
+        ("claude-bridge-rev", "codex", REV_EFFORT),
+        ("claude-bridge-rev-2", "claude", ["--model", "opus"]),
+    ]),
+    ("content-insights-collector", f"{HOME}/Devs/content-insights-collector", [
+        ("content-insights-collector-exec", "claude", []),
+        ("content-insights-collector-rev", "codex", REV_EFFORT),
+        ("content-insights-collector-rev-2", "claude", ["--model", "opus"]),
+    ]),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem "-exec" de proposito: a sessao interativa do
     # humano aqui e' o executor, nao um agent bootstrapado - so os revisores
@@ -106,7 +118,7 @@ def main():
             if DRY:
                 continue
             ws_id = res["workspace"]["workspace_id"]
-            panes_by_ws[ws_id] = [res["workspace"]["root_pane"]["pane_id"]]
+            panes_by_ws[ws_id] = [res["root_pane"]["pane_id"]]
         else:
             ws_id = ws["workspace_id"]
             print(f"space {label}: já existe ({ws_id})")
@@ -120,7 +132,7 @@ def main():
             res = run("pane", "split", panes[-1], "--direction", direction)
             if DRY:
                 break
-            panes.append(res["pane_info"]["pane_id"])
+            panes.append(res["pane"]["pane_id"])
 
         for pane_id, (name, kind, extra_args) in zip(panes, agents):
             if pane_id in busy:
