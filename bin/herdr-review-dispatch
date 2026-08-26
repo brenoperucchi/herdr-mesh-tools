@@ -272,6 +272,51 @@ def get_agent_info(name):
     return api("agent", "get", name)["agent"]
 
 
+def wait_for_settle(target_names, dispatch_info, timeout_s):
+    """Espera cada agent em target_names assentar (idle/done) após seu
+    dispatch, ou ficar 'blocked' de verdade — sustentado por BLOCKED_GRACE_S,
+    não no primeiro poll (senão um blip transitório, ex: ruído de MCP
+    subindo, seria confundido com bloqueio real). Sem transição nenhuma até o
+    timeout, reporta 'timeout'.
+
+    Concorrente entre os agents de target_names (mesmo loop, mesmo tick) —
+    um agent lento ou travado não atrasa a detecção dos outros.
+
+    Retorna (result, settle_ts): dicts nome -> status ("idle"/"done"/
+    "blocked"/"timeout") e nome -> timestamp ISO de quando assentou.
+    """
+    deadline = time.time() + timeout_s
+    result = {name: None for name in target_names}
+    settle_ts = {}
+    last_seen = dict(result)
+    blocked_since = dict.fromkeys(result)
+    while time.time() < deadline and any(v is None for v in result.values()):
+        for name in list(result):
+            if result[name] is not None:
+                continue
+            info = api("agent", "get", name)["agent"]
+            last_seen[name] = info["agent_status"]
+            changed = info["state_change_seq"] != dispatch_info[name]["seq_before"]
+            if changed and info["agent_status"] in ("idle", "done"):
+                result[name] = info["agent_status"]
+                settle_ts[name] = now_iso()
+            elif changed and info["agent_status"] == "blocked":
+                if blocked_since[name] is None:
+                    blocked_since[name] = time.time()
+                elif time.time() - blocked_since[name] >= BLOCKED_GRACE_S:
+                    result[name] = "blocked"
+                    settle_ts[name] = now_iso()
+            else:
+                blocked_since[name] = None
+        if any(v is None for v in result.values()):
+            time.sleep(2)
+    for name in result:
+        if result[name] is None:
+            result[name] = "blocked" if last_seen.get(name) == "blocked" else "timeout"
+            settle_ts[name] = now_iso()
+    return result, settle_ts
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
@@ -399,37 +444,8 @@ def main():
         print("erro: nenhum revisor recebeu o prompt — nada foi disparado", file=sys.stderr)
         sys.exit(1)
 
-    deadline = time.time() + args.timeout
-    result = {name: None for name in target_names if dispatched[name]}
-    settle_ts = {}
-    last_seen = dict(result)
-    blocked_since = dict.fromkeys(result)
-    while time.time() < deadline and any(v is None for v in result.values()):
-        for name in list(result):
-            if result[name] is not None:
-                continue
-            info = api("agent", "get", name)["agent"]
-            last_seen[name] = info["agent_status"]
-            changed = info["state_change_seq"] != dispatch_info[name]["seq_before"]
-            if changed and info["agent_status"] in ("idle", "done"):
-                result[name] = info["agent_status"]
-                settle_ts[name] = now_iso()
-            elif changed and info["agent_status"] == "blocked":
-                # sustentado, nao transitorio (ex: ruido de MCP subindo) -> nao
-                # espera o --timeout inteiro pra reportar, so a folga de graca
-                if blocked_since[name] is None:
-                    blocked_since[name] = time.time()
-                elif time.time() - blocked_since[name] >= BLOCKED_GRACE_S:
-                    result[name] = "blocked"
-                    settle_ts[name] = now_iso()
-            else:
-                blocked_since[name] = None
-        if any(v is None for v in result.values()):
-            time.sleep(2)
-    for name in result:
-        if result[name] is None:
-            result[name] = "blocked" if last_seen.get(name) == "blocked" else "timeout"
-            settle_ts[name] = now_iso()
+    active_names = [name for name in target_names if dispatched[name]]
+    result, settle_ts = wait_for_settle(active_names, dispatch_info, args.timeout)
 
     print("\nresultado da rodada:")
     ok_count = 0

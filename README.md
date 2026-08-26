@@ -39,6 +39,18 @@ Claude Code / Codex skills (shared via symlink into `~/.claude/skills/` and
   (CONFIRMED/UNIQUE/CONFLICT) for the review cycle, capped at 2 rounds.
 - **`herdr-swap`** — the executor-swap protocol with context handoff.
 
+## `tests/`
+
+Regression tests for the settle logic shared by `herdr-review-dispatch` and
+`herdr-swap-exec` (sustained-`blocked` vs. transient blip vs. real timeout) —
+this loop has already regressed once by being "fixed" in a way that
+over-corrected, so the scenarios are checked mechanically instead of
+re-derived by hand each time:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Project context
 
 Each real project using this cycle keeps its own `.herdr/reviewer.md`
