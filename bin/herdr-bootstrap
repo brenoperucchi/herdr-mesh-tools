@@ -33,7 +33,7 @@ SPACES = [
         ("omabackup-rev", "codex", REV_EFFORT),
         ("omabackup-rev-2", "claude", ["--model", "opus"]),
     ]),
-    ("MFC", f"{HOME}/Devs/miqueias/MFC", [
+    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), [
         ("mfc-exec", "claude", []),
         ("mfc-rev", "codex", REV_EFFORT),
         ("mfc-rev-2", "claude", ["--model", "opus"]),
