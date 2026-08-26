@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""herdr-ask <slug> — dispara uma consulta de design cega e paralela pros dois
+revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr. Mesma mecânica do
+herdr-review-dispatch (isolamento por diretório, congelamento de contexto,
+`agent prompt --wait` concorrente), formato de resposta diferente: não é bug
+hunt, não tem achado atômico P0-P3 nem APPROVE — é uma pergunta de design
+aberta, e a resposta é uma posição com premissas explícitas.
+
+Uso:
+  herdr-ask <slug> --question-file pergunta.md
+  herdr-ask <slug> --question-file pergunta.md --context /caminho/a /caminho/b
+  herdr-ask <slug> --question-file pergunta.md --reviewer rev   # só 1 consultor
+
+Grava em .herdr/ask/<slug>-<N>/ — namespace separado de .herdr/review/, pra
+não colidir a numeração de rodada com o encadeamento de --verify do
+herdr-review-dispatch.
+
+Sai com 0 só se todos os consultores despachados produziram resposta não
+vazia. Qualquer BLOCKED/TIMEOUT/resposta ausente sai com 1.
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+now_iso = core.now_iso
+agent_status = core.agent_status
+agent_status_safe = core.agent_status_safe
+agent_cwd = core.agent_cwd
+get_agent_info = core.get_agent_info
+freeze_files = core.freeze_files
+dispatch_and_wait_all = core.dispatch_and_wait_all
+
+ISOLATION_NOTE = """
+Esta consulta é CEGA: outro consultor está respondendo à MESMA pergunta ao
+mesmo tempo, num diretório irmão deste (`{sibling_dir}`). A ÚNICA coisa
+proibida é esse diretório irmão especificamente: não abra
+`{sibling_dir}/answer.md` nem liste `{sibling_dir}/`, nem antes nem depois de
+escrever a sua — mesmo que você termine depois e a resposta dele já exista,
+ler antes de escrever a sua invalida a consulta inteira, mesmo sem copiar
+nada. Fora desse diretório específico, não há restrição de leitura.
+"""
+
+ASK_PROTOCOL = """# Consulta de design (herdr ask)
+
+Você é um consultor independente. Leia a pergunta abaixo e o contexto (se
+houver) — leia à vontade qualquer coisa que seja material da própria
+consulta (a pergunta, os arquivos de contexto, o request.md, qualquer
+arquivo do projeto sendo discutido). Escreva sua resposta em `answer.md`,
+dentro desta mesma pasta (`{verdict_dir}`), e SÓ escreva nesse arquivo — não
+edite nada além dele.
+{isolation_note}
+Isso NÃO é um bug hunt — não há severidade P0-P3 nem "APPROVE". É uma
+pergunta de design aberta. Estruture sua resposta assim:
+
+1. **A decisão** — sua posição, em uma frase.
+2. **As premissas** (2-3) que sustentam essa decisão, explicitamente
+   rotuladas: "se X for falso, minha resposta muda". Isso é o que torna duas
+   respostas divergentes reconciliáveis depois — sem premissas explícitas,
+   "discordamos de verdade" e "concordamos por motivos opostos" ficam
+   indistinguíveis.
+3. **O argumento** — pode discordar de uma sub-pergunta específica se houver
+   mais de uma, pode dizer "não vale a pena", pode ter baixa confiança — diga
+   isso explicitamente em vez de forçar uma posição.
+
+{context_instruction}
+"""
+
+
+def load_invariants(cwd):
+    reviewer_md_path = os.path.join(cwd, ".herdr", "reviewer.md")
+    if os.path.isfile(reviewer_md_path):
+        with open(reviewer_md_path) as f:
+            return f.read()
+    return None
+
+
+def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapshot_map):
+    if context_files:
+        listing = "\n".join(f"- `{snapshot_map[f]}` (original: `{f}`)" for f in context_files)
+        context_instruction = (
+            f"## Contexto\n\nCongelado no disparo desta consulta — leia a partir "
+            f"da cópia abaixo, não do path original (pode ter mudado desde o "
+            f"disparo):\n\n{listing}"
+        )
+    else:
+        context_instruction = ""
+
+    invariants = load_invariants(cwd)
+    invariants_section = f"\n## Invariantes do projeto\n\n{invariants}\n" if invariants else ""
+
+    isolation_note = ISOLATION_NOTE.format(sibling_dir=sibling_dir) if sibling_dir else ""
+
+    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction)}
+{invariants_section}
+## Pergunta
+
+{question}
+"""
+    with open(os.path.join(verdict_dir, "request.md"), "w") as f:
+        f.write(content)
+
+
+def prompt_text(verdict_dir):
+    return (
+        f"Leia {verdict_dir}/request.md e siga o protocolo nele. O único arquivo "
+        f"que você deve escrever é {verdict_dir}/answer.md — as regras de "
+        f"leitura estão no request.md."
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("slug")
+    ap.add_argument("--question-file", required=True, help="arquivo com a pergunta de design (markdown, pode ser longo)")
+    ap.add_argument("--context", nargs="+", default=None, help="arquivos de contexto — congelados no disparo, como --files do herdr-review-dispatch")
+    ap.add_argument("--reviewer", choices=["rev", "rev-2"], default=None, help="consulta só 1 (default: os dois)")
+    ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por consultor (default 1200)")
+    args = ap.parse_args()
+
+    if os.environ.get("HERDR_ENV") != "1":
+        print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.isfile(args.question_file):
+        print(f"erro: arquivo de pergunta não encontrado: {args.question_file}", file=sys.stderr)
+        sys.exit(2)
+    with open(args.question_file) as f:
+        question = f.read()
+
+    context_files = None
+    if args.context:
+        context_files = [os.path.abspath(f) for f in args.context]
+        for f in context_files:
+            if not os.path.isfile(f):
+                print(f"erro: arquivo de contexto não encontrado: {f}", file=sys.stderr)
+                sys.exit(2)
+
+    rev_name = f"{args.slug}-rev"
+    rev2_name = f"{args.slug}-rev-2"
+    target_names = [f"{args.slug}-{args.reviewer}"] if args.reviewer else [rev_name, rev2_name]
+
+    for name in target_names:
+        try:
+            status = agent_status(name)
+        except RuntimeError as exc:
+            print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
+            sys.exit(1)
+        if status not in ("idle", "done"):
+            print(f"erro: '{name}' está '{status}' — não vou disparar em cima de working/blocked", file=sys.stderr)
+            sys.exit(1)
+
+    cwd = agent_cwd(f"{args.slug}-exec") if agent_status_safe(f"{args.slug}-exec") else agent_cwd(target_names[0])
+    round_dir, n = core.next_round_dir(cwd, args.slug, namespace="ask")
+    print(f"consulta {n}: {round_dir}")
+
+    verdict_dirs = {}
+    for name in target_names:
+        verdict_dirs[name] = os.path.join(round_dir, name)
+        os.makedirs(verdict_dirs[name])
+
+    def sibling_dir_for(name):
+        other = rev2_name if name == rev_name else rev_name
+        return verdict_dirs.get(other)  # None se for consulta a 1 consultor só
+
+    try:
+        snapshot_map = {}
+        if context_files:
+            snapshot_map = freeze_files(context_files, round_dir)
+            print(f"{len(context_files)} arquivo(s) de contexto congelado(s) em {round_dir}/_snapshot/")
+
+        for name in target_names:
+            write_request(cwd, verdict_dirs[name], sibling_dir_for(name), question, context_files, snapshot_map)
+        print(f"request.md escrito pr{'o' if len(target_names) == 1 else 'os'} {'consultor' if len(target_names) == 1 else 'dois'}")
+    except (RuntimeError, OSError) as exc:
+        print(f"erro preparando a consulta: {exc}", file=sys.stderr)
+        shutil.rmtree(round_dir, ignore_errors=True)
+        sys.exit(1)
+
+    verb = "disparando" if len(target_names) > 1 else "disparando (consultor único)"
+    print(f"{verb} {', '.join(target_names)}...")
+    dispatch_ts = {name: now_iso() for name in target_names}
+    pre_info = {}
+    dispatched = {}
+    for name in target_names:
+        try:
+            pre_info[name] = get_agent_info(name)
+            dispatched[name] = True
+        except RuntimeError as exc:
+            print(f"  aviso: falha checando '{name}' antes de disparar: {exc}", file=sys.stderr)
+            dispatched[name] = False
+
+    if not any(dispatched.values()):
+        print("erro: nenhum consultor disponível — nada foi disparado", file=sys.stderr)
+        sys.exit(1)
+
+    active_names = [name for name in target_names if dispatched[name]]
+    dispatch_info = {
+        name: {
+            "kind": pre_info[name]["agent"],
+            "agent_session": (pre_info[name].get("agent_session") or {}).get("value"),
+            "dispatch_ts": dispatch_ts[name],
+        }
+        for name in active_names
+    }
+    prompts = {name: prompt_text(verdict_dirs[name]) for name in active_names}
+    result, wait_info, settle_ts = dispatch_and_wait_all(prompts, args.timeout)
+
+    print("\nresultado da consulta:")
+    ok_count = 0
+    metrics = {
+        "round_dir": round_dir,
+        "slug": args.slug,
+        "mode": "ask",
+        "question_file": os.path.abspath(args.question_file),
+        "context_files": context_files or [],
+        "reviewers": {},
+    }
+    for name in target_names:
+        if not dispatched.get(name):
+            print(f"  {name}: não disparado (veja aviso acima)")
+            metrics["reviewers"][name] = {"dispatched": False}
+            continue
+        status = result[name]
+        answer_path = os.path.join(verdict_dirs[name], "answer.md")
+        size = os.path.getsize(answer_path) if os.path.isfile(answer_path) else 0
+        di = dispatch_info[name]
+        metrics["reviewers"][name] = {
+            "dispatched": True,
+            "kind": di["kind"],
+            "agent_session": di["agent_session"],
+            "dispatch_ts": di["dispatch_ts"],
+            "settle_ts": settle_ts.get(name),
+            "status": status,
+            "answer_bytes": size,
+        }
+        if status == "blocked":
+            print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem answer.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
+        elif status == "timeout":
+            print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é resposta" + (f" (answer.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "stalled":
+            print(f"  {name}: STALLED — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado")
+        elif status == "error":
+            print(f"  {name}: ERRO esperando assentar ({wait_info.get(name)})")
+        elif size == 0:
+            print(f"  {name}: {status}, mas answer.md {'não existe' if not os.path.isfile(answer_path) else 'está vazio'} — falha operacional")
+        else:
+            print(f"  {name}: {status}, resposta em {answer_path} ({size}b)")
+            ok_count += 1
+
+    with open(os.path.join(round_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"\nround dir: {round_dir}")
+    sys.exit(0 if ok_count == len(target_names) else 1)
+
+
+if __name__ == "__main__":
+    main()
