@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for the blocked-vs-transient settle logic shared by
-herdr-review-dispatch (wait_for_settle, multi-agent) and herdr-swap-exec
-(dispatch_and_wait, single-agent via `agent prompt --wait`).
+herdr-review-dispatch (dispatch_and_wait_all, N concurrent agents) and
+herdr-swap-exec (dispatch_and_wait, single agent) — both via native
+`agent prompt --wait`, one `herdr` subprocess per agent.
 
 These formalize the ad-hoc simulations used to validate BLOCKED_GRACE_S so
 the same scenarios are checked on every change instead of re-derived by hand
@@ -46,8 +47,9 @@ class FakeClock:
         self.t += seconds
 
 
-class WaitForSettleTests(unittest.TestCase):
-    """herdr-review-dispatch: wait_for_settle(), multi-agent concurrent."""
+class DispatchAndWaitAllTests(unittest.TestCase):
+    """herdr-review-dispatch: dispatch_and_wait_all(), N agentes concorrentes
+    via `agent prompt --wait` (um subprocesso por nome)."""
 
     def setUp(self):
         self.mod = _load("herdr-review-dispatch")
@@ -60,53 +62,75 @@ class WaitForSettleTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     @staticmethod
-    def _dispatch_info(seqs):
-        return {name: {"seq_before": seq} for name, seq in seqs.items()}
+    def _never_exits_proc():
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.communicate.return_value = ("", "")
+        return proc
+
+    @staticmethod
+    def _settles_proc(status="idle"):
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        proc.communicate.return_value = (json.dumps({"result": {"agent": {"agent_status": status}}}), "")
+        return proc
+
+    def _popen_by_name(self, procs_by_name):
+        def _side_effect(args, **kwargs):
+            name = args[3]  # [HERDR, "agent", "prompt", name, text, ...]
+            return procs_by_name[name]
+        return _side_effect
 
     def test_sustained_blocked_reports_early_not_full_timeout(self):
-        dispatch_info = self._dispatch_info({"rev": 5})
-        fake_api = mock.Mock(return_value={"agent": {"agent_status": "blocked", "state_change_seq": 6}})
-        with mock.patch.object(self.mod, "api", fake_api):
-            result, settle_ts = self.mod.wait_for_settle(["rev"], dispatch_info, timeout_s=1200)
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name({"rev": self._never_exits_proc()})), \
+             mock.patch.object(self.mod, "get_agent_info", return_value={"agent_status": "blocked"}):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "prompt"}, timeout_s=1200)
         self.assertEqual(result["rev"], "blocked")
         self.assertIn("rev", settle_ts)
         self.assertGreaterEqual(self.clock.t, self.mod.BLOCKED_GRACE_S)
         self.assertLess(self.clock.t, 1200, "bloqueio sustentado nao deveria esperar o --timeout inteiro")
 
     def test_transient_blip_settles_normally_not_blocked(self):
-        dispatch_info = self._dispatch_info({"rev": 5})
-        statuses = iter([
-            {"agent_status": "blocked", "state_change_seq": 6},
-            {"agent_status": "working", "state_change_seq": 6},
-            {"agent_status": "idle", "state_change_seq": 7},
-        ])
-        fake_api = mock.Mock(side_effect=lambda *a: {"agent": next(statuses)})
-        with mock.patch.object(self.mod, "api", fake_api):
-            result, _ = self.mod.wait_for_settle(["rev"], dispatch_info, timeout_s=1200)
+        proc = mock.Mock()
+        proc.poll.side_effect = [None, None, None, 0]
+        proc.communicate.return_value = (json.dumps({"result": {"agent": {"agent_status": "idle"}}}), "")
+        statuses = iter(["blocked", "working", "working", "working"])
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name({"rev": proc})), \
+             mock.patch.object(self.mod, "get_agent_info", side_effect=lambda name: {"agent_status": next(statuses, "working")}):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "prompt"}, timeout_s=1200)
         self.assertEqual(result["rev"], "idle", "blip transitorio nao deveria ser reportado como blocked")
 
     def test_real_timeout_when_nothing_settles(self):
-        dispatch_info = self._dispatch_info({"rev": 5})
-        fake_api = mock.Mock(return_value={"agent": {"agent_status": "working", "state_change_seq": 5}})
-        with mock.patch.object(self.mod, "api", fake_api):
-            result, _ = self.mod.wait_for_settle(["rev"], dispatch_info, timeout_s=60)
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name({"rev": self._never_exits_proc()})), \
+             mock.patch.object(self.mod, "get_agent_info", return_value={"agent_status": "working"}):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "prompt"}, timeout_s=60)
         self.assertEqual(result["rev"], "timeout")
         self.assertAlmostEqual(self.clock.t, 60, delta=3)
 
     def test_two_agents_one_stuck_one_settles_independently(self):
-        dispatch_info = self._dispatch_info({"rev": 5, "rev2": 9})
-
-        def fake_api(*args):
-            name = args[2]
-            if name == "rev":
-                return {"agent": {"agent_status": "blocked", "state_change_seq": 6}}
-            return {"agent": {"agent_status": "idle", "state_change_seq": 10}}
-
-        with mock.patch.object(self.mod, "api", fake_api):
-            result, _ = self.mod.wait_for_settle(["rev", "rev2"], dispatch_info, timeout_s=1200)
+        procs = {"rev": self._never_exits_proc(), "rev2": self._settles_proc("idle")}
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name(procs)), \
+             mock.patch.object(self.mod, "get_agent_info", side_effect=lambda name: {"agent_status": "blocked" if name == "rev" else "idle"}):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "p1", "rev2": "p2"}, timeout_s=1200)
         self.assertEqual(result["rev"], "blocked")
         self.assertEqual(result["rev2"], "idle")
         self.assertLess(self.clock.t, 1200, "um agent travado nao deveria atrasar a detecao do outro")
+
+    def test_agent_blocked_on_submission_is_reported_as_blocked(self):
+        proc = mock.Mock()
+        proc.poll.return_value = 1
+        proc.communicate.return_value = (json.dumps({"error": {"code": "agent_blocked", "message": "..."}}), "")
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name({"rev": proc})):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "prompt"}, timeout_s=60)
+        self.assertEqual(result["rev"], "blocked")
+
+    def test_prompt_stalled_is_reported_distinctly_from_timeout(self):
+        proc = mock.Mock()
+        proc.poll.return_value = 1
+        proc.communicate.return_value = (json.dumps({"error": {"code": "agent_prompt_stalled", "message": "no change"}}), "")
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=self._popen_by_name({"rev": proc})):
+            result, info, settle_ts = self.mod.dispatch_and_wait_all({"rev": "prompt"}, timeout_s=60)
+        self.assertEqual(result["rev"], "stalled")
 
 
 class DispatchAndWaitTests(unittest.TestCase):

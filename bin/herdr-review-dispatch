@@ -251,70 +251,108 @@ def write_request_files(cwd, verdict_dir, sibling_dir, description, files, snaps
         f.write(content)
 
 
-def dispatch(name, verdict_dir):
-    prompt = (
+def prompt_text(verdict_dir):
+    return (
         f"Leia {verdict_dir}/request.md e siga o protocolo nele. O único arquivo "
         f"que você deve escrever é {verdict_dir}/verdict.md — as regras de "
         f"leitura estão no request.md."
     )
-    info_before = get_agent_info(name)
-    dispatch_ts = now_iso()
-    api("agent", "prompt", name, prompt)
-    return {
-        "seq_before": info_before["state_change_seq"],
-        "kind": info_before["agent"],
-        "agent_session": (info_before.get("agent_session") or {}).get("value"),
-        "dispatch_ts": dispatch_ts,
-    }
 
 
 def get_agent_info(name):
     return api("agent", "get", name)["agent"]
 
 
-def wait_for_settle(target_names, dispatch_info, timeout_s):
-    """Espera cada agent em target_names assentar (idle/done) após seu
-    dispatch, ou ficar 'blocked' de verdade — sustentado por BLOCKED_GRACE_S,
-    não no primeiro poll (senão um blip transitório, ex: ruído de MCP
-    subindo, seria confundido com bloqueio real). Sem transição nenhuma até o
-    timeout, reporta 'timeout'.
+def dispatch_and_wait_all(prompts, timeout_s):
+    """Manda o prompt e espera cada agent assentar (idle/done) via
+    `agent prompt --wait`, um subprocesso concorrente por nome — um agent
+    lento ou travado não atrasa a detecção dos outros. Ancorado na submissão,
+    ao contrário de `agent wait` sozinho, que casa o estado JÁ atual na hora
+    da chamada, não uma transição depois do prompt (confirmado ao vivo, ver
+    herdr-swap-exec: retornou em ~5ms num agent que só estava idle de antes).
 
-    Concorrente entre os agents de target_names (mesmo loop, mesmo tick) —
-    um agent lento ou travado não atrasa a detecção dos outros.
+    `blocked` fica de propósito fora do --until: um blip transitório não bate
+    o alvo e a espera nativa continua através dele, sem grace period manual.
+    Um watchdog em paralelo, por agent, cobre o caso sustentado
+    (BLOCKED_GRACE_S) e mata o processo correspondente se achar blocked
+    contínuo, sem esperar o --timeout inteiro.
 
-    Retorna (result, settle_ts): dicts nome -> status ("idle"/"done"/
-    "blocked"/"timeout") e nome -> timestamp ISO de quando assentou.
+    prompts: dict nome -> texto do prompt.
+    Retorna (result, info, settle_ts): dicts nome -> status ("idle"/"done"/
+    "blocked"/"timeout"/"stalled"/"error"); nome -> dict do agent quando
+    disponível, senão uma mensagem (str) ou None; nome -> timestamp ISO de
+    quando resolveu.
     """
     deadline = time.time() + timeout_s
-    result = {name: None for name in target_names}
+    procs = {
+        name: subprocess.Popen(
+            [HERDR, "agent", "prompt", name, text,
+             "--wait", "--until", "idle", "--until", "done",
+             "--timeout", str(timeout_s * 1000)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for name, text in prompts.items()
+    }
+    result = {name: None for name in procs}
+    info = {}
     settle_ts = {}
-    last_seen = dict(result)
-    blocked_since = dict.fromkeys(result)
-    while time.time() < deadline and any(v is None for v in result.values()):
-        for name in list(result):
+    blocked_since = dict.fromkeys(procs)
+
+    def finish(name, status, detail):
+        result[name] = status
+        info[name] = detail
+        settle_ts[name] = now_iso()
+
+    while any(v is None for v in result.values()):
+        for name, proc in procs.items():
             if result[name] is not None:
                 continue
-            info = api("agent", "get", name)["agent"]
-            last_seen[name] = info["agent_status"]
-            changed = info["state_change_seq"] != dispatch_info[name]["seq_before"]
-            if changed and info["agent_status"] in ("idle", "done"):
-                result[name] = info["agent_status"]
-                settle_ts[name] = now_iso()
-            elif changed and info["agent_status"] == "blocked":
+            ret = proc.poll()
+            if ret is not None:
+                out, err = proc.communicate()
+                if ret == 0:
+                    try:
+                        agent_info = json.loads(out)["result"]["agent"]
+                        finish(name, agent_info["agent_status"], agent_info)
+                    except (json.JSONDecodeError, KeyError):
+                        finish(name, "error", (out or err).strip())
+                    continue
+                try:
+                    payload = json.loads(out or err)
+                    code = payload.get("error", {}).get("code")
+                    message = payload.get("error", {}).get("message", "")
+                except json.JSONDecodeError:
+                    code, message = None, (out or err).strip()
+                if code == "agent_blocked":
+                    finish(name, "blocked", message)
+                elif code == "timeout":
+                    finish(name, "timeout", message)
+                elif code == "agent_prompt_stalled":
+                    finish(name, "stalled", message)
+                else:
+                    finish(name, "error", message or f"exit {ret}")
+                continue
+            if time.time() >= deadline:
+                proc.kill()
+                proc.wait()
+                finish(name, "timeout", None)
+                continue
+            try:
+                agent_info = get_agent_info(name)
+            except RuntimeError:
+                agent_info = None
+            if agent_info and agent_info["agent_status"] == "blocked":
                 if blocked_since[name] is None:
                     blocked_since[name] = time.time()
                 elif time.time() - blocked_since[name] >= BLOCKED_GRACE_S:
-                    result[name] = "blocked"
-                    settle_ts[name] = now_iso()
+                    proc.kill()
+                    proc.wait()
+                    finish(name, "blocked", agent_info)
             else:
                 blocked_since[name] = None
         if any(v is None for v in result.values()):
             time.sleep(2)
-    for name in result:
-        if result[name] is None:
-            result[name] = "blocked" if last_seen.get(name) == "blocked" else "timeout"
-            settle_ts[name] = now_iso()
-    return result, settle_ts
+    return result, info, settle_ts
 
 
 def main():
@@ -430,22 +468,32 @@ def main():
 
     verb = "disparando" if len(target_names) > 1 else "disparando (verificação, revisor único)"
     print(f"{verb} {', '.join(target_names)}...")
-    dispatch_info = {}
+    dispatch_ts = {name: now_iso() for name in target_names}
+    pre_info = {}
     dispatched = {}
     for name in target_names:
         try:
-            dispatch_info[name] = dispatch(name, verdict_dirs[name])
+            pre_info[name] = get_agent_info(name)
             dispatched[name] = True
         except RuntimeError as exc:
-            print(f"  aviso: falha disparando pra {name}: {exc}", file=sys.stderr)
+            print(f"  aviso: falha checando '{name}' antes de disparar: {exc}", file=sys.stderr)
             dispatched[name] = False
 
     if not any(dispatched.values()):
-        print("erro: nenhum revisor recebeu o prompt — nada foi disparado", file=sys.stderr)
+        print("erro: nenhum revisor disponível — nada foi disparado", file=sys.stderr)
         sys.exit(1)
 
     active_names = [name for name in target_names if dispatched[name]]
-    result, settle_ts = wait_for_settle(active_names, dispatch_info, args.timeout)
+    dispatch_info = {
+        name: {
+            "kind": pre_info[name]["agent"],
+            "agent_session": (pre_info[name].get("agent_session") or {}).get("value"),
+            "dispatch_ts": dispatch_ts[name],
+        }
+        for name in active_names
+    }
+    prompts = {name: prompt_text(verdict_dirs[name]) for name in active_names}
+    result, wait_info, settle_ts = dispatch_and_wait_all(prompts, args.timeout)
 
     print("\nresultado da rodada:")
     ok_count = 0
@@ -480,6 +528,10 @@ def main():
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem verdict.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é veredito" + (f" (verdict.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "stalled":
+            print(f"  {name}: STALLED — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado")
+        elif status == "error":
+            print(f"  {name}: ERRO esperando assentar ({wait_info.get(name)})")
         elif size == 0:
             print(f"  {name}: {status}, mas verdict.md {'não existe' if not os.path.isfile(verdict_path) else 'está vazio'} — falha operacional")
         else:
