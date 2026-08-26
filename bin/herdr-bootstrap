@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""herdr-bootstrap — garante spaces, panes e agents do ambiente de trabalho.
+
+Idempotente: só cria o que falta e só inicia agent em pane que ainda não tem.
+Uso: herdr-bootstrap [--dry-run]
+"""
+import json
+import os
+import subprocess
+import sys
+
+HERDR = os.path.expanduser("~/.local/bin/herdr")
+HOME = os.path.expanduser("~")
+DRY = "--dry-run" in sys.argv
+
+# label -> (cwd, [(nome_do_agent, kind, extra_args), ...])
+# Layout: pane 1 = exec (esquerda, altura toda); pane 2 = rev (split right);
+# pane 3 = rev-2 (split down a partir do pane 2, empilhado sob o rev).
+#
+# Effort dos revisores (2026-08-26, achado da revisao de eficiencia de token):
+# ate aqui "-rev" subia em gpt-5.6-luna "max" so porque era o default global
+# do ~/.codex/config.toml - nunca foi decisao, e os dois revisores (Codex e
+# Opus, cegos entre si) bateram na mesma critica: dois revisores no teto e'
+# redundancia cara. REV_EFFORT torna isso explicito e um degrau abaixo de
+# "max", mantendo "-rev-2" (Opus, ja deliberadamente --model opus) como a
+# lente cara. Sem dado suficiente ainda pra ir mais longe que isso (ver
+# metrics.json / artifact "Ciclo de Revisao").
+REV_EFFORT = ["-c", "model_reasoning_effort=high"]
+
+SPACES = [
+    ("omabackup", f"{HOME}/Devs/omabackup", [
+        ("omabackup-exec", "claude", []),
+        ("omabackup-rev", "codex", REV_EFFORT),
+        ("omabackup-rev-2", "claude", ["--model", "opus"]),
+    ]),
+    ("MFC", f"{HOME}/Devs/miqueias/MFC", [
+        ("mfc-exec", "claude", []),
+        ("mfc-rev", "codex", REV_EFFORT),
+        ("mfc-rev-2", "claude", ["--model", "opus"]),
+    ]),
+    ("acervo", f"{HOME}/Devs/acervo", [
+        ("acervo-exec", "claude", []),
+        ("acervo-rev", "codex", REV_EFFORT),
+        ("acervo-rev-2", "claude", ["--model", "opus"]),
+    ]),
+    # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
+    # tipo de trabalho). Sem "-exec" de proposito: a sessao interativa do
+    # humano aqui e' o executor, nao um agent bootstrapado - so os revisores
+    # sao geridos por este script.
+    ("herdr", HOME, [
+        ("herdr-rev", "codex", REV_EFFORT),
+        ("herdr-rev-2", "claude", ["--model", "opus"]),
+    ]),
+]
+
+
+def api(*args):
+    out = subprocess.run([HERDR, *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
+    return json.loads(out.stdout)["result"]
+
+
+def run(*args):
+    if DRY:
+        print(f"  [dry-run] herdr {' '.join(args)}")
+        return None
+    return api(*args)
+
+
+def ensure_notify_watchers():
+    """Arma um herdr-notify-watch pra cada agent '*-exec' vivo.
+
+    Nao checa se ja tem um rodando por fora (pgrep e' fragil e ja duplicou
+    processo antes) - o proprio herdr-notify-watch se tranca com flock, entao
+    chamar aqui de novo mesmo com um watch ja vivo e' seguro: a instancia nova
+    detecta o lock e sai sozinha sem duplicar.
+    """
+    watch_bin = os.path.expanduser("~/.local/bin/herdr-notify-watch")
+    for a in api("agent", "list")["agents"]:
+        name = a.get("name", "")
+        if not name.endswith("-exec"):
+            continue
+        print(f"  notify-watch {name}: armando (flock evita duplicar)")
+        if DRY:
+            continue
+        subprocess.Popen(
+            [watch_bin, name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def main():
+    workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
+    panes_by_ws = {}
+    for p in api("pane", "list")["panes"]:
+        panes_by_ws.setdefault(p["workspace_id"], []).append(p["pane_id"])
+    busy = {a["pane_id"] for a in api("agent", "list")["agents"]}
+
+    for label, cwd, agents in SPACES:
+        ws = workspaces.get(label)
+        if ws is None:
+            print(f"space {label}: criando (cwd={cwd})")
+            res = run("workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")
+            if DRY:
+                continue
+            ws_id = res["workspace"]["workspace_id"]
+            panes_by_ws[ws_id] = [res["workspace"]["root_pane"]["pane_id"]]
+        else:
+            ws_id = ws["workspace_id"]
+            print(f"space {label}: já existe ({ws_id})")
+
+        panes = panes_by_ws.get(ws_id, [])
+        while len(panes) < len(agents):
+            # 1o pane extra abre a direita (wide->right); os seguintes empilham
+            # para baixo a partir do ultimo, para nao virar colunas apertadas.
+            direction = "right" if len(panes) == 1 else "down"
+            print(f"  split ({direction}): {label} precisa de {len(agents)} panes, tem {len(panes)}")
+            res = run("pane", "split", panes[-1], "--direction", direction)
+            if DRY:
+                break
+            panes.append(res["pane_info"]["pane_id"])
+
+        for pane_id, (name, kind, extra_args) in zip(panes, agents):
+            if pane_id in busy:
+                print(f"  {pane_id}: já tem agent, pulando")
+                continue
+            print(f"  {pane_id}: iniciando {kind} como '{name}'" + (f" ({' '.join(extra_args)})" if extra_args else ""))
+            try:
+                args = ["agent", "start", name, "--kind", kind, "--pane", pane_id]
+                if extra_args:
+                    args += ["--", *extra_args]
+                run(*args)
+            except RuntimeError as exc:
+                # agent_not_ready = subiu mas parou num prompt (ex: trust do diretorio).
+                # Nao e falha: segue para os proximos panes.
+                if "agent_not_ready" in str(exc):
+                    print(f"  {pane_id}: {name} subiu mas aguarda input humano")
+                else:
+                    raise
+
+    ensure_notify_watchers()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""herdr-review-dispatch <slug> — despacha uma rodada de revisão cega e paralela
+pros dois revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr.
+
+Congela o diff atual em .herdr/review/<slug>-<N>/, escreve o request.md (protocolo
++ .herdr/reviewer.md do projeto + descrição), manda o MESMO texto pros dois
+revisores em paralelo, espera os dois assentarem (idle/done — sempre uma
+TRANSICAO nova, nunca reaproveita estado antigo) e reporta onde ficaram os
+vereditos.
+
+Uso:
+  herdr-review-dispatch <slug> --description "o que foi feito e por que"
+  herdr-review-dispatch <slug> --description-file /caminho/desc.md
+  herdr-review-dispatch <slug> --base <ref>   # default: HEAD (diff do working tree)
+
+Modo sem git — revisa arquivos específicos em vez de um diff (útil pra scripts
+soltos, tipo os do próprio ~/.local/bin, que não vivem num repo):
+  herdr-review-dispatch <slug> --description "..." --files /caminho/a /caminho/b
+
+Sai com 0 só se os dois revisores produziram veredito utilizável. Qualquer
+BLOCKED/TIMEOUT/veredito ausente ou vazio sai com 1.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+HERDR = os.path.expanduser("~/.local/bin/herdr")
+CLI_TIMEOUT_S = 30  # teto por chamada individual ao binario herdr, nao pelo ciclo inteiro
+
+PROTOCOL = """# Protocolo de revisão (herdr review-cycle)
+
+Você é um revisor independente. {diff_instruction} Leia também as invariantes do
+projeto abaixo (se houver) — leia à vontade qualquer coisa que seja *material da
+revisão em si* (o diff, os arquivos listados, o request.md, qualquer arquivo do
+próprio projeto/repositório sendo avaliado). Escreva seu veredito em
+`verdict.md`, dentro desta mesma pasta (`{verdict_dir}`), e SÓ escreva nesse
+arquivo — não edite nada além dele.
+
+Esta rodada é CEGA: outro revisor está avaliando o mesmo material ao mesmo
+tempo, num diretório irmão deste (`{sibling_dir}`). A ÚNICA coisa proibida é
+esse diretório irmão especificamente: não abra `{sibling_dir}/verdict.md` nem
+liste `{sibling_dir}/`, nem antes nem depois de escrever o seu — mesmo que você
+termine depois e o veredito dele já exista, ler o veredito alheio antes de
+escrever o seu invalida a rodada inteira, mesmo sem editar nada. Fora desse
+diretório específico, não há restrição de leitura.
+
+Formato do veredito — uma lista de achados, cada um com:
+- **severidade**: P0 (crítico) / P1 (alto) / P2 (médio) / P3 (baixo)
+- **arquivo:linha**
+- **descrição** do problema
+- **evidência** (por que isso é real, não hipotético)
+
+Se não achar nada, escreva `APPROVE` e o porquê (o que você verificou).
+"""
+
+VERIFY_PROTOCOL = """# Verificação (herdr review-cycle) — pergunta fechada, não revisão nova
+
+Você já revisou este material antes. Abaixo estão OS SEUS PRÓPRIOS achados
+daquela rodada (não os de outro revisor) e o diff do que mudou desde então.
+Não releia o projeto inteiro do zero — para cada achado, confira só se as
+linhas relevantes mudaram e responda:
+
+- **corrigido** / **não corrigido** / **parcial** — com a linha atual como
+  evidência.
+- Achado **novo** só se estiver dentro das linhas que mudaram no diff abaixo
+  (não vá procurar em arquivo que não mudou).
+
+Escreva sua resposta em `verdict.md`, dentro desta mesma pasta
+(`{verdict_dir}`), e SÓ nesse arquivo.
+
+## Seus achados da rodada anterior
+
+{prior_verdict}
+
+## O que mudou desde então
+
+Base: `{base_ref}` (HEAD = `{head_sha}`). Diff completo em `diff.patch`, na pasta
+acima desta.
+"""
+
+
+def api(*args):
+    try:
+        out = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{' '.join(args)}: sem resposta em {CLI_TIMEOUT_S}s (server do Herdr travado?)")
+    if out.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
+    return json.loads(out.stdout)["result"]
+
+
+def agent_seq(name):
+    return api("agent", "get", name)["agent"]["state_change_seq"]
+
+
+def agent_status(name):
+    return api("agent", "get", name)["agent"]["agent_status"]
+
+
+def agent_status_safe(name):
+    try:
+        agent_status(name)
+        return True
+    except RuntimeError:
+        return False
+
+
+def agent_cwd(name):
+    return api("agent", "get", name)["agent"]["cwd"]
+
+
+def next_round_dir(cwd, slug):
+    base = os.path.join(cwd, ".herdr", "review")
+    os.makedirs(base, exist_ok=True)
+    pattern = re.compile(rf"^{re.escape(slug)}-(\d+)$")
+    nums = [int(m.group(1)) for d in os.listdir(base) if (m := pattern.match(d))]
+    n = max(nums, default=0) + 1
+    round_dir = os.path.join(base, f"{slug}-{n}")
+    os.makedirs(round_dir, exist_ok=False)
+    return round_dir, n
+
+
+def freeze_diff(cwd, base_ref, round_dir):
+    """git diff <base_ref>, incluindo untracked (git diff sozinho os ignora).
+
+    -z e split em NUL, não texto por linha: com core.quotePath=true (default do
+    git), qualquer nome com acento/cedilha/etc sai citado e escapado em texto
+    normal, o que quebra o pathspec do 'add -N' e aborta o lote inteiro,
+    inclusive os arquivos ASCII que vieram junto. -z desliga o quoting.
+    """
+    untracked = [
+        p for p in subprocess.run(
+            ["git", "-C", cwd, "ls-files", "--others", "--exclude-standard", "-z"],
+            capture_output=True, text=True,
+        ).stdout.split("\0") if p
+    ]
+    try:
+        if untracked:
+            added = subprocess.run(["git", "-C", cwd, "add", "-N", "--"] + untracked, capture_output=True, text=True)
+            if added.returncode != 0:
+                raise RuntimeError(f"git add -N falhou (untracked ficariam de fora do diff): {added.stderr.strip()}")
+        diff = subprocess.run(["git", "-C", cwd, "diff", base_ref], capture_output=True, text=True)
+        if diff.returncode != 0:
+            raise RuntimeError(f"git diff falhou: {diff.stderr.strip()}")
+        if not diff.stdout.strip():
+            raise RuntimeError(f"nada pra revisar — 'git diff {base_ref}' está vazio em {cwd}")
+        with open(os.path.join(round_dir, "diff.patch"), "w") as f:
+            f.write(diff.stdout)
+    finally:
+        if untracked:
+            subprocess.run(["git", "-C", cwd, "reset", "--"] + untracked, capture_output=True, text=True)
+
+    head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode != 0:
+        raise RuntimeError(f"git rev-parse HEAD falhou: {head.stderr.strip()}")
+    return head.stdout.strip()
+
+
+def load_invariants(cwd):
+    reviewer_md_path = os.path.join(cwd, ".herdr", "reviewer.md")
+    if os.path.isfile(reviewer_md_path):
+        with open(reviewer_md_path) as f:
+            return f.read()
+    return "_(sem .herdr/reviewer.md neste projeto ainda — sem invariantes específicas)_"
+
+
+def write_request(cwd, verdict_dir, sibling_dir, description, head_sha, base_ref):
+    diff_instruction = (
+        f"Leia o diff em `diff.patch` (na pasta acima desta, `{os.path.dirname(verdict_dir)}`)."
+    )
+    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir)}
+
+## Invariantes do projeto
+
+{load_invariants(cwd)}
+
+## O que mudou
+
+Base: `{base_ref}` (HEAD = `{head_sha}`). Diff completo em `diff.patch`, na pasta
+acima desta.
+
+{description}
+"""
+    with open(os.path.join(verdict_dir, "request.md"), "w") as f:
+        f.write(content)
+
+
+def write_verify_request(verdict_dir, prior_verdict, head_sha, base_ref):
+    content = VERIFY_PROTOCOL.format(
+        verdict_dir=verdict_dir, prior_verdict=prior_verdict, head_sha=head_sha, base_ref=base_ref,
+    )
+    with open(os.path.join(verdict_dir, "request.md"), "w") as f:
+        f.write(content)
+
+
+def load_prior_verdict(prev_round_dir, reviewer_name):
+    path = os.path.join(prev_round_dir, reviewer_name, "verdict.md")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"veredito anterior não encontrado em {path}")
+    with open(path) as f:
+        return f.read()
+
+
+def write_request_files(cwd, verdict_dir, sibling_dir, description, files):
+    listing = "\n".join(f"- `{f}`" for f in files)
+    diff_instruction = "Sem diff de git — leia o conteúdo atual de cada arquivo listado abaixo, direto do disco."
+    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir)}
+
+## Invariantes do projeto
+
+{load_invariants(cwd)}
+
+## O que revisar
+
+{listing}
+
+{description}
+"""
+    with open(os.path.join(verdict_dir, "request.md"), "w") as f:
+        f.write(content)
+
+
+def dispatch(name, verdict_dir):
+    prompt = (
+        f"Leia {verdict_dir}/request.md e siga o protocolo nele. O único arquivo "
+        f"que você deve escrever é {verdict_dir}/verdict.md — as regras de "
+        f"leitura estão no request.md."
+    )
+    info_before = get_agent_info(name)
+    dispatch_ts = now_iso()
+    api("agent", "prompt", name, prompt)
+    return {
+        "seq_before": info_before["state_change_seq"],
+        "kind": info_before["agent"],
+        "agent_session": (info_before.get("agent_session") or {}).get("value"),
+        "dispatch_ts": dispatch_ts,
+    }
+
+
+def get_agent_info(name):
+    return api("agent", "get", name)["agent"]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("slug")
+    desc_group = ap.add_mutually_exclusive_group()
+    desc_group.add_argument("--description", default=None)
+    desc_group.add_argument("--description-file", default=None)
+    ap.add_argument("--base", default="HEAD")
+    ap.add_argument("--files", nargs="+", default=None, help="revisa arquivos especificos (sem git) em vez de um diff")
+    ap.add_argument("--verify", metavar="ROUND_DIR", default=None, help="modo verificacao: confere achados de uma rodada anterior (git only), um revisor so")
+    ap.add_argument("--reviewer", choices=["rev", "rev-2"], default=None, help="qual revisor usar no --verify (default: alterna pelo numero da rodada)")
+    ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por revisor (default 1200)")
+    args = ap.parse_args()
+
+    if os.environ.get("HERDR_ENV") != "1":
+        print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.verify and args.files:
+        print("erro: --verify não combina com --files (verificação encadeia diff de git)", file=sys.stderr)
+        sys.exit(2)
+    if not args.verify and not args.description and not args.description_file:
+        print("erro: passe --description ou --description-file (não obrigatório só em --verify)", file=sys.stderr)
+        sys.exit(2)
+
+    if args.files:
+        args.files = [os.path.abspath(f) for f in args.files]
+        for f in args.files:
+            if not os.path.isfile(f):
+                print(f"erro: arquivo não encontrado: {f}", file=sys.stderr)
+                sys.exit(2)
+
+    description = args.description
+    if args.description_file:
+        with open(args.description_file) as f:
+            description = f.read()
+
+    rev_name = f"{args.slug}-rev"
+    rev2_name = f"{args.slug}-rev-2"
+
+    cwd = agent_cwd(f"{args.slug}-exec") if agent_status_safe(f"{args.slug}-exec") else agent_cwd(rev_name)
+
+    if args.verify:
+        prev_metrics_path = os.path.join(args.verify, "metrics.json")
+        if not os.path.isfile(prev_metrics_path):
+            print(f"erro: {prev_metrics_path} não existe — rodada anterior não tem metrics.json (rodada antiga demais?)", file=sys.stderr)
+            sys.exit(1)
+        with open(prev_metrics_path) as f:
+            prev_metrics = json.load(f)
+        prev_head_sha = prev_metrics.get("head_sha")
+        if not prev_head_sha:
+            print(f"erro: {prev_metrics_path} não tem head_sha — foi uma rodada em modo --files, não dá pra encadear diff", file=sys.stderr)
+            sys.exit(1)
+        round_dir, n = next_round_dir(cwd, args.slug)
+        reviewer_name = f"{args.slug}-{args.reviewer}" if args.reviewer else (rev_name if n % 2 == 1 else rev2_name)
+        try:
+            prior_verdict = load_prior_verdict(args.verify, reviewer_name)
+        except RuntimeError as exc:
+            shutil.rmtree(round_dir, ignore_errors=True)
+            print(f"erro: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"rodada {n} (verificação de {args.verify}, revisor único: {reviewer_name}): {round_dir}")
+        target_names = [reviewer_name]
+    else:
+        for name in (rev_name, rev2_name):
+            try:
+                status = agent_status(name)
+            except RuntimeError as exc:
+                print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
+                sys.exit(1)
+            if status not in ("idle", "done"):
+                print(f"erro: '{name}' está '{status}' — não vou disparar em cima de working/blocked", file=sys.stderr)
+                sys.exit(1)
+        round_dir, n = next_round_dir(cwd, args.slug)
+        print(f"rodada {n}: {round_dir}")
+        target_names = [rev_name, rev2_name]
+
+    verdict_dirs = {}
+    for name in target_names:
+        verdict_dirs[name] = os.path.join(round_dir, name)
+        os.makedirs(verdict_dirs[name])
+
+    def sibling_dir_for(name):
+        other = rev2_name if name == rev_name else rev_name
+        return verdict_dirs.get(other, "(nenhum — rodada de verificação, revisor único)")
+
+    head_sha = None
+    try:
+        if args.verify:
+            head_sha = freeze_diff(cwd, prev_head_sha, round_dir)
+            print(f"diff congelado desde a rodada anterior, base={prev_head_sha[:10]} head={head_sha[:10]}")
+            write_verify_request(verdict_dirs[reviewer_name], prior_verdict, head_sha, prev_head_sha)
+            if description:
+                with open(os.path.join(verdict_dirs[reviewer_name], "request.md"), "a") as f:
+                    f.write(f"\n## Contexto adicional\n\n{description}\n")
+            print("request.md de verificação escrito")
+        elif args.files:
+            for name in target_names:
+                write_request_files(cwd, verdict_dirs[name], sibling_dir_for(name), description, args.files)
+            print(f"request.md escrito pros dois, {len(args.files)} arquivo(s) referenciado(s) direto do disco")
+        else:
+            head_sha = freeze_diff(cwd, args.base, round_dir)
+            print(f"diff congelado (com untracked), base={args.base} head={head_sha[:10]}")
+            for name in target_names:
+                write_request(cwd, verdict_dirs[name], sibling_dir_for(name), description, head_sha, args.base)
+            print("request.md escrito pros dois")
+    except RuntimeError as exc:
+        print(f"erro preparando a rodada: {exc}", file=sys.stderr)
+        shutil.rmtree(round_dir, ignore_errors=True)
+        sys.exit(1)
+
+    verb = "disparando" if len(target_names) > 1 else "disparando (verificação, revisor único)"
+    print(f"{verb} {', '.join(target_names)}...")
+    dispatch_info = {}
+    dispatched = {}
+    for name in target_names:
+        try:
+            dispatch_info[name] = dispatch(name, verdict_dirs[name])
+            dispatched[name] = True
+        except RuntimeError as exc:
+            print(f"  aviso: falha disparando pra {name}: {exc}", file=sys.stderr)
+            dispatched[name] = False
+
+    if not any(dispatched.values()):
+        print("erro: nenhum revisor recebeu o prompt — nada foi disparado", file=sys.stderr)
+        sys.exit(1)
+
+    deadline = time.time() + args.timeout
+    result = {name: None for name in target_names if dispatched[name]}
+    settle_ts = {}
+    last_seen = dict(result)
+    while time.time() < deadline and any(v is None for v in result.values()):
+        for name in list(result):
+            if result[name] is not None:
+                continue
+            info = api("agent", "get", name)["agent"]
+            last_seen[name] = info["agent_status"]
+            if info["state_change_seq"] != dispatch_info[name]["seq_before"] and info["agent_status"] in ("idle", "done"):
+                result[name] = info["agent_status"]
+                settle_ts[name] = now_iso()
+        if any(v is None for v in result.values()):
+            time.sleep(2)
+    for name in result:
+        if result[name] is None:
+            result[name] = "blocked" if last_seen.get(name) == "blocked" else "timeout"
+            settle_ts[name] = now_iso()
+
+    print("\nresultado da rodada:")
+    ok_count = 0
+    metrics = {
+        "round_dir": round_dir,
+        "slug": args.slug,
+        "mode": "verify" if args.verify else ("files" if args.files else "diff"),
+        "head_sha": head_sha,
+        "reviewers": {},
+    }
+    if args.verify:
+        metrics["verified_round"] = args.verify
+    for name in target_names:
+        if not dispatched.get(name):
+            print(f"  {name}: não disparado (veja aviso acima)")
+            metrics["reviewers"][name] = {"dispatched": False}
+            continue
+        status = result[name]
+        verdict_path = os.path.join(verdict_dirs[name], "verdict.md")
+        size = os.path.getsize(verdict_path) if os.path.isfile(verdict_path) else 0
+        di = dispatch_info[name]
+        metrics["reviewers"][name] = {
+            "dispatched": True,
+            "kind": di["kind"],
+            "agent_session": di["agent_session"],
+            "dispatch_ts": di["dispatch_ts"],
+            "settle_ts": settle_ts.get(name),
+            "status": status,
+            "verdict_bytes": size,
+        }
+        if status == "blocked":
+            print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem verdict.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
+        elif status == "timeout":
+            print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é veredito" + (f" (verdict.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif size == 0:
+            print(f"  {name}: {status}, mas verdict.md {'não existe' if not os.path.isfile(verdict_path) else 'está vazio'} — falha operacional")
+        else:
+            print(f"  {name}: {status}, veredito em {verdict_path} ({size}b)")
+            ok_count += 1
+
+    with open(os.path.join(round_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"\nround dir: {round_dir}")
+    sys.exit(0 if ok_count == len(target_names) else 1)
+
+
+if __name__ == "__main__":
+    main()

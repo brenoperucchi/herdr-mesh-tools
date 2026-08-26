@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# herdr-notify-watch <agent-name>
+# Loop de fundo: espera o agent ficar blocked/done, dispara notificação de
+# desktop via omarchy-notification-send. Só notifica em evento NOVO de verdade
+# (state_change_seq mudou) — "done" fica preso até alguém "ver" o agent (foco de
+# UI), e isso nunca acontece aqui de propósito, então sem essa checagem o wait
+# retorna na hora a cada volta do loop e vira rajada de notificação.
+# Trava com flock: rodar duas instâncias pro mesmo nome não duplica, a segunda
+# sai sozinha. Sai de vez quando o agent não existir mais.
+set -u
+
+name="${1:?uso: herdr-notify-watch <agent-name>}"
+log="/tmp/herdr-notify-${name}.log"
+lock="/tmp/herdr-notify-${name}.lock"
+
+exec 9>"$lock"
+if ! flock -n 9; then
+  echo "$(date -Iseconds) já tem um watch vivo pra $name, saindo" >>"$log"
+  exit 0
+fi
+
+echo "$(date -Iseconds) watch iniciado para $name (pid $$)" >>"$log"
+
+last_seq=""
+
+while true; do
+  out=$(herdr agent wait "$name" --until blocked --until done 2>&1)
+  rc=$?
+
+  if [ $rc -ne 0 ]; then
+    code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+    if [ "$code" = "agent_not_found" ]; then
+      echo "$(date -Iseconds) $name sumiu, encerrando watch" >>"$log"
+      exit 0
+    fi
+    echo "$(date -Iseconds) erro inesperado em wait: $out" >>"$log"
+    sleep 5
+    continue
+  fi
+
+  info=$(herdr agent get "$name" 2>/dev/null)
+  status=$(printf '%s' "$info" | jq -r '.result.agent.agent_status // empty')
+  seq=$(printf '%s' "$info" | jq -r '.result.agent.state_change_seq // empty')
+
+  if [ -n "$seq" ] && [ "$seq" = "$last_seq" ]; then
+    # mesmo evento de antes, agent ainda parado em done/blocked sem ninguem ver.
+    # nao repete notificacao; so espera antes de checar de novo.
+    sleep 2
+    continue
+  fi
+  last_seq="$seq"
+
+  echo "$(date -Iseconds) $name -> $status (seq $seq)" >>"$log"
+
+  case "$status" in
+  blocked)
+    omarchy-notification-send --app-name "herdr" -u critical \
+      "Herdr: $name bloqueado" "Esperando sua aprovação/decisão" >/dev/null 2>&1
+    ;;
+  done)
+    omarchy-notification-send --app-name "herdr" -u normal \
+      "Herdr: $name terminou" "Tarefa em background concluída" >/dev/null 2>&1
+    ;;
+  esac
+
+  sleep 1
+done

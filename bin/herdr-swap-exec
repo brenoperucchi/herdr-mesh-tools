@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""herdr-swap-exec <slug> <kind> — troca o kind do agent <slug>-exec (ex: claude
+-> codex), preservando contexto via handoff escrito em arquivo pelo próprio
+agent que está saindo. NÃO manda o buffer/scrollback bruto pro novo agent —
+isso é lossy e específico da CLI de cada um. Em vez disso, pede pro exec atual
+escrever um resumo de handoff, confirma que ele escreveu, divide um pane novo
+do lado, fecha o pane antigo (mata o processo — pedir pra CLI sair sozinha via
+send-keys se mostrou pouco confiável, ctrl+d/ctrl+c não encerraram de forma
+previsível) e só então sobe o novo kind já apontado pra ler aquele resumo.
+
+Uso:
+  herdr-swap-exec <slug> <kind> [-- <agent-args...>]
+
+Exige que <slug>-exec já exista e esteja 'idle' ou 'done' (não troca em cima de
+trabalho em andamento).
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERDR = os.path.expanduser("~/.local/bin/herdr")
+CLI_TIMEOUT_S = 30
+
+HANDOFF_PROMPT = """Vou trocar você por um agent de outro kind neste mesmo pane. Antes disso,
+escreva um resumo de handoff em `{path}` cobrindo:
+
+- o que você estava fazendo e por quê
+- decisões já tomadas (e o porquê, se não for óbvio)
+- o que falta / próximo passo
+- arquivos relevantes e qualquer coisa que quem assumir precise saber pra não
+  repetir trabalho ou perder contexto
+
+Depois de escrever o arquivo, pare — não faça mais nada."""
+
+RESUME_PROMPT = """Você está retomando de outro agent neste mesmo projeto. Leia {path} antes de
+qualquer coisa — é o handoff de quem estava trabalhando aqui antes de você."""
+
+
+def api(*args):
+    try:
+        out = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{' '.join(args)}: sem resposta em {CLI_TIMEOUT_S}s (server do Herdr travado?)")
+    if out.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
+    return json.loads(out.stdout)["result"]
+
+
+def get_agent(name):
+    return api("agent", "get", name)["agent"]
+
+
+def wait_settled(name, seq_before, timeout_s):
+    """Espera o agent assentar (idle/done) OU ficar 'blocked' de verdade — sem
+    travar em blocked transitório (ex: ruido de MCP subindo)."""
+    deadline = time.time() + timeout_s
+    last_status = None
+    while time.time() < deadline:
+        info = get_agent(name)
+        last_status = info["agent_status"]
+        if info["state_change_seq"] != seq_before and last_status in ("idle", "done"):
+            return last_status
+        time.sleep(2)
+    return "blocked" if last_status == "blocked" else "timeout"
+
+
+def recover_pane(new_pane_id, handoff_path):
+    print(f"o pane {new_pane_id} está aguardando — confira na mão. O handoff está salvo em {handoff_path}.", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("slug")
+    ap.add_argument("kind")
+    ap.add_argument("extra_args", nargs="*", help="passados pro novo agent depois de --")
+    ap.add_argument("--timeout", type=int, default=180, help="segundos pra esperar o handoff ser escrito")
+    args = ap.parse_args()
+
+    if os.environ.get("HERDR_ENV") != "1":
+        print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
+        sys.exit(1)
+
+    name = f"{args.slug}-exec"
+
+    try:
+        info = get_agent(name)
+    except RuntimeError as exc:
+        print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
+        sys.exit(1)
+
+    if info["agent_status"] not in ("idle", "done"):
+        print(f"erro: '{name}' está '{info['agent_status']}' — não troco em cima de trabalho em andamento (working/blocked)", file=sys.stderr)
+        sys.exit(1)
+
+    old_kind = info["agent"]
+    pane_id = info["pane_id"]
+    cwd = info["cwd"]
+
+    if args.kind == old_kind:
+        print(f"aviso: '{name}' já é '{old_kind}' — trocando mesmo assim (contexto zera igual)", file=sys.stderr)
+
+    handoff_dir = os.path.join(cwd, ".herdr", "handoff")
+    os.makedirs(handoff_dir, exist_ok=True)
+    handoff_path = os.path.join(
+        handoff_dir, f"{args.slug}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.md"
+    )
+
+    print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
+    seq_before = info["state_change_seq"]
+    api("agent", "prompt", name, HANDOFF_PROMPT.format(path=handoff_path))
+    status = wait_settled(name, seq_before, args.timeout)
+
+    if status == "timeout":
+        print(f"erro: {name} não assentou em {args.timeout}s escrevendo o handoff — abortando, processo antigo mantido vivo", file=sys.stderr)
+        sys.exit(1)
+    if status == "blocked":
+        print(f"erro: {name} ficou 'blocked' escrevendo o handoff — veja o pane {pane_id} antes de tentar de novo. Processo antigo mantido vivo.", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(handoff_path) or os.path.getsize(handoff_path) == 0:
+        print(f"erro: {name} assentou mas não escreveu {handoff_path} (ou ficou vazio) — abortando, processo antigo mantido vivo", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"handoff escrito ({os.path.getsize(handoff_path)} bytes).")
+
+    # A partir daqui o exec antigo pode já estar morto (pane fechado) - qualquer
+    # erro precisa reportar como recuperar, nunca um traceback cru.
+    try:
+        print(f"dividindo pane novo ao lado de {pane_id}...")
+        split = api("pane", "split", pane_id, "--direction", "right", "--no-focus")
+        new_pane_id = split["pane"]["pane_id"]
+
+        print(f"fechando o pane antigo ({pane_id}, {old_kind}) — libera o nome '{name}'...")
+        api("pane", "close", pane_id)
+    except RuntimeError as exc:
+        print(f"erro dividindo/fechando pane: {exc}", file=sys.stderr)
+        print(f"processo antigo em {pane_id} pode ainda estar vivo — confira na mão. Handoff salvo em {handoff_path}.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"subindo {name} como '{args.kind}' no pane novo ({new_pane_id})...")
+    start_args = ["agent", "start", name, "--kind", args.kind, "--pane", new_pane_id]
+    if args.extra_args:
+        start_args += ["--", *args.extra_args]
+
+    last_exc = None
+    for attempt in range(6):  # pane recém-dividido pode levar um instante pra assentar no shell
+        try:
+            api(*start_args)
+            last_exc = None
+            break
+        except RuntimeError as exc:
+            last_exc = exc
+            if "agent_pane_busy" in str(exc) and attempt < 5:
+                time.sleep(1)
+                continue
+            break
+
+    if last_exc is not None and "agent_not_ready" in str(last_exc):
+        # nome/processo existem, so travou num dialogo de startup (ex: confiar
+        # no diretorio) OU e' so ruido de MCP subindo, que se resolve sozinho
+        # em poucos segundos (visto empiricamente) - nesse meio-tempo o status
+        # normalmente e' 'working', nao 'idle'. Aceita qualquer um dos dois
+        # como "resolveu sozinho".
+        try:
+            time.sleep(4)
+            if get_agent(name)["agent_status"] in ("idle", "working", "done"):
+                last_exc = None
+        except RuntimeError as exc:
+            last_exc = exc
+
+    if last_exc is not None and "agent_not_ready" in str(last_exc):
+        # ainda nao resolveu sozinho - reconhece o padrao do dialogo antes de
+        # responder, nao aprova as cegas.
+        try:
+            pane_text = subprocess.run(
+                [HERDR, "pane", "read", new_pane_id, "--source", "visible", "--lines", "30"],
+                capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+            ).stdout
+            trust_markers = ("Do you trust", "confia", "trust the contents", "Yes, I trust")
+            if any(m.lower() in pane_text.lower() for m in trust_markers):
+                print(f"'{name}' parou num diálogo de confiança de diretório (1a vez desse kind aqui) — aprovando...")
+                api("agent", "send-keys", name, "enter")
+                time.sleep(2)
+                if get_agent(name)["agent_status"] in ("idle", "working", "done"):
+                    last_exc = None
+            if last_exc is not None:
+                print(f"'{name}' ficou bloqueado num diálogo que não reconheço — veja o pane {new_pane_id} na mão:", file=sys.stderr)
+                print(pane_text[-800:], file=sys.stderr)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"erro checando/respondendo o diálogo: {exc}", file=sys.stderr)
+
+    if last_exc is not None:
+        print(f"erro ao subir o novo agent: {last_exc}", file=sys.stderr)
+        recover_pane(new_pane_id, handoff_path)
+        sys.exit(1)
+
+    try:
+        api("agent", "prompt", name, RESUME_PROMPT.format(path=handoff_path))
+    except RuntimeError as exc:
+        print(f"'{name}' subiu ({old_kind} -> {args.kind}) mas falhei mandando ele ler o handoff: {exc}", file=sys.stderr)
+        print(f"mande na mão: herdr agent prompt {name} 'Leia {handoff_path} antes de qualquer coisa'", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"'{name}' trocado: {old_kind} -> {args.kind}. Mandei pra ele ler o handoff, sem esperar a resposta.")
+    print(f"handoff: {handoff_path}")
+
+
+if __name__ == "__main__":
+    main()

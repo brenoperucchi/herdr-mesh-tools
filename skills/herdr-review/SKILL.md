@@ -1,0 +1,123 @@
+---
+name: herdr-review
+description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev e <slug>-rev-2 vivos no mesmo space."
+---
+
+# herdr-review
+
+Sistematiza o que antes era feito na mão: pedir revisão cega e paralela pros dois
+revisores de um projeto, classificar divergência, decidir o que corrigir sozinho e
+o que escalar.
+
+Antes de qualquer coisa, confirme que está num pane do Herdr:
+
+```bash
+test "${HERDR_ENV:-}" = 1
+```
+
+## Quando usar
+
+Depois de terminar uma unidade de trabalho — uma feature, um fix, um refactor
+coeso — não a cada edit isolado. Você (o exec) decide sozinho quando pedir; não
+espere o usuário mandar toda vez. Se tiver dúvida se o trabalho já está "pronto o
+suficiente", prefira pedir revisão a adiar — o custo de uma rodada é bem menor
+que o de um bug que passa direto.
+
+## Descobrir seu próprio slug
+
+Seu nome de agent no Herdr segue o padrão `<slug>-exec`. Resolva via `HERDR_PANE_ID`:
+
+```bash
+slug=$(herdr agent list | python3 -c "
+import json, sys, os
+data = json.load(sys.stdin)
+pane = os.environ['HERDR_PANE_ID']
+for a in data['result']['agents']:
+    if a.get('pane_id') == pane and a.get('name', '').endswith('-exec'):
+        print(a['name'][:-5]); break
+")
+```
+
+## Disparar a rodada
+
+```bash
+herdr-review-dispatch "$slug" --description "o que foi feito, por que, e o que é fora de escopo"
+```
+
+Isso congela o diff atual (`git diff` contra `HEAD`, incluindo untracked) em
+`.herdr/review/<slug>-<n>/`, cria uma **pasta por revisor** dentro dela
+(`<slug>-<n>/<slug>-rev/`, `<slug>-<n>/<slug>-rev-2/`), escreve o `request.md`
+de cada um (protocolo genérico + `.herdr/reviewer.md` do projeto, se existir, +
+sua descrição), dispara `<slug>-rev` e `<slug>-rev-2` em paralelo, cegos um do
+outro, e espera os dois assentarem. Exige os dois `idle` **ou** `done` antes de
+rodar — se algum estiver `working`/`blocked`, o script recusa em vez de
+enfileirar.
+
+Sem repo git (script solto, por exemplo)? Use `--files <path> [<path> ...]` em
+vez de deixar o modo git tentar e falhar — revisa os arquivos listados
+diretamente do disco, sem diff. `--base <ref>` muda a base do diff (default
+`HEAD`). `--timeout <segundos>` muda o teto de espera por revisor (default
+**1200 = 20 minutos**) — o script fica em silêncio dentro desse tempo se algum
+revisor estiver `blocked` de verdade, então não estranhe demora sem output.
+
+O script bloqueia até terminar e sai com **código 0 só se os dois** revisores
+produziram veredito utilizável; qualquer `BLOCKED`/`TIMEOUT`/veredito
+ausente-ou-vazio sai com 1 — não confie só no texto do stdout, cheque o exit
+code se for encadear isso em algo automático.
+
+## Ler e classificar
+
+Leia os dois `verdict.md` que o comando apontou — cada um dentro da pasta do
+seu próprio revisor (`<round_dir>/<slug>-rev/verdict.md`,
+`<round_dir>/<slug>-rev-2/verdict.md`). Não use `agent read` nos panes dos
+revisores pra isso — é scrape de tela, lossy; os arquivos são a fonte de
+verdade.
+
+Monte uma tabela por achado, em três classes:
+
+| Classe | Quando | Quem trata |
+|---|---|---|
+| **CONFIRMADO** | Os dois revisores bateram no mesmo achado | Você corrige sozinho |
+| **ÚNICO** | Só um achou — o outro simplesmente não mencionou | Você avalia e corrige se procede |
+| **CONFLITO** | Um revisor **contesta explicitamente** a validade do que o outro apontou (não apenas deixou de encontrar) | Nunca você sozinho — veja abaixo |
+
+## CONFLITO — árbitro sob demanda, opcional
+
+Se quiser uma terceira opinião antes de escalar (não é obrigatório), suba um
+`gpt-5.6-sol` efêmero:
+
+```bash
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+# use o pane_id retornado:
+herdr agent start "${slug}-arbiter" --kind codex --pane <pane_id> -- --model gpt-5.6-sol -c model_reasoning_effort=high
+```
+
+Mande o achado disputado + as duas posições completas (o árbitro **não é cego** —
+sua função é pesar as duas narrativas, ao contrário dos revisores). Ele não edita
+código, não inventa achado novo, dá um veredito por achado (confirmed / rejected /
+needs-human-evidence). Feche o pane depois (`herdr pane close <pane_id>`).
+
+O veredito do árbitro **não substitui sua decisão** — ele só enriquece o que você
+leva pro usuário. Todo CONFLITO, arbitrado ou não, ainda vai pro usuário.
+
+## Corrigir e ciclar
+
+Aplique as correções dos achados CONFIRMADO (e ÚNICO que procedam) você mesmo. Pra
+CONFLITO ou qualquer achado que você considere descartar: **pare e pergunte ao
+usuário** — nunca decida sozinho que um achado não procede.
+
+Se corrigiu algo, pode rodar `herdr-review-dispatch` de novo pra uma nova rodada
+(cria `<slug>-2`, etc. automaticamente). **Máximo 2 rodadas de correção** — na
+terceira, pare e leve o estado pro usuário decidir, mesmo que ainda haja achado
+aberto.
+
+Pare imediatamente pro usuário, sem esperar o teto de rodadas, se aparecer:
+mudança arquitetural nas correções, achado de severidade alta e controverso, ou
+recomendações mutuamente incompatíveis entre os dois revisores.
+
+## O que não fazer
+
+- Não rode `herdr-review-dispatch` em cima de trabalho não commitado que não é
+  seu — confirme que o diff é da unidade que você mesmo terminou.
+- Não trate `TIMEOUT` ou revisor `BLOCKED` como aprovação.
+- Não decida sozinho que um CONFLITO não procede, mesmo com o árbitro do seu lado.
