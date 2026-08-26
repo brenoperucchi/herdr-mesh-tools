@@ -212,9 +212,29 @@ def load_prior_verdict(prev_round_dir, reviewer_name):
         return f.read()
 
 
-def write_request_files(cwd, verdict_dir, sibling_dir, description, files):
-    listing = "\n".join(f"- `{f}`" for f in files)
-    diff_instruction = "Sem diff de git — leia o conteúdo atual de cada arquivo listado abaixo, direto do disco."
+def freeze_files(files, round_dir):
+    """Copia cada arquivo pra round_dir/_snapshot/, preservando o path absoluto
+    como subdiretório (sem a '/' inicial). O revisor lê a cópia congelada, não
+    o path original no disco — sem isso, o arquivo pode mudar no meio da
+    revisão e o veredito sai sobre material que já não existe mais (já
+    aconteceu na prática, rodada inteira perdida)."""
+    snapshot_root = os.path.join(round_dir, "_snapshot")
+    mapping = {}
+    for f in files:
+        dest = os.path.join(snapshot_root, f.lstrip(os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(f, dest)
+        mapping[f] = dest
+    return mapping
+
+
+def write_request_files(cwd, verdict_dir, sibling_dir, description, files, snapshot_map):
+    listing = "\n".join(f"- `{snapshot_map[f]}` (original: `{f}`)" for f in files)
+    diff_instruction = (
+        "Sem diff de git — leia o conteúdo de cada arquivo abaixo a partir da "
+        "cópia CONGELADA no path indicado, não do path original: o original "
+        "pode ter mudado desde o disparo desta rodada."
+    )
     content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir)}
 
 ## Invariantes do projeto
@@ -348,9 +368,10 @@ def main():
                     f.write(f"\n## Contexto adicional\n\n{description}\n")
             print("request.md de verificação escrito")
         elif args.files:
+            snapshot_map = freeze_files(args.files, round_dir)
             for name in target_names:
-                write_request_files(cwd, verdict_dirs[name], sibling_dir_for(name), description, args.files)
-            print(f"request.md escrito pros dois, {len(args.files)} arquivo(s) referenciado(s) direto do disco")
+                write_request_files(cwd, verdict_dirs[name], sibling_dir_for(name), description, args.files, snapshot_map)
+            print(f"{len(args.files)} arquivo(s) congelado(s) em {round_dir}/_snapshot/, request.md escrito pros dois")
         else:
             head_sha = freeze_diff(cwd, args.base, round_dir)
             print(f"diff congelado (com untracked), base={args.base} head={head_sha[:10]}")
