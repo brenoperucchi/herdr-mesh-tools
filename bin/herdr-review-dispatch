@@ -36,6 +36,7 @@ def now_iso():
 
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 CLI_TIMEOUT_S = 30  # teto por chamada individual ao binario herdr, nao pelo ciclo inteiro
+BLOCKED_GRACE_S = 15  # quanto tempo em blocked sustentado ate reportar sem esperar o --timeout inteiro
 
 PROTOCOL = """# Protocolo de revisão (herdr review-cycle)
 
@@ -381,15 +382,27 @@ def main():
     result = {name: None for name in target_names if dispatched[name]}
     settle_ts = {}
     last_seen = dict(result)
+    blocked_since = dict.fromkeys(result)
     while time.time() < deadline and any(v is None for v in result.values()):
         for name in list(result):
             if result[name] is not None:
                 continue
             info = api("agent", "get", name)["agent"]
             last_seen[name] = info["agent_status"]
-            if info["state_change_seq"] != dispatch_info[name]["seq_before"] and info["agent_status"] in ("idle", "done"):
+            changed = info["state_change_seq"] != dispatch_info[name]["seq_before"]
+            if changed and info["agent_status"] in ("idle", "done"):
                 result[name] = info["agent_status"]
                 settle_ts[name] = now_iso()
+            elif changed and info["agent_status"] == "blocked":
+                # sustentado, nao transitorio (ex: ruido de MCP subindo) -> nao
+                # espera o --timeout inteiro pra reportar, so a folga de graca
+                if blocked_since[name] is None:
+                    blocked_since[name] = time.time()
+                elif time.time() - blocked_since[name] >= BLOCKED_GRACE_S:
+                    result[name] = "blocked"
+                    settle_ts[name] = now_iso()
+            else:
+                blocked_since[name] = None
         if any(v is None for v in result.values()):
             time.sleep(2)
     for name in result:

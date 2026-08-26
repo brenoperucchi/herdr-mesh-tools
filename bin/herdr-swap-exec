@@ -23,6 +23,7 @@ import time
 
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 CLI_TIMEOUT_S = 30
+BLOCKED_GRACE_S = 15  # quanto tempo em blocked sustentado ate reportar sem esperar o --timeout inteiro
 
 HANDOFF_PROMPT = """Vou trocar você por um agent de outro kind neste mesmo pane. Antes disso,
 escreva um resumo de handoff em `{path}` cobrindo:
@@ -58,11 +59,20 @@ def wait_settled(name, seq_before, timeout_s):
     travar em blocked transitório (ex: ruido de MCP subindo)."""
     deadline = time.time() + timeout_s
     last_status = None
+    blocked_since = None
     while time.time() < deadline:
         info = get_agent(name)
         last_status = info["agent_status"]
-        if info["state_change_seq"] != seq_before and last_status in ("idle", "done"):
+        changed = info["state_change_seq"] != seq_before
+        if changed and last_status in ("idle", "done"):
             return last_status
+        if changed and last_status == "blocked":
+            if blocked_since is None:
+                blocked_since = time.time()
+            elif time.time() - blocked_since >= BLOCKED_GRACE_S:
+                return "blocked"
+        else:
+            blocked_since = None
         time.sleep(2)
     return "blocked" if last_status == "blocked" else "timeout"
 
