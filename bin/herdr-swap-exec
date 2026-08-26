@@ -15,15 +15,16 @@ Exige que <slug>-exec já exista e esteja 'idle' ou 'done' (não troca em cima d
 trabalho em andamento).
 """
 import argparse
-import json
 import os
 import subprocess
 import sys
 import time
 
-HERDR = os.path.expanduser("~/.local/bin/herdr")
-CLI_TIMEOUT_S = 30
-BLOCKED_GRACE_S = 15  # quanto tempo em blocked sustentado ate reportar sem esperar o --timeout inteiro
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+HERDR = core.HERDR
+CLI_TIMEOUT_S = core.CLI_TIMEOUT_S
 
 HANDOFF_PROMPT = """Vou trocar você por um agent de outro kind neste mesmo pane. Antes disso,
 escreva um resumo de handoff em `{path}` cobrindo:
@@ -40,86 +41,23 @@ RESUME_PROMPT = """Você está retomando de outro agent neste mesmo projeto. Lei
 qualquer coisa — é o handoff de quem estava trabalhando aqui antes de você."""
 
 
-def api(*args):
-    try:
-        out = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{' '.join(args)}: sem resposta em {CLI_TIMEOUT_S}s (server do Herdr travado?)")
-    if out.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
-    return json.loads(out.stdout)["result"]
-
-
-def get_agent(name):
-    return api("agent", "get", name)["agent"]
+api = core.api
+get_agent = core.get_agent_info
 
 
 def dispatch_and_wait(name, prompt_text, timeout_s):
-    """Manda o prompt e espera o agent assentar (idle/done) via
-    `agent prompt --wait`, ancorado na submissão — `agent wait` sozinho casa o
-    estado JÁ atual na hora da chamada, não uma transição depois do prompt
-    (confirmado ao vivo: retornou em ~5ms num agent que só estava idle de
-    antes, antes de qualquer turno novo começar — trocar por ele reintroduz o
-    bug de estado velho, pior que o polling manual que substituiu).
-
-    `blocked` fica de propósito fora do --until: um blip transitório não bate
-    o alvo e a espera nativa continua através dele, sem grace period manual.
-    Um watchdog em paralelo cobre o caso sustentado (BLOCKED_GRACE_S) e mata o
-    processo se achar blocked contínuo, sem esperar o --timeout inteiro.
+    """Manda o prompt e espera o agent assentar via `agent prompt --wait` —
+    caso de 1 agent só do core.dispatch_and_wait_all (mesma mecânica usada
+    pelo herdr-review-dispatch com N agentes concorrentes; ver docstring lá
+    pro porquê de `agent wait` sozinho não servir e de `blocked` ficar fora
+    do --until).
 
     Retorna (status, info): status em "idle"/"done"/"blocked"/"timeout"/
     "stalled"/"error"; info é o dict do agent quando disponível, senão uma
     mensagem (str) ou None.
     """
-    proc = subprocess.Popen(
-        [HERDR, "agent", "prompt", name, prompt_text,
-         "--wait", "--until", "idle", "--until", "done",
-         "--timeout", str(timeout_s * 1000)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    deadline = time.time() + timeout_s
-    blocked_since = None
-    while True:
-        ret = proc.poll()
-        if ret is not None:
-            out, err = proc.communicate()
-            if ret == 0:
-                try:
-                    info = json.loads(out)["result"]["agent"]
-                    return info["agent_status"], info
-                except (json.JSONDecodeError, KeyError):
-                    return "error", (out or err).strip()
-            try:
-                payload = json.loads(out or err)
-                code = payload.get("error", {}).get("code")
-                message = payload.get("error", {}).get("message", "")
-            except json.JSONDecodeError:
-                code, message = None, (out or err).strip()
-            if code == "agent_blocked":
-                return "blocked", None
-            if code == "timeout":
-                return "timeout", None
-            if code == "agent_prompt_stalled":
-                return "stalled", message
-            return "error", message or f"exit {ret}"
-        if time.time() >= deadline:
-            proc.kill()
-            proc.wait()
-            return "timeout", None
-        try:
-            info = get_agent(name)
-        except RuntimeError:
-            info = None
-        if info and info["agent_status"] == "blocked":
-            if blocked_since is None:
-                blocked_since = time.time()
-            elif time.time() - blocked_since >= BLOCKED_GRACE_S:
-                proc.kill()
-                proc.wait()
-                return "blocked", info
-        else:
-            blocked_since = None
-        time.sleep(2)
+    result, info, _ = core.dispatch_and_wait_all({name: prompt_text}, timeout_s)
+    return result[name], info[name]
 
 
 def recover_pane(new_pane_id, handoff_path):
