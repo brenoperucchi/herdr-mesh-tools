@@ -1,43 +1,46 @@
 # herdr-mesh-tools
 
-Scripts e skills pessoais construídos em cima do [Herdr](https://github.com) (o CLI/
-multiplexador de terminal para coding agents) — não é o Herdr em si, é a camada de
-automação por cima dele: bootstrap de spaces/panes/agents, notificação de background,
-troca de kind do executor preservando contexto, e o ciclo de revisão cega/paralela
-entre dois revisores independentes.
+Personal scripts and skills built on top of [Herdr](https://github.com) (the
+terminal multiplexer for coding agents) — this is not Herdr itself, it's the
+automation layer on top of it: workspace/pane/agent bootstrap, background
+notifications, swapping the executor's kind while preserving context, and a
+blind/parallel review cycle between two independent reviewers.
 
-Os arquivos aqui são a fonte real; `~/.local/bin/` e `~/.agents/skills/` apontam pra
-cá via symlink (o mesmo padrão usado no dotfiles). Editar em qualquer um dos dois
-lugares edita o mesmo arquivo.
+The files here are the source of truth; `~/.local/bin/` and `~/.agents/skills/`
+point back to this repo via symlink (the same pattern used for dotfiles).
+Editing either location edits the same file.
 
 ## `bin/`
 
-- **`herdr-bootstrap`** — garante spaces/panes/agents do ambiente de trabalho
-  (idempotente). Define, por space, quem é o executor e quem são os dois revisores
-  (kind, modelo, effort), e arma um `herdr-notify-watch` pra cada `*-exec`.
-- **`herdr-notify-watch`** — daemon (`flock`-protegido) que notifica via
-  `omarchy-notification-send` quando um agent `*-exec` muda de estado de verdade
-  (edge-triggered em `state_change_seq`, não em polling ingênuo de status).
-- **`herdr-review-dispatch`** — dispara uma rodada de revisão cega e paralela pros
-  dois revisores de um space (`--verify` faz verificação com um único revisor,
-  mais barata). Congela o diff (incluindo untracked), isola cada revisor em
-  subdiretório próprio, grava `metrics.json` por rodada pra correlação de custo.
-- **`herdr-swap-exec`** — troca o kind (`claude`/`codex`) do agent `<slug>-exec` de
-  um space, preservando contexto via handoff escrito em arquivo pelo agent que sai.
+- **`herdr-bootstrap`** — ensures the workspaces/panes/agents of the working
+  environment exist (idempotent). Defines, per workspace, who the executor is
+  and who the two reviewers are (kind, model, effort), and arms a
+  `herdr-notify-watch` for each `*-exec`.
+- **`herdr-notify-watch`** — a `flock`-protected daemon that notifies via
+  `omarchy-notification-send` when a `*-exec` agent has a genuine state
+  change (edge-triggered on `state_change_seq`, not naive status polling).
+- **`herdr-review-dispatch`** — fires a blind, parallel review round to the
+  two reviewers of a workspace (`--verify` runs a cheaper single-reviewer
+  verification pass). Freezes the diff (including untracked files), isolates
+  each reviewer in its own subdirectory, and writes a per-round `metrics.json`
+  for cost correlation.
+- **`herdr-swap-exec`** — swaps the kind (`claude`/`codex`) of a workspace's
+  `<slug>-exec` agent, preserving context via a handoff file written by the
+  outgoing agent.
 
 ## `skills/`
 
-Skills do Claude Code / Codex (compartilhadas via symlink em `~/.claude/skills/` e
+Claude Code / Codex skills (shared via symlink into `~/.claude/skills/` and
 `~/.codex/skills/`):
 
-- **`herdr`** — uso geral do CLI Herdr (inspecionar/controlar panes, tabs, workspaces,
-  agents).
-- **`herdr-review`** — protocolo de disparo + classificação de achados
-  (CONFIRMADO/ÚNICO/CONFLITO) do ciclo de revisão, com teto de 2 rodadas.
-- **`herdr-swap`** — protocolo de troca de executor com handoff de contexto.
+- **`herdr`** — general use of the Herdr CLI (inspecting/controlling panes,
+  tabs, workspaces, agents).
+- **`herdr-review`** — the dispatch protocol and finding classification
+  (CONFIRMED/UNIQUE/CONFLICT) for the review cycle, capped at 2 rounds.
+- **`herdr-swap`** — the executor-swap protocol with context handoff.
 
-## Contexto de projeto
+## Project context
 
-Cada projeto real que usa esse ciclo mantém seu próprio `.herdr/reviewer.md`
-(invariantes específicas do domínio pros revisores) — isso vive no repo de cada
-projeto, não aqui.
+Each real project using this cycle keeps its own `.herdr/reviewer.md`
+(domain-specific invariants for the reviewers) — that lives in each project's
+own repo, not here.
