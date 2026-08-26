@@ -54,27 +54,72 @@ def get_agent(name):
     return api("agent", "get", name)["agent"]
 
 
-def wait_settled(name, seq_before, timeout_s):
-    """Espera o agent assentar (idle/done) OU ficar 'blocked' de verdade — sem
-    travar em blocked transitório (ex: ruido de MCP subindo)."""
+def dispatch_and_wait(name, prompt_text, timeout_s):
+    """Manda o prompt e espera o agent assentar (idle/done) via
+    `agent prompt --wait`, ancorado na submissão — `agent wait` sozinho casa o
+    estado JÁ atual na hora da chamada, não uma transição depois do prompt
+    (confirmado ao vivo: retornou em ~5ms num agent que só estava idle de
+    antes, antes de qualquer turno novo começar — trocar por ele reintroduz o
+    bug de estado velho, pior que o polling manual que substituiu).
+
+    `blocked` fica de propósito fora do --until: um blip transitório não bate
+    o alvo e a espera nativa continua através dele, sem grace period manual.
+    Um watchdog em paralelo cobre o caso sustentado (BLOCKED_GRACE_S) e mata o
+    processo se achar blocked contínuo, sem esperar o --timeout inteiro.
+
+    Retorna (status, info): status em "idle"/"done"/"blocked"/"timeout"/
+    "stalled"/"error"; info é o dict do agent quando disponível, senão uma
+    mensagem (str) ou None.
+    """
+    proc = subprocess.Popen(
+        [HERDR, "agent", "prompt", name, prompt_text,
+         "--wait", "--until", "idle", "--until", "done",
+         "--timeout", str(timeout_s * 1000)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
     deadline = time.time() + timeout_s
-    last_status = None
     blocked_since = None
-    while time.time() < deadline:
-        info = get_agent(name)
-        last_status = info["agent_status"]
-        changed = info["state_change_seq"] != seq_before
-        if changed and last_status in ("idle", "done"):
-            return last_status
-        if changed and last_status == "blocked":
+    while True:
+        ret = proc.poll()
+        if ret is not None:
+            out, err = proc.communicate()
+            if ret == 0:
+                try:
+                    info = json.loads(out)["result"]["agent"]
+                    return info["agent_status"], info
+                except (json.JSONDecodeError, KeyError):
+                    return "error", (out or err).strip()
+            try:
+                payload = json.loads(out or err)
+                code = payload.get("error", {}).get("code")
+                message = payload.get("error", {}).get("message", "")
+            except json.JSONDecodeError:
+                code, message = None, (out or err).strip()
+            if code == "agent_blocked":
+                return "blocked", None
+            if code == "timeout":
+                return "timeout", None
+            if code == "agent_prompt_stalled":
+                return "stalled", message
+            return "error", message or f"exit {ret}"
+        if time.time() >= deadline:
+            proc.kill()
+            proc.wait()
+            return "timeout", None
+        try:
+            info = get_agent(name)
+        except RuntimeError:
+            info = None
+        if info and info["agent_status"] == "blocked":
             if blocked_since is None:
                 blocked_since = time.time()
             elif time.time() - blocked_since >= BLOCKED_GRACE_S:
-                return "blocked"
+                proc.kill()
+                proc.wait()
+                return "blocked", info
         else:
             blocked_since = None
         time.sleep(2)
-    return "blocked" if last_status == "blocked" else "timeout"
 
 
 def recover_pane(new_pane_id, handoff_path):
@@ -119,15 +164,19 @@ def main():
     )
 
     print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
-    seq_before = info["state_change_seq"]
-    api("agent", "prompt", name, HANDOFF_PROMPT.format(path=handoff_path))
-    status = wait_settled(name, seq_before, args.timeout)
+    status, wait_info = dispatch_and_wait(name, HANDOFF_PROMPT.format(path=handoff_path), args.timeout)
 
     if status == "timeout":
         print(f"erro: {name} não assentou em {args.timeout}s escrevendo o handoff — abortando, processo antigo mantido vivo", file=sys.stderr)
         sys.exit(1)
     if status == "blocked":
         print(f"erro: {name} ficou 'blocked' escrevendo o handoff — veja o pane {pane_id} antes de tentar de novo. Processo antigo mantido vivo.", file=sys.stderr)
+        sys.exit(1)
+    if status == "stalled":
+        print(f"erro: {name} não mostrou nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info}) — pane pode estar travado. Processo antigo mantido vivo.", file=sys.stderr)
+        sys.exit(1)
+    if status == "error":
+        print(f"erro esperando {name} assentar: {wait_info}. Processo antigo mantido vivo.", file=sys.stderr)
         sys.exit(1)
     if not os.path.isfile(handoff_path) or os.path.getsize(handoff_path) == 0:
         print(f"erro: {name} assentou mas não escreveu {handoff_path} (ou ficou vazio) — abortando, processo antigo mantido vivo", file=sys.stderr)
