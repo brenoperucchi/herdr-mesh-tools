@@ -51,7 +51,7 @@ SPACES = [
         ("claude-bridge-rev-2", "claude", ["--model", "opus"]),
     ]),
     ("content-insights-collector", f"{HOME}/Devs/content-insights-collector", [
-        ("content-insights-collector-exec", "claude", []),
+        ("content-insights-collector-exec", "codex", []),
         ("content-insights-collector-rev", "codex", REV_EFFORT),
         ("content-insights-collector-rev-2", "claude", ["--model", "opus"]),
     ]),
