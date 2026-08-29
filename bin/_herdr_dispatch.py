@@ -131,6 +131,29 @@ completo se precisar de mais contexto.
 Detalhes completos em AGENTS.md/CLAUDE.md (seção "Reviewer colleagues") e em
 `.herdr/reviewer.md` deste repo, se existir."""
 
+SCOUT_ROLE_NOTE = """
+
+Nota específica de papel — você é `{name}`, o scout deste space: seu perfil é
+READ-ONLY de propósito, sem acesso de escrita ao socket do Herdr (mover pane,
+criar tab, etc. vão dar "Operation not permitted" — isso é o sandbox
+funcionando certo, não um bug). Se esbarrar numa ação que precisa de escrita,
+**não tente contornar o read-only** e não fique só descrevendo o problema —
+mande a ação específica direto pro `{exec_name}` (ele tem escrita) pedindo
+pra executar por você, e siga em frente com o que puder fazer sem escrita
+enquanto isso."""
+
+
+def _infer_role(name):
+    if name.endswith("-rev-2"):
+        return "rev-2"
+    if name.endswith("-rev"):
+        return "rev"
+    if name.endswith("-scout"):
+        return "scout"
+    if name.endswith("-exec"):
+        return "exec"
+    return None
+
 
 def role_reinforcement_prompt(name, slug, cwd, siblings):
     """siblings: lista de nomes dos outros agents do mesmo space (`<slug>-exec`,
@@ -138,7 +161,11 @@ def role_reinforcement_prompt(name, slug, cwd, siblings):
     corrido pro prompt; lista vazia (space sem colegas, ex. "herdr" sem exec)
     vira uma frase dizendo isso explicitamente, não um "{siblings}" vazio."""
     sib_text = ", ".join(f"`{s}`" for s in siblings) if siblings else "nenhum — este space não tem outros agents"
-    return ROLE_REINFORCEMENT_PROMPT.format(name=name, slug=slug, cwd=cwd, siblings=sib_text)
+    prompt = ROLE_REINFORCEMENT_PROMPT.format(name=name, slug=slug, cwd=cwd, siblings=sib_text)
+    if _infer_role(name) == "scout":
+        exec_name = f"{slug}-exec"
+        prompt += SCOUT_ROLE_NOTE.format(name=name, exec_name=exec_name)
+    return prompt
 
 
 _COMPOSE_LINE_RE = re.compile(r"^(❯|›)\s+(\S.*)$")

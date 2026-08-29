@@ -80,9 +80,12 @@ SPACES = [
         None,
     ),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
-    # tipo de trabalho). Sem "-exec" de proposito: a sessao interativa do
-    # humano aqui e' o executor, nao um agent bootstrapado - so os revisores
-    # sao geridos por este script.
+    # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
+    # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
+    # "herdr-exec", 2026-08-29) - nao e' um agent bootstrapado por este
+    # script, entao nao entra no SPACES pra nao arriscar o script tentar
+    # reiniciar/trocar uma sessao com humano atras dela. So os revisores sao
+    # geridos por aqui.
     ("herdr", HOME,
         [
             ("herdr-rev", "codex", REV_EFFORT),
