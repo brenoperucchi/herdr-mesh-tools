@@ -148,10 +148,18 @@ def main():
         print(f"processo antigo em {pane_id} não foi tocado. Handoff salvo em {handoff_path}.", file=sys.stderr)
         sys.exit(1)
 
+    full_extra = list(args.extra_args)
+    if args.kind == "codex":
+        # desliga o sistema nativo de sub-agentes do Codex - ver
+        # core.CODEX_NO_NATIVE_AGENTS pro porque (achado real, omabackup-exec
+        # 2026-08-29 usou isso como atalho pra "revisao independente" em vez
+        # de voltar pro herdr-review)
+        full_extra += core.CODEX_NO_NATIVE_AGENTS
+
     print(f"subindo '{temp_name}' (provisório) como '{args.kind}' no pane novo ({new_pane_id})...")
     start_args = ["agent", "start", temp_name, "--kind", args.kind, "--pane", new_pane_id]
-    if args.extra_args:
-        start_args += ["--", *args.extra_args]
+    if full_extra:
+        start_args += ["--", *full_extra]
 
     last_exc = None
     for attempt in range(6):  # pane recém-dividido pode levar um instante pra assentar no shell

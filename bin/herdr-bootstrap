@@ -9,6 +9,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 HOME = os.path.expanduser("~")
 DRY = "--dry-run" in sys.argv
@@ -27,42 +30,66 @@ DRY = "--dry-run" in sys.argv
 # metrics.json / artifact "Ciclo de Revisao").
 REV_EFFORT = ["-c", "model_reasoning_effort=high"]
 
+# label -> (cwd, tab1_agents, scout)
+# scout e' sempre tab PROPRIA no workspace (herdr tab create), nunca mais um
+# pane splitado na tab 1 - achado explicito do usuario (2026-08-29): scout
+# faz um tipo de trabalho diferente (leitura/exploracao paralela) e misturar
+# no mesmo tab de exec/rev/rev-2 nao faz sentido de layout. None = sem scout
+# neste space.
 SPACES = [
-    ("omabackup", f"{HOME}/Devs/omabackup", [
-        ("omabackup-exec", "claude", []),
-        ("omabackup-rev", "codex", REV_EFFORT),
-        ("omabackup-rev-2", "claude", ["--model", "opus"]),
-    ]),
-    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), [
-        ("mfc-exec", "claude", []),
-        ("mfc-rev", "codex", REV_EFFORT),
-        ("mfc-rev-2", "claude", ["--model", "opus"]),
-    ]),
-    ("acervo", f"{HOME}/Devs/acervo", [
-        ("acervo-exec", "claude", []),
-        ("acervo-rev", "codex", REV_EFFORT),
-        ("acervo-rev-2", "claude", ["--model", "opus"]),
-    ]),
+    ("omabackup", f"{HOME}/Devs/omabackup",
+        [
+            ("omabackup-exec", "claude", []),
+            ("omabackup-rev", "codex", REV_EFFORT),
+            ("omabackup-rev-2", "claude", ["--model", "opus"]),
+        ],
+        ("omabackup-scout", "codex", []),
+    ),
+    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"),
+        [
+            ("mfc-exec", "claude", []),
+            ("mfc-rev", "codex", REV_EFFORT),
+            ("mfc-rev-2", "claude", ["--model", "opus"]),
+        ],
+        ("mfc-scout", "codex", []),
+    ),
+    ("acervo", f"{HOME}/Devs/acervo",
+        [
+            ("acervo-exec", "claude", []),
+            ("acervo-rev", "codex", REV_EFFORT),
+            ("acervo-rev-2", "claude", ["--model", "opus"]),
+        ],
+        None,
+    ),
     # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
     # Claude, porque e' o projeto que testa o papel de orquestrador externo.
-    ("claude-bridge", f"{HOME}/.claude-bridge", [
-        ("claude-bridge-exec", "codex", []),
-        ("claude-bridge-rev", "codex", REV_EFFORT),
-        ("claude-bridge-rev-2", "claude", ["--model", "opus"]),
-    ]),
-    ("content-insights-collector", f"{HOME}/Devs/content-insights-collector", [
-        ("content-insights-collector-exec", "codex", []),
-        ("content-insights-collector-rev", "codex", REV_EFFORT),
-        ("content-insights-collector-rev-2", "claude", ["--model", "opus"]),
-    ]),
+    ("claude-bridge", f"{HOME}/.claude-bridge",
+        [
+            ("claude-bridge-exec", "codex", []),
+            ("claude-bridge-rev", "codex", REV_EFFORT),
+            ("claude-bridge-rev-2", "claude", ["--model", "opus"]),
+        ],
+        ("claude-bridge-scout", "codex", []),
+    ),
+    ("content-insights-collector", f"{HOME}/Devs/content-insights-collector",
+        [
+            ("content-insights-collector-exec", "codex", []),
+            ("content-insights-collector-rev", "codex", REV_EFFORT),
+            ("content-insights-collector-rev-2", "claude", ["--model", "opus"]),
+        ],
+        None,
+    ),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem "-exec" de proposito: a sessao interativa do
     # humano aqui e' o executor, nao um agent bootstrapado - so os revisores
     # sao geridos por este script.
-    ("herdr", HOME, [
-        ("herdr-rev", "codex", REV_EFFORT),
-        ("herdr-rev-2", "claude", ["--model", "opus"]),
-    ]),
+    ("herdr", HOME,
+        [
+            ("herdr-rev", "codex", REV_EFFORT),
+            ("herdr-rev-2", "claude", ["--model", "opus"]),
+        ],
+        None,
+    ),
 ]
 
 
@@ -103,14 +130,50 @@ def ensure_notify_watchers():
         )
 
 
+def start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings):
+    """Sobe (name, kind) no pane_id e, se subir de verdade, manda o reforço de
+    papel — usado tanto pro loop de split da tab 1 quanto pra tab do scout,
+    pra não duplicar a mesma lógica dos dois lugares."""
+    full_extra = list(extra_args)
+    if kind == "codex":
+        # desliga o sistema nativo de sub-agentes do Codex - ver
+        # core.CODEX_NO_NATIVE_AGENTS pro porque (achado real,
+        # omabackup-exec 2026-08-29)
+        full_extra += core.CODEX_NO_NATIVE_AGENTS
+    print(f"  {pane_id}: iniciando {kind} como '{name}'" + (f" ({' '.join(full_extra)})" if full_extra else ""))
+    started_ok = False
+    try:
+        args = ["agent", "start", name, "--kind", kind, "--pane", pane_id]
+        if full_extra:
+            args += ["--", *full_extra]
+        run(*args)
+        started_ok = True
+    except RuntimeError as exc:
+        # agent_not_ready = subiu mas parou num prompt (ex: trust do diretorio).
+        # Nao e falha: segue, mas nao manda reforco de papel - o agent nao
+        # esta pronto pra receber prompt ainda.
+        if "agent_not_ready" in str(exc):
+            print(f"  {pane_id}: {name} subiu mas aguarda input humano")
+        else:
+            raise
+
+    if started_ok:
+        prompt = core.role_reinforcement_prompt(name, label, cwd, siblings)
+        try:
+            run("agent", "prompt", name, prompt)
+        except RuntimeError as exc:
+            print(f"  {pane_id}: aviso — falhei mandando reforço de papel pra {name}: {exc}")
+
+
 def main():
     workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
     panes_by_ws = {}
     for p in api("pane", "list")["panes"]:
         panes_by_ws.setdefault(p["workspace_id"], []).append(p["pane_id"])
     busy = {a["pane_id"] for a in api("agent", "list")["agents"]}
+    existing_agent_names = {a.get("name") for a in api("agent", "list")["agents"] if a.get("name")}
 
-    for label, cwd, agents in SPACES:
+    for label, cwd, tab1_agents, scout in SPACES:
         ws = workspaces.get(label)
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")
@@ -124,33 +187,35 @@ def main():
             print(f"space {label}: já existe ({ws_id})")
 
         panes = panes_by_ws.get(ws_id, [])
-        while len(panes) < len(agents):
+        while len(panes) < len(tab1_agents):
             # 1o pane extra abre a direita (wide->right); os seguintes empilham
             # para baixo a partir do ultimo, para nao virar colunas apertadas.
             direction = "right" if len(panes) == 1 else "down"
-            print(f"  split ({direction}): {label} precisa de {len(agents)} panes, tem {len(panes)}")
+            print(f"  split ({direction}): {label} precisa de {len(tab1_agents)} panes na tab 1, tem {len(panes)}")
             res = run("pane", "split", panes[-1], "--direction", direction)
             if DRY:
                 break
             panes.append(res["pane"]["pane_id"])
 
-        for pane_id, (name, kind, extra_args) in zip(panes, agents):
+        all_names = [n for (n, _, _) in tab1_agents] + ([scout[0]] if scout else [])
+        for pane_id, (name, kind, extra_args) in zip(panes, tab1_agents):
             if pane_id in busy:
                 print(f"  {pane_id}: já tem agent, pulando")
                 continue
-            print(f"  {pane_id}: iniciando {kind} como '{name}'" + (f" ({' '.join(extra_args)})" if extra_args else ""))
-            try:
-                args = ["agent", "start", name, "--kind", kind, "--pane", pane_id]
-                if extra_args:
-                    args += ["--", *extra_args]
-                run(*args)
-            except RuntimeError as exc:
-                # agent_not_ready = subiu mas parou num prompt (ex: trust do diretorio).
-                # Nao e falha: segue para os proximos panes.
-                if "agent_not_ready" in str(exc):
-                    print(f"  {pane_id}: {name} subiu mas aguarda input humano")
-                else:
-                    raise
+            siblings = [n for n in all_names if n != name]
+            start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings)
+
+        if scout is not None:
+            scout_name, scout_kind, scout_extra = scout
+            if scout_name in existing_agent_names:
+                print(f"  {scout_name}: já existe (tab própria), pulando")
+            else:
+                print(f"  {label}: scout precisa de tab própria, criando...")
+                res = run("tab", "create", "--workspace", ws_id, "--cwd", cwd, "--label", "scout", "--no-focus")
+                if not DRY:
+                    scout_pane_id = res["root_pane"]["pane_id"]
+                    siblings = [n for n in all_names if n != scout_name]
+                    start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, label, cwd, siblings)
 
     ensure_notify_watchers()
 

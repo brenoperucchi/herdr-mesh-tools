@@ -91,6 +91,46 @@ def freeze_files(files, round_dir):
     return mapping
 
 
+# Desliga o sistema nativo de sub-agentes do Codex (`agents`/`pipeline_*` em
+# ~/.codex/config.toml, global à máquina) pra qualquer agent que o Herdr
+# gerencia. Achado real (2026-08-29, omabackup-exec pós-swap): um exec Codex
+# tentou "uma rodada final independente" via esse mecanismo nativo em vez de
+# voltar pro herdr-review — spawnou um processo efêmero, invisível, fora do
+# Herdr, sem pane, sem identidade, e falhou porque o `./agents/*.toml` local
+# não existe no projeto. Ver AGENTS.md "Reviewer colleagues" / herdr-6.
+CODEX_NO_NATIVE_AGENTS = ["-c", "agents.max_threads=0"]
+
+ROLE_REINFORCEMENT_PROMPT = """Reforço de papel — mandatório a cada início ou troca de agent neste space,
+não é um FYI opcional.
+
+Você é `{name}` no space `{slug}` (cwd `{cwd}`). Seus colegas neste mesmo
+space são panes REAIS e vivos no Herdr agora — não hipotéticos, nada a
+configurar: {siblings}.
+
+Regra que não muda entre CLI (Claude ou Codex) nem entre troca de kind: TODA
+revisão, consulta de design ou "segunda opinião" passa pelas skills
+`herdr-review`/`herdr-ask`, que despacham pros panes acima. NUNCA use o
+sistema nativo de sub-agentes do seu próprio CLI (ex: `agents`/
+`pipeline_reviewer` do Codex, ou o tool `Agent` do Claude) como substituto —
+isso spawna processo efêmero e invisível, fora do Herdr, sem pane, sem
+identidade persistente; o usuário não consegue ver nem confiar no resultado.
+Se dado sentir vontade de "fazer mais uma rodada rápida e independente por
+conta própria", isso é sinal de voltar pro `herdr-review` de novo, não de
+usar um atalho nativo do seu CLI.
+
+Detalhes completos em AGENTS.md/CLAUDE.md (seção "Reviewer colleagues") e em
+`.herdr/reviewer.md` deste repo, se existir."""
+
+
+def role_reinforcement_prompt(name, slug, cwd, siblings):
+    """siblings: lista de nomes dos outros agents do mesmo space (`<slug>-exec`,
+    `<slug>-rev`, `<slug>-rev-2`), já sem o próprio `name`. Formata como texto
+    corrido pro prompt; lista vazia (space sem colegas, ex. "herdr" sem exec)
+    vira uma frase dizendo isso explicitamente, não um "{siblings}" vazio."""
+    sib_text = ", ".join(f"`{s}`" for s in siblings) if siblings else "nenhum — este space não tem outros agents"
+    return ROLE_REINFORCEMENT_PROMPT.format(name=name, slug=slug, cwd=cwd, siblings=sib_text)
+
+
 _COMPOSE_LINE_RE = re.compile(r"^(❯|›)\s+(\S.*)$")
 _PENDING_MARKERS = (
     "interrupted", "what should claude do instead", "do you trust",
