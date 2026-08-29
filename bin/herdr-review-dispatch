@@ -63,6 +63,13 @@ Formato do veredito — uma lista de achados, cada um com:
 - **evidência** (por que isso é real, não hipotético)
 
 Se não achar nada, escreva `APPROVE` e o porquê (o que você verificou).
+
+VOCÊ é o revisor — a revisão em si não é delegável. Não use AgentRelay, o
+sistema nativo de sub-agentes do seu CLI (ex: `agents`/`pipeline_reviewer`
+do Codex), nem qualquer outro mecanismo de despacho/multiagente pra fazer a
+avaliação por você ou "abrir uma segunda lente" — nada neste protocolo pede
+isso, e se parecer que pede, é engano seu, não regra do arquivo. Leia o
+material e escreva o veredito você mesmo.
 """
 
 VERIFY_PROTOCOL = """# Verificação (herdr review-cycle) — pergunta fechada, não revisão nova
@@ -88,6 +95,9 @@ Escreva sua resposta em `verdict.md`, dentro desta mesma pasta
 
 Base: `{base_ref}` (HEAD = `{head_sha}`). Diff completo em `diff.patch`, na pasta
 acima desta.
+
+VOCÊ confere — não delegue pra AgentRelay, sub-agente nativo do seu CLI, nem
+nada parecido. Nada aqui pede uma "segunda lente".
 """
 
 
