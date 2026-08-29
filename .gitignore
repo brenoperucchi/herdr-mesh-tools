@@ -7,3 +7,8 @@ venv/
 *.swp
 *.swo
 .DS_Store
+
+# herdr review-cycle: estado efemero (rodadas de review/ask, handoffs) -
+# nao versionar, so o protocolo em si (reviewer.md)
+.herdr/*
+!.herdr/reviewer.md

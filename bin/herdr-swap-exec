@@ -3,10 +3,18 @@
 -> codex), preservando contexto via handoff escrito em arquivo pelo próprio
 agent que está saindo. NÃO manda o buffer/scrollback bruto pro novo agent —
 isso é lossy e específico da CLI de cada um. Em vez disso, pede pro exec atual
-escrever um resumo de handoff, confirma que ele escreveu, divide um pane novo
-do lado, fecha o pane antigo (mata o processo — pedir pra CLI sair sozinha via
-send-keys se mostrou pouco confiável, ctrl+d/ctrl+c não encerraram de forma
-previsível) e só então sobe o novo kind já apontado pra ler aquele resumo.
+escrever um resumo de handoff, confirma que ele escreveu, sobe o novo kind num
+pane à parte sob nome PROVISÓRIO, confirma que ele respondeu, e só ENTÃO fecha
+o pane antigo (mata o processo — pedir pra CLI sair sozinha via send-keys se
+mostrou pouco confiável, ctrl+d/ctrl+c não encerraram de forma previsível) e
+renomeia o novo pro nome final. Até o close do antigo, tudo é reversível: se o
+novo não subir, só se fecha o pane provisório e o antigo continua vivo e
+intacto.
+
+Antes de mandar qualquer coisa pro agent antigo (inclusive o pedido de
+handoff), confere heuristicamente se o pane não tem composição humana ou
+diálogo pendente (`core.pane_looks_busy_with_human_input`) — não é garantia
+(existe corrida real entre a leitura e a ação seguinte), é redução de janela.
 
 Uso:
   herdr-swap-exec <slug> <kind> [-- <agent-args...>]
@@ -60,10 +68,6 @@ def dispatch_and_wait(name, prompt_text, timeout_s):
     return result[name], info[name]
 
 
-def recover_pane(new_pane_id, handoff_path):
-    print(f"o pane {new_pane_id} está aguardando — confira na mão. O handoff está salvo em {handoff_path}.", file=sys.stderr)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
@@ -95,6 +99,11 @@ def main():
     if args.kind == old_kind:
         print(f"aviso: '{name}' já é '{old_kind}' — trocando mesmo assim (contexto zera igual)", file=sys.stderr)
 
+    busy, why = core.pane_looks_busy_with_human_input(pane_id)
+    if busy:
+        print(f"erro: {pane_id} parece ter composição humana ou diálogo pendente ({why}) — abortando antes de mandar qualquer coisa. Confira o pane na mão.", file=sys.stderr)
+        sys.exit(1)
+
     handoff_dir = os.path.join(cwd, ".herdr", "handoff")
     os.makedirs(handoff_dir, exist_ok=True)
     handoff_path = os.path.join(
@@ -122,22 +131,25 @@ def main():
 
     print(f"handoff escrito ({os.path.getsize(handoff_path)} bytes).")
 
-    # A partir daqui o exec antigo pode já estar morto (pane fechado) - qualquer
-    # erro precisa reportar como recuperar, nunca um traceback cru.
+    # Sobe o novo kind sob nome PROVISÓRIO antes de tocar no antigo — até o
+    # `pane close` do antigo (mais abaixo), tudo aqui é reversível: se o novo
+    # não subir, só se fecha o pane novo e o exec antigo continua vivo,
+    # intacto, como se nada tivesse acontecido. Isso elimina a categoria de
+    # "antigo morto, novo não subiu" que existia quando o close vinha antes
+    # do start (achado em herdr-6, ambos os revisores independentemente).
+    temp_name = f"{name}-new"
+
     try:
         print(f"dividindo pane novo ao lado de {pane_id}...")
         split = api("pane", "split", pane_id, "--direction", "right", "--no-focus")
         new_pane_id = split["pane"]["pane_id"]
-
-        print(f"fechando o pane antigo ({pane_id}, {old_kind}) — libera o nome '{name}'...")
-        api("pane", "close", pane_id)
     except RuntimeError as exc:
-        print(f"erro dividindo/fechando pane: {exc}", file=sys.stderr)
-        print(f"processo antigo em {pane_id} pode ainda estar vivo — confira na mão. Handoff salvo em {handoff_path}.", file=sys.stderr)
+        print(f"erro dividindo pane: {exc}", file=sys.stderr)
+        print(f"processo antigo em {pane_id} não foi tocado. Handoff salvo em {handoff_path}.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"subindo {name} como '{args.kind}' no pane novo ({new_pane_id})...")
-    start_args = ["agent", "start", name, "--kind", args.kind, "--pane", new_pane_id]
+    print(f"subindo '{temp_name}' (provisório) como '{args.kind}' no pane novo ({new_pane_id})...")
+    start_args = ["agent", "start", temp_name, "--kind", args.kind, "--pane", new_pane_id]
     if args.extra_args:
         start_args += ["--", *args.extra_args]
 
@@ -162,7 +174,7 @@ def main():
         # como "resolveu sozinho".
         try:
             time.sleep(4)
-            if get_agent(name)["agent_status"] in ("idle", "working", "done"):
+            if get_agent(temp_name)["agent_status"] in ("idle", "working", "done"):
                 last_exc = None
         except RuntimeError as exc:
             last_exc = exc
@@ -177,20 +189,43 @@ def main():
             ).stdout
             trust_markers = ("Do you trust", "confia", "trust the contents", "Yes, I trust")
             if any(m.lower() in pane_text.lower() for m in trust_markers):
-                print(f"'{name}' parou num diálogo de confiança de diretório (1a vez desse kind aqui) — aprovando...")
-                api("agent", "send-keys", name, "enter")
+                print(f"'{temp_name}' parou num diálogo de confiança de diretório (1a vez desse kind aqui) — aprovando...")
+                api("agent", "send-keys", temp_name, "enter")
                 time.sleep(2)
-                if get_agent(name)["agent_status"] in ("idle", "working", "done"):
+                if get_agent(temp_name)["agent_status"] in ("idle", "working", "done"):
                     last_exc = None
             if last_exc is not None:
-                print(f"'{name}' ficou bloqueado num diálogo que não reconheço — veja o pane {new_pane_id} na mão:", file=sys.stderr)
+                print(f"'{temp_name}' ficou bloqueado num diálogo que não reconheço — veja o pane {new_pane_id} na mão:", file=sys.stderr)
                 print(pane_text[-800:], file=sys.stderr)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             print(f"erro checando/respondendo o diálogo: {exc}", file=sys.stderr)
 
     if last_exc is not None:
         print(f"erro ao subir o novo agent: {last_exc}", file=sys.stderr)
-        recover_pane(new_pane_id, handoff_path)
+        print(f"'{name}' (antigo, {old_kind}) NÃO foi tocado — continua vivo em {pane_id}, com contexto intacto.", file=sys.stderr)
+        try:
+            api("pane", "close", new_pane_id)
+            print(f"pane provisório {new_pane_id} fechado. Handoff salvo em {handoff_path} pra tentar de novo depois.", file=sys.stderr)
+        except RuntimeError as exc2:
+            print(f"pane provisório {new_pane_id} ficou pra trás sem fechar ({exc2}) — feche na mão se quiser. O antigo continua sendo o '{name}' válido.", file=sys.stderr)
+        sys.exit(1)
+
+    # Ponto de não-retorno de verdade: só a partir daqui o antigo é encerrado.
+    # Tudo antes disso era reversível.
+    print(f"'{temp_name}' subiu e respondeu — fechando o antigo ({pane_id}, {old_kind}) e promovendo o nome...")
+    try:
+        api("pane", "close", pane_id)
+    except RuntimeError as exc:
+        print(f"erro fechando o pane antigo: {exc}", file=sys.stderr)
+        print(f"'{temp_name}' está vivo em {new_pane_id} mas o antigo '{name}' em {pane_id} também pode continuar vivo — confira os dois na mão antes de renomear.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        api("agent", "rename", new_pane_id, name)
+    except RuntimeError as exc:
+        print(f"erro renomeando '{temp_name}' -> '{name}': {exc}", file=sys.stderr)
+        print(f"o novo agent está vivo em {new_pane_id}, só que com o nome '{temp_name}' em vez de '{name}'. Renomeie na mão: herdr agent rename {new_pane_id} {name}", file=sys.stderr)
+        print(f"handoff: {handoff_path}", file=sys.stderr)
         sys.exit(1)
 
     try:

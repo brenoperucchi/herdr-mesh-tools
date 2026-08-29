@@ -91,6 +91,44 @@ def freeze_files(files, round_dir):
     return mapping
 
 
+_COMPOSE_LINE_RE = re.compile(r"^(❯|›)\s+(\S.*)$")
+_PENDING_MARKERS = (
+    "interrupted", "what should claude do instead", "do you trust",
+    "confia", "trust the contents",
+)
+
+
+def pane_looks_busy_with_human_input(pane_id, lines=12):
+    """Heurística, não garantia: lê o pane (`--source detection`, o buffer
+    que o próprio Herdr usa pra detectar estado de agent, onde a caixa de
+    composição vive) e sinaliza suspeita de texto humano não confirmado ou
+    diálogo pendente. Existe uma corrida real que isso não fecha: texto pode
+    chegar ENTRE essa leitura e a ação seguinte — reduz a janela, não prova
+    segurança. Ver discussão em herdr-6 (herdr-ask) sobre os limites disso.
+
+    Retorna (suspeito: bool, motivo: str|None). Em qualquer erro de leitura,
+    trata como suspeito (falha segura, não silenciosa)."""
+    try:
+        out = subprocess.run(
+            [HERDR, "pane", "read", pane_id, "--source", "detection", "--lines", str(lines)],
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return True, "timeout lendo o pane pra checar composição — tratando como suspeito"
+    if out.returncode != 0:
+        return True, f"falha lendo pane pra checar composição: {out.stderr.strip()}"
+    text = out.stdout
+    for line in text.splitlines():
+        m = _COMPOSE_LINE_RE.match(line.strip())
+        if m:
+            return True, f"caixa de composição parece ter texto não enviado: {m.group(2)[:80]!r}"
+    lowered = text.lower()
+    for marker in _PENDING_MARKERS:
+        if marker in lowered:
+            return True, f"pane mostra diálogo/pergunta pendente (marcador: {marker!r})"
+    return False, None
+
+
 def dispatch_and_wait_all(prompts, timeout_s):
     """Manda o prompt e espera cada agent assentar (idle/done) via
     `agent prompt --wait`, um subprocesso concorrente por nome — um agent

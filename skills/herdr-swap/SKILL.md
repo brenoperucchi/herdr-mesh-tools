@@ -37,25 +37,31 @@ herdr-swap-exec mfc claude -- --model opus
 `<slug>-exec` precisa existir e estar `idle` ou `done` — o script recusa trocar
 em cima de `working`/`blocked`. Ele:
 
+0. Antes de mandar qualquer coisa pro pane antigo (inclusive o pedido de
+   handoff), lê o pane (`--source detection`) e aborta se parecer ter
+   composição humana não enviada ou diálogo pendente. **Isso é heurística, não
+   garantia** — existe corrida real entre essa leitura e a ação seguinte
+   (alguém pode digitar bem depois do read). Reduz a janela, não a fecha.
 1. Pede pro exec atual escrever um resumo de handoff em
    `.herdr/handoff/<slug>-<timestamp>-<pid>.md` (o que estava fazendo, decisões,
    o que falta, arquivos relevantes) e confirma que o arquivo foi escrito antes
    de continuar — se não escrever, aborta e não mexe no processo antigo.
-2. Divide um pane novo do lado, fecha o antigo (é assim que o processo anterior
-   é encerrado — pedir pra CLI sair educadamente via `ctrl+d`/`ctrl+c` se
-   mostrou pouco confiável, não confie nisso). **A partir daqui o exec antigo já
-   morreu** — se algo falhar depois disso (passo 3 ou 4), não há mais como
-   voltar atrás, só seguir em frente.
-3. Sobe o novo `kind` no pane novo, com o mesmo nome `<slug>-exec`.
-4. Manda o novo agent ler o handoff antes de fazer qualquer coisa — sem esperar
-   resposta.
+2. Divide um pane novo do lado e sobe o novo `kind` ali sob um nome
+   **provisório** (`<slug>-exec-new`) — o exec antigo **continua vivo e
+   intocado** nesse momento.
+3. Só depois de confirmar que o provisório respondeu (subiu de verdade, não
+   travou num diálogo desconhecido), fecha o pane antigo — **esse é o ponto de
+   não-retorno real**, tudo antes dele é reversível — e renomeia o provisório
+   pro nome final (`<slug>-exec-new` → `<slug>-exec`) via `herdr agent rename`.
+4. Manda o novo agent (já com o nome final) ler o handoff antes de fazer
+   qualquer coisa — sem esperar resposta.
 
-**Se o passo 3 falhar** (o script imprime "o pane X está aguardando" com o
-caminho do handoff): o exec antigo já morreu e o novo nunca subiu — o pane fica
-com um shell nu. Não é dado perdido, o handoff está salvo em disco. Suba na mão:
-`herdr agent start <slug>-exec --kind <kind> --pane <pane-que-o-script-citou>`,
-depois `herdr agent prompt <slug>-exec "Leia <caminho-do-handoff> antes de
-qualquer coisa"`.
+**Se o passo 2 falhar** (o novo kind não sobe): o script já fecha sozinho o
+pane provisório e imprime que o exec antigo **não foi tocado** — nada a
+recuperar, o handoff fica salvo em disco pra tentar de novo. **Se o passo 3
+falhar depois do close do antigo** (rename não vai): o script avisa que o novo
+agent está vivo, só que ainda com o nome provisório — renomeie na mão:
+`herdr agent rename <pane-que-o-script-citou> <slug>-exec`.
 
 Diálogos de startup (ex: confiar num diretório, comum na primeira vez que um
 `kind` roda ali) são reconhecidos por padrão de texto e aprovados
@@ -76,3 +82,24 @@ disso. Deixe ele ler e retomar no próprio ritmo; se o resumo não for suficient
 - Não assuma que o handoff cobre tudo perfeitamente — é um resumo escrito por
   um agent sobre si mesmo, não um dump completo. Se o novo exec parecer perdido,
   isso é sinal de que o handoff ficou raso, não de que o mecanismo falhou.
+- **Nunca encerre um agent mandando `/exit` ou `ctrl+d`/`ctrl+c` como texto pra
+  um pane que pode estar em uso** (nem na mão, nem em script novo) — se houver
+  algo digitado e não confirmado na caixa de composição, o texto de saída se
+  junta a ele e é ENVIADO como mensagem, não descartado. Pra encerrar um
+  processo, use `herdr pane close <pane_id>` — ele mata o processo direto, sem
+  passar pela caixa de entrada, então na pior hipótese *descarta* o rascunho
+  não confirmado em vez de *submetê-lo*. Dois incidentes reais confirmaram isso
+  (ver `~/.herdr/ask/herdr-6/` pra contexto completo).
+- Pra ajustar só um parâmetro (ex: effort/model) de um agent que já está no
+  `kind` certo, não rode um swap completo — prefira `herdr pane close` +
+  `herdr pane split` + `<cli> resume <session-id> -c ...` no mesmo `kind`, sem
+  trocar de CLI. Evita a janela de risco inteira do handoff cross-CLI.
+
+## Próximos passos identificados (não implementados ainda)
+
+- `--dry-run`: mostrar o plano (handoff que seria pedido, panes que seriam
+  tocados) sem executar `close`/`start` de verdade.
+- Log de auditoria em append (`.herdr/handoff/swap-log.md`: quando, quem,
+  de/para, status de cada etapa) — hoje um incidente só fica registrado se
+  alguém lembrar de reconstruir de memória.
+- Lock por slug pra evitar duas trocas simultâneas no mesmo `<slug>-exec`.
