@@ -98,7 +98,14 @@ def freeze_files(files, round_dir):
 # voltar pro herdr-review — spawnou um processo efêmero, invisível, fora do
 # Herdr, sem pane, sem identidade, e falhou porque o `./agents/*.toml` local
 # não existe no projeto. Ver AGENTS.md "Reviewer colleagues" / herdr-6.
-CODEX_NO_NATIVE_AGENTS = ["-c", "agents.max_threads=0"]
+#
+# `max_threads=0` (usado até 2026-08-30) quebrou depois de um update do
+# Codex (0.149.1 -> 0.151.0): a chave de validação real é
+# `agents.max_concurrent_threads_per_session`, que exige >=1 — `0` vira erro
+# fatal de config, o processo nem sobe ("Error loading configuration").
+# `max_depth=0` consegue o mesmo efeito (nenhum sub-agente pode ser
+# spawnado, profundidade zero) sem bater nesse piso.
+CODEX_NO_NATIVE_AGENTS = ["-c", "agents.max_depth=0"]
 
 ROLE_REINFORCEMENT_PROMPT = """Reforço de papel — mandatório a cada início ou troca de agent neste space,
 não é um FYI opcional.
