@@ -31,11 +31,11 @@ Editing either location edits the same file.
   for a single cheaper consultant). The response format is a decision with
   explicit premises, not an atomic finding — writes to `.herdr/ask/`, a
   namespace separate from `.herdr/review/`.
-- **`herdr-swap-exec`** — swaps the kind (`claude`/`codex`) of a workspace's
-  `<slug>-exec` agent, preserving context via a handoff file written by the
-  outgoing agent.
+- **`herdr-swap`** — swaps the kind (`claude`/`codex`/`grok`/etc) of a
+  workspace's `<slug>-<role>` agent (`exec`, `rev`, `rev-2`, `scout`, ...),
+  preserving context via a handoff file written by the outgoing agent.
 - **`_herdr_dispatch.py`** — shared mechanics behind `herdr-review-dispatch`,
-  `herdr-ask`, and `herdr-swap-exec`: talking to the `herdr` CLI, resolving
+  `herdr-ask`, and `herdr-swap`: talking to the `herdr` CLI, resolving
   agent status/cwd, numbering a round directory, freezing context, and
   `dispatch_and_wait_all()` (concurrent `agent prompt --wait` per agent, with
   a per-agent watchdog for a genuinely sustained `blocked`). Not a CLI itself

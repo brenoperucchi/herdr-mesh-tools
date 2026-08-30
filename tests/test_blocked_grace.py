@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for the blocked-vs-transient settle logic in
 _herdr_dispatch.dispatch_and_wait_all() — shared by herdr-review-dispatch (N
-concurrent agents) and herdr-swap-exec (1 agent, via a thin wrapper) — both
+concurrent agents) and herdr-swap (1 agent, via a thin wrapper) — both
 via native `agent prompt --wait`, one `herdr` subprocess per agent.
 
 These formalize the ad-hoc simulations used to validate BLOCKED_GRACE_S so
@@ -149,11 +149,11 @@ class DispatchAndWaitAllTests(_BaseDispatchTests):
 
 
 class DispatchAndWaitTests(_BaseDispatchTests):
-    """herdr-swap-exec: dispatch_and_wait(), wrapper de 1 agente sobre
+    """herdr-swap: dispatch_and_wait(), wrapper de 1 agente sobre
     dispatch_and_wait_all() — mesmo motor, mesmos cenarios, via a API do
     script (name, text, timeout) -> (status, info)."""
 
-    SCRIPT_NAME = "herdr-swap-exec"
+    SCRIPT_NAME = "herdr-swap"
 
     def test_sustained_blocked_reports_early_not_full_timeout(self):
         with mock.patch.object(self.core.subprocess, "Popen", side_effect=self._popen_by_name({"x": self._never_exits_proc()})), \

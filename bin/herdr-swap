@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""herdr-swap-exec <slug> <kind> — troca o kind do agent <slug>-exec (ex: claude
--> codex), preservando contexto via handoff escrito em arquivo pelo próprio
-agent que está saindo. NÃO manda o buffer/scrollback bruto pro novo agent —
-isso é lossy e específico da CLI de cada um. Em vez disso, pede pro exec atual
+"""herdr-swap <slug> <role> <kind> — troca o kind do agent <slug>-<role> (ex:
+claude -> codex, ou -> grok), preservando contexto via handoff escrito em
+arquivo pelo próprio agent que está saindo. <role> é qualquer sufixo real
+(exec, rev, rev-2, scout, ...) — a mecânica é idêntica pra qualquer papel, só
+muda o nome. NÃO manda o buffer/scrollback bruto pro novo agent — isso é
+lossy e específico da CLI de cada um. Em vez disso, pede pro agent atual
 escrever um resumo de handoff, confirma que ele escreveu, sobe o novo kind num
 pane à parte sob nome PROVISÓRIO, confirma que ele respondeu, e só ENTÃO fecha
 o pane antigo (mata o processo — pedir pra CLI sair sozinha via send-keys se
@@ -17,10 +19,14 @@ diálogo pendente (`core.pane_looks_busy_with_human_input`) — não é garantia
 (existe corrida real entre a leitura e a ação seguinte), é redução de janela.
 
 Uso:
-  herdr-swap-exec <slug> <kind> [-- <agent-args...>]
+  herdr-swap <slug> <role> <kind> [-- <agent-args...>]
 
-Exige que <slug>-exec já exista e esteja 'idle' ou 'done' (não troca em cima de
-trabalho em andamento).
+Exemplos:
+  herdr-swap mfc rev-2 grok
+  herdr-swap omabackup exec codex
+
+Exige que <slug>-<role> já exista e esteja 'idle' ou 'done' (não troca em
+cima de trabalho em andamento).
 """
 import argparse
 import os
@@ -71,6 +77,7 @@ def dispatch_and_wait(name, prompt_text, timeout_s):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
+    ap.add_argument("role", help="sufixo do agent: exec, rev, rev-2, scout, ...")
     ap.add_argument("kind")
     ap.add_argument("extra_args", nargs="*", help="passados pro novo agent depois de --")
     ap.add_argument("--timeout", type=int, default=180, help="segundos pra esperar o handoff ser escrito")
@@ -80,7 +87,7 @@ def main():
         print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
         sys.exit(1)
 
-    name = f"{args.slug}-exec"
+    name = f"{args.slug}-{args.role}"
 
     try:
         info = get_agent(name)
