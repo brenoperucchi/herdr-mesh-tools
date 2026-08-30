@@ -63,7 +63,13 @@ SPACES = [
     ),
     # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
     # Claude, porque e' o projeto que testa o papel de orquestrador externo.
-    ("claude-bridge", f"{HOME}/.claude-bridge",
+    # cwd e' o repo de codigo real (~/Devs/claude-bridge), nao o dir de
+    # runtime (~/.claude-bridge, so broker.sqlite/tokens.json) - achado
+    # 2026-08-29: claude-bridge-exec relatou honestamente que AGENTS.md/
+    # CLAUDE.md/.herdr/reviewer.md nao existiam no cwd registrado porque
+    # apontava pro dir errado; o proprio exec ja trabalhava de fato em
+    # ~/Devs/claude-bridge (onde o codigo/git realmente vive).
+    ("claude-bridge", f"{HOME}/Devs/claude-bridge",
         [
             ("claude-bridge-exec", "codex", []),
             ("claude-bridge-rev", "codex", REV_EFFORT),
