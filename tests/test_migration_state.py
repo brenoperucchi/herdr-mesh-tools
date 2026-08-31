@@ -180,21 +180,45 @@ class MigrationStateTests(unittest.TestCase):
 
     # --- dual-read fail-closed ------------------------------------------
 
+    # Achado P1 herdr-13 (herdr-rev): resolve_reviewer_name passou a usar
+    # agent_status_or_raise (que chama core.agent_status -> core.get_agent_info),
+    # não mais o agent_status_safe fail-open — mockar o alias antigo deixaria
+    # a chamada real escapar pro binário `herdr`.
+    def _fake_get_agent_info(self, alive_names):
+        def fake(name):
+            if name in alive_names:
+                return {"agent_status": "idle"}
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+        return fake
+
     def test_resolve_reviewer_name_only_rev(self):
-        with patch.object(self.core, "agent_status_safe", side_effect=lambda n: n == "foo-rev"):
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info({"foo-rev"})):
             self.assertEqual(self.migration.resolve_reviewer_name(self.cwd, "foo"), "foo-rev")
 
     def test_resolve_reviewer_name_only_rev1(self):
-        with patch.object(self.core, "agent_status_safe", side_effect=lambda n: n == "foo-rev-1"):
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info({"foo-rev-1"})):
             self.assertEqual(self.migration.resolve_reviewer_name(self.cwd, "foo"), "foo-rev-1")
 
     def test_resolve_reviewer_name_both_alive_raises(self):
-        with patch.object(self.core, "agent_status_safe", return_value=True):
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info({"foo-rev", "foo-rev-1"})):
             with self.assertRaises(RuntimeError):
                 self.migration.resolve_reviewer_name(self.cwd, "foo")
 
     def test_resolve_reviewer_name_neither_alive_raises(self):
-        with patch.object(self.core, "agent_status_safe", return_value=False):
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info(set())):
+            with self.assertRaises(RuntimeError):
+                self.migration.resolve_reviewer_name(self.cwd, "foo")
+
+    def test_resolve_reviewer_name_infra_failure_propagates(self):
+        # Achado P1 herdr-13: um timeout consultando UM dos dois nomes não
+        # pode virar "não existe" silenciosamente — precisa propagar, não
+        # deixar a função escolher o outro nome como se o estado não fosse
+        # ambíguo.
+        def fake(name):
+            if name == "foo-rev-1":
+                raise RuntimeError("sem resposta em 30s")
+            return {"agent_status": "idle"}
+        with patch.object(self.core, "get_agent_info", side_effect=fake):
             with self.assertRaises(RuntimeError):
                 self.migration.resolve_reviewer_name(self.cwd, "foo")
 
@@ -541,6 +565,58 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         state = self.migrate.migration.read_migration_state(self.cwd)
         self.assertEqual(state["phase"], "migrated")
         self.assertEqual(state["rev2_kind"], "grok")
+
+    def test_self_heal_infra_failure_keeps_phase_migrating_not_observed_phase(self):
+        # Achado P1-1 herdr-13 (herdr-rev): a versão anterior restaurava
+        # `observed_phase` quando a rechecagem de ausência sob o lock falhava
+        # por infra — mas essa fase pode ser "legacy", que o gate do worker
+        # trata como livre, reabrindo o space pra uso durante um estado ainda
+        # não confirmado. Agora deve permanecer "migrating" (bloqueado).
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        def fake_agent_status_or_raise(name):
+            if name == "foo-rev":
+                raise RuntimeError("sem resposta em 30s")
+            raise AssertionError(f"agent_status_or_raise inesperado: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.migration, "agent_status_or_raise", side_effect=fake_agent_status_or_raise):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 2)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "migrating", "falha de infra na rechecagem não pode reabrir uma fase livre como legacy")
+
+    def test_self_heal_requires_idle_or_done_not_only_interactive_ready(self):
+        # Achado P1-2 herdr-13 (herdr-rev): o caminho normal já exige
+        # agent_status idle/done antes de agir; o self-heal só checava
+        # interactive_ready, permitindo finalizar mesmo com o rev-1 ainda
+        # "working" (ou reocupado por outro pane).
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("working")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "pending-manual", "rev-1 'working' não pode ser finalizado como migrated silenciosamente")
 
     def test_self_heal_refuses_when_lock_held_by_an_active_process(self):
         # Achado P1-1 herdr-10 (os dois revisores, independentemente): a

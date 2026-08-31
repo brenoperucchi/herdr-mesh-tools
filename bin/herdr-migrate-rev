@@ -129,17 +129,22 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
             # ponto (o rename é feito por `_reinforce_and_finalize`, mais
             # abaixo) — uma falha de infra aqui (timeout, servidor sob
             # carga) não é um estado corrompido que exija intervenção
-            # humana, é "não consegui confirmar, tente de novo". Mesmo
-            # desfecho do ramo "reapareceu" logo abaixo: restaura a phase
-            # observada, exit 2. `pending-manual` fica reservado pra
-            # ambiguidade real observada no mundo (ex: pós-rename).
+            # humana, é "não consegui confirmar, tente de novo".
+            #
+            # Achado P1-1 herdr-13 (herdr-rev): a versão anterior restaurava
+            # `observed_phase` aqui — mas essa fase pode ser `legacy` (o
+            # chamador encaminha QUALQUER fase não-terminal pro self-heal),
+            # e `legacy` é tratada como "livre" pelo gate do worker
+            # (`space_gate_reason`), reabrindo o space pra uso durante um
+            # estado que ainda não foi confirmado. Mantém `phase=migrating`
+            # (já gravada acima) em vez de restaurar — o space continua
+            # bloqueado até a próxima tentativa confirmar algo de verdade;
+            # `space_gate_message` já orienta a rodar este comando de novo.
             note = f"self-heal: falha reconfirmando ausência de '{rev_name}' sob o lock ({exc})"
-            print(f"erro: {note} — não vou reconciliar por segurança, tente de novo", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": observed_phase})
+            print(f"erro: {note} — não vou reconciliar por segurança; mantendo phase=migrating (bloqueado) até a próxima tentativa, tente de novo", file=sys.stderr)
             sys.exit(2)
         if reappeared:
-            print(f"'{rev_name}' reapareceu depois do lock — não é mais um caso de self-heal, rode de novo", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": observed_phase})
+            print(f"'{rev_name}' reapareceu depois do lock — não é mais um caso de self-heal; mantendo phase=migrating (bloqueado), rode de novo", file=sys.stderr)
             sys.exit(2)
         try:
             after = get_agent(rev1_name)
@@ -153,6 +158,17 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         # (achado P2-2 herdr-10: não exigir menos que o caminho normal).
         if after.get("interactive_ready") is not True:
             note = f"self-heal: '{rev1_name}' encontrado mas interactive_ready != True"
+            print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+        # Achado P1-2 herdr-13 (herdr-rev): a versão anterior só checava
+        # `interactive_ready`, ao contrário do caminho normal (`:283-285`),
+        # que também exige `agent_status` em `idle`/`done` antes de agir. Um
+        # `rev-1` que esteja `working` — ou que tenha sido reocupado por
+        # outro pane depois do rename original — podia receber um segundo
+        # `agent.prompt` e ser marcado como migração concluída mesmo assim.
+        if after.get("agent_status") not in ("idle", "done"):
+            note = f"self-heal: '{rev1_name}' encontrado mas agent_status={after.get('agent_status')!r} (esperado idle/done)"
             print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
             migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
             sys.exit(1)

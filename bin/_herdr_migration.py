@@ -309,11 +309,22 @@ def agent_status_or_raise(name):
 def resolve_reviewer_name(cwd, slug):
     """Dual-read do primeiro revisor: <slug>-rev-1 se vivo, senão <slug>-rev.
     Fail-closed (RuntimeError) se os dois estiverem vivos ao mesmo tempo
-    (estado ambíguo — nunca escolhe sozinho) ou se nenhum existir."""
+    (estado ambíguo — nunca escolhe sozinho) ou se nenhum existir.
+
+    Achado P1 herdr-13 (herdr-rev): usava `core.agent_status_safe`, que
+    converte QUALQUER RuntimeError (inclusive timeout/infra) em `False` —
+    isto é o último ponto decisório do mecanismo que ainda fazia isso. Se a
+    consulta de um dos dois nomes sofrer timeout enquanto o outro responde,
+    o timeout virava silenciosamente "não existe", e a função escolhia o
+    nome que respondeu como se o estado não fosse ambíguo — exatamente a
+    garantia que este docstring promete e que `agent_status_or_raise`
+    existe para preservar. Usa `agent_status_or_raise` agora: uma falha de
+    infra em qualquer uma das duas consultas propaga (fail-closed), em vez
+    de ser tratada como ausência confirmada."""
     rev1_name = f"{slug}-rev-1"
     rev_name = f"{slug}-rev"
-    rev1_alive = core.agent_status_safe(rev1_name)
-    rev_alive = core.agent_status_safe(rev_name)
+    rev1_alive = agent_status_or_raise(rev1_name) is not None
+    rev_alive = agent_status_or_raise(rev_name) is not None
     if rev1_alive and rev_alive:
         raise RuntimeError(
             f"estado ambíguo: '{rev1_name}' e '{rev_name}' estão vivos ao mesmo "
