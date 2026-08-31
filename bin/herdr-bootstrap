@@ -11,6 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
+import _herdr_migration as migration
 
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 HOME = os.path.expanduser("~")
@@ -30,37 +31,27 @@ DRY = "--dry-run" in sys.argv
 # metrics.json / artifact "Ciclo de Revisao").
 REV_EFFORT = ["-c", "model_reasoning_effort=high"]
 
-# label -> (cwd, tab1_agents, scout)
+# label -> (cwd, exec_agent_or_None, scout)
 # scout e' sempre tab PROPRIA no workspace (herdr tab create), nunca mais um
 # pane splitado na tab 1 - achado explicito do usuario (2026-08-29): scout
 # faz um tipo de trabalho diferente (leitura/exploracao paralela) e misturar
 # no mesmo tab de exec/rev/rev-2 nao faz sentido de layout. None = sem scout
 # neste space.
+#
+# Os dois revisores ("<slug>-rev" ou "<slug>-rev-1", e "<slug>-rev-2") NAO
+# estao mais hardcoded aqui - build_rev_agents() os monta em runtime, lendo
+# migration-state.json de cada space (migracao rev->rev-1, ver
+# _herdr_migration.py). Isso evita dois bugs achados nas rodadas de revisao
+# herdr-4/5/6: bootstrap recriando "-rev" depois que o space ja migrou pra
+# "-rev-1", e o "-rev-2" sempre subindo hardcoded como Claude/Opus mesmo com
+# a policy viva sendo Grok (rev2_kind por space).
 SPACES = [
-    ("omabackup", f"{HOME}/Devs/omabackup",
-        [
-            ("omabackup-exec", "claude", []),
-            ("omabackup-rev", "codex", REV_EFFORT),
-            ("omabackup-rev-2", "claude", ["--model", "opus"]),
-        ],
-        ("omabackup-scout", "codex", []),
-    ),
-    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"),
-        [
-            ("mfc-exec", "claude", []),
-            ("mfc-rev", "codex", REV_EFFORT),
-            ("mfc-rev-2", "claude", ["--model", "opus"]),
-        ],
-        ("mfc-scout", "codex", []),
-    ),
-    ("acervo", f"{HOME}/Devs/acervo",
-        [
-            ("acervo-exec", "claude", []),
-            ("acervo-rev", "codex", REV_EFFORT),
-            ("acervo-rev-2", "claude", ["--model", "opus"]),
-        ],
-        None,
-    ),
+    ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "claude", []),
+        ("omabackup-scout", "codex", [])),
+    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "claude", []),
+        ("mfc-scout", "codex", [])),
+    ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", []),
+        None),
     # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
     # Claude, porque e' o projeto que testa o papel de orquestrador externo.
     # cwd e' o repo de codigo real (~/Devs/claude-bridge), nao o dir de
@@ -69,22 +60,10 @@ SPACES = [
     # CLAUDE.md/.herdr/reviewer.md nao existiam no cwd registrado porque
     # apontava pro dir errado; o proprio exec ja trabalhava de fato em
     # ~/Devs/claude-bridge (onde o codigo/git realmente vive).
-    ("claude-bridge", f"{HOME}/Devs/claude-bridge",
-        [
-            ("claude-bridge-exec", "codex", []),
-            ("claude-bridge-rev", "codex", REV_EFFORT),
-            ("claude-bridge-rev-2", "claude", ["--model", "opus"]),
-        ],
-        ("claude-bridge-scout", "codex", []),
-    ),
+    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "codex", []),
+        ("claude-bridge-scout", "codex", [])),
     ("content-insights-collector", f"{HOME}/Devs/content-insights-collector",
-        [
-            ("content-insights-collector-exec", "codex", []),
-            ("content-insights-collector-rev", "codex", REV_EFFORT),
-            ("content-insights-collector-rev-2", "claude", ["--model", "opus"]),
-        ],
-        None,
-    ),
+        ("content-insights-collector-exec", "codex", []), None),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
@@ -92,14 +71,22 @@ SPACES = [
     # script, entao nao entra no SPACES pra nao arriscar o script tentar
     # reiniciar/trocar uma sessao com humano atras dela. So os revisores sao
     # geridos por aqui.
-    ("herdr", HOME,
-        [
-            ("herdr-rev", "codex", REV_EFFORT),
-            ("herdr-rev-2", "claude", ["--model", "opus"]),
-        ],
-        None,
-    ),
+    ("herdr", HOME, None, None),
 ]
+
+
+def build_rev_agents(slug, cwd):
+    """Monta as tuplas (nome, kind, extra_args) dos dois revisores em
+    runtime, lendo a fase e o rev2_kind de migration-state.json daquele
+    space. Nunca cria "<slug>-rev-1" fora da fase "migrated"; nunca recria
+    "<slug>-rev" depois de "migrated"."""
+    state = migration.read_migration_state(cwd)
+    rev_name = f"{slug}-rev-1" if state["phase"] == "migrated" else f"{slug}-rev"
+    rev2_kind = state["rev2_kind"]
+    return [
+        (rev_name, "codex", REV_EFFORT),
+        (f"{slug}-rev-2", rev2_kind, migration.extra_args_for_rev2(rev2_kind)),
+    ]
 
 
 def api(*args):
@@ -182,7 +169,13 @@ def main():
     busy = {a["pane_id"] for a in api("agent", "list")["agents"]}
     existing_agent_names = {a.get("name") for a in api("agent", "list")["agents"] if a.get("name")}
 
-    for label, cwd, tab1_agents, scout in SPACES:
+    for label, cwd, exec_agent, scout in SPACES:
+        slug = label.lower()
+        if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+            print(f"space {label}: migração de nome em andamento (lock ativo) — pulando esta rodada")
+            continue
+        tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, cwd)
+
         ws = workspaces.get(label)
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")

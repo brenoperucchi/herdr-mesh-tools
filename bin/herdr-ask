@@ -26,6 +26,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
+import _herdr_migration as migration
 
 now_iso = core.now_iso
 agent_status = core.agent_status
@@ -137,7 +138,7 @@ def main():
     ap.add_argument("slug")
     ap.add_argument("--question-file", required=True, help="arquivo com a pergunta de design (markdown, pode ser longo)")
     ap.add_argument("--context", nargs="+", default=None, help="arquivos de contexto — congelados no disparo, como --files do herdr-review-dispatch")
-    ap.add_argument("--reviewer", choices=["rev", "rev-2"], default=None, help="consulta só 1 (default: os dois)")
+    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2"], default=None, help="consulta só 1 (default: os dois); 'rev' e 'rev-1' sao o mesmo papel logico, aceitos como alias")
     ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por consultor (default 1200)")
     args = ap.parse_args()
 
@@ -159,9 +160,24 @@ def main():
                 print(f"erro: arquivo de contexto não encontrado: {f}", file=sys.stderr)
                 sys.exit(2)
 
-    rev_name = f"{args.slug}-rev"
+    cwd = core.project_root(os.getcwd())
+
+    if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+        print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — tente de novo depois", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        rev_name = migration.resolve_reviewer_name(cwd, args.slug)
+    except RuntimeError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        sys.exit(1)
     rev2_name = f"{args.slug}-rev-2"
-    target_names = [f"{args.slug}-{args.reviewer}"] if args.reviewer else [rev_name, rev2_name]
+    if args.reviewer in ("rev", "rev-1"):
+        target_names = [rev_name]
+    elif args.reviewer == "rev-2":
+        target_names = [rev2_name]
+    else:
+        target_names = [rev_name, rev2_name]
 
     for name in target_names:
         try:
@@ -173,7 +189,6 @@ def main():
             print(f"erro: '{name}' está '{status}' — não vou disparar em cima de working/blocked", file=sys.stderr)
             sys.exit(1)
 
-    cwd = core.project_root(os.getcwd())
     try:
         for name in target_names:
             validate_agent_project(name, cwd)

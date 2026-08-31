@@ -29,6 +29,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
+import _herdr_migration as migration
 
 now_iso = core.now_iso
 api = core.api
@@ -203,9 +204,12 @@ def write_verify_request(verdict_dir, prior_verdict, head_sha, base_ref):
 
 
 def load_prior_verdict(prev_round_dir, reviewer_name):
-    path = os.path.join(prev_round_dir, reviewer_name, "verdict.md")
-    if not os.path.isfile(path):
-        raise RuntimeError(f"veredito anterior não encontrado em {path}")
+    """Contrato de leitura histórica: tenta reviewer_name; se for o papel
+    'rev' (-rev ou -rev-1), cai pro nome irmão histórico quando o atual não
+    existir na rodada antiga — sem isso, uma rodada dispatchada como
+    '<slug>-rev' antes da migração nunca é encontrada por um --verify que
+    resolve o nome atual como '<slug>-rev-1'."""
+    path = migration.resolve_historical_artifact(prev_round_dir, reviewer_name, "verdict.md")
     with open(path) as f:
         return f.read()
 
@@ -253,7 +257,7 @@ def main():
     ap.add_argument("--base", default="HEAD")
     ap.add_argument("--files", nargs="+", default=None, help="revisa arquivos especificos (sem git) em vez de um diff")
     ap.add_argument("--verify", metavar="ROUND_DIR", default=None, help="modo verificacao: confere achados de uma rodada anterior (git only), um revisor so")
-    ap.add_argument("--reviewer", choices=["rev", "rev-2"], default=None, help="qual revisor usar no --verify (default: alterna pelo numero da rodada)")
+    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2"], default=None, help="qual revisor usar no --verify (default: alterna pelo numero da rodada); 'rev' e 'rev-1' sao o mesmo papel logico, aceitos como alias")
     ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por revisor (default 1200)")
     args = ap.parse_args()
 
@@ -280,10 +284,19 @@ def main():
         with open(args.description_file) as f:
             description = f.read()
 
-    rev_name = f"{args.slug}-rev"
+    cwd = core.project_root(os.getcwd())
+
+    if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+        print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — tente de novo depois", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        rev_name = migration.resolve_reviewer_name(cwd, args.slug)
+    except RuntimeError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        sys.exit(1)
     rev2_name = f"{args.slug}-rev-2"
 
-    cwd = core.project_root(os.getcwd())
     try:
         for name in (rev_name, rev2_name):
             validate_agent_project(name, cwd)
@@ -303,7 +316,12 @@ def main():
             print(f"erro: {prev_metrics_path} não tem head_sha — foi uma rodada em modo --files, não dá pra encadear diff", file=sys.stderr)
             sys.exit(1)
         round_dir, n = next_round_dir(cwd, args.slug)
-        reviewer_name = f"{args.slug}-{args.reviewer}" if args.reviewer else (rev_name if n % 2 == 1 else rev2_name)
+        if args.reviewer in ("rev", "rev-1"):
+            reviewer_name = rev_name
+        elif args.reviewer == "rev-2":
+            reviewer_name = rev2_name
+        else:
+            reviewer_name = rev_name if n % 2 == 1 else rev2_name
         try:
             prior_verdict = load_prior_verdict(args.verify, reviewer_name)
         except RuntimeError as exc:

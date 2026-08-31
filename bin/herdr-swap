@@ -29,6 +29,7 @@ Exige que <slug>-<role> já exista e esteja 'idle' ou 'done' (não troca em
 cima de trabalho em andamento).
 """
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
+import _herdr_migration as migration
 
 HERDR = core.HERDR
 CLI_TIMEOUT_S = core.CLI_TIMEOUT_S
@@ -103,6 +105,10 @@ def main():
     pane_id = info["pane_id"]
     cwd = info["cwd"]
 
+    if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+        print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — não troco kind durante isso", file=sys.stderr)
+        sys.exit(1)
+
     if args.kind == old_kind:
         print(f"aviso: '{name}' já é '{old_kind}' — trocando mesmo assim (contexto zera igual)", file=sys.stderr)
 
@@ -144,7 +150,13 @@ def main():
     # intacto, como se nada tivesse acontecido. Isso elimina a categoria de
     # "antigo morto, novo não subiu" que existia quando o close vinha antes
     # do start (achado em herdr-6, ambos os revisores independentemente).
-    temp_name = f"{name}-new"
+    # Nome provisório curto e descartável, independente do comprimento de
+    # `name` — achado real (2026-08-30, migração rev->rev-1): `f"{name}-new"`
+    # estourou o limite de 32 chars do `agent start` já com slugs de
+    # tamanho comum (`content-insights-collector-exec-new` = 35 chars). O
+    # nome final (pós-rename) não tem esse limite, só o `agent start` do
+    # provisório.
+    temp_name = "tmp" + hashlib.sha1(f"{name}{time.time()}".encode()).hexdigest()[:10]
 
     try:
         print(f"dividindo pane novo ao lado de {pane_id}...")

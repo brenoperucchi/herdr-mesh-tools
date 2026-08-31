@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""herdr-migrate-rev <slug> — migra o primeiro revisor de um space de
+`<slug>-rev` para `<slug>-rev-1`. `<slug>-rev-2` nunca muda de nome.
+
+Diferente de herdr-swap: isto NÃO troca o kind do agent, só o nome pelo qual
+o Herdr o reconhece — o processo, pane, cwd e família continuam os mesmos.
+Por isso é um `herdr agent rename` direto, sem pane novo, sem nome
+provisório e sem o mecanismo de handoff do herdr-swap (nada é perdido, o
+processo nem reinicia).
+
+Sequência (ver docs/plans/migration-plan-rev-to-rev1-v3.md e
+_herdr_migration.py):
+  1. Adquire o lock de migração do space (recusa se já estiver migrando).
+  2. Confirma `<slug>-rev` idle/done e nenhuma rodada em voo naquele space.
+  3. `herdr agent rename <slug>-rev <slug>-rev-1`.
+  4. Confirma metadata pós-rename (só o nome deveria ter mudado) e reenvia
+     o reforço de papel.
+  5. Sucesso: grava phase=migrated (com o rev2_kind observado agora) e
+     libera o lock.
+  6. Falha em (3) ou (4): reverte o rename; se a reversão falhar também,
+     grava phase=pending-manual (lock NÃO liberado, exige intervenção
+     manual).
+
+Uso:
+  herdr-migrate-rev <slug>
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+import _herdr_migration as migration
+
+api = core.api
+get_agent = core.get_agent_info
+
+
+FIELDS_TO_MATCH = ("workspace_id", "cwd", "foreground_cwd", "agent", "tab_id")
+
+
+def _rename(old, new):
+    api("agent", "rename", old, new)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("slug")
+    args = ap.parse_args()
+
+    if os.environ.get("HERDR_ENV") != "1":
+        print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
+        sys.exit(1)
+
+    rev_name = f"{args.slug}-rev"
+    rev1_name = f"{args.slug}-rev-1"
+    rev2_name = f"{args.slug}-rev-2"
+
+    try:
+        before = get_agent(rev_name)
+    except RuntimeError as exc:
+        print(f"erro: '{rev_name}' não encontrado ({exc}) — nada a migrar (já migrado, ou nunca existiu)", file=sys.stderr)
+        sys.exit(1)
+
+    cwd = core.project_root(before["cwd"])
+
+    if not migration.acquire_migration_lock(cwd):
+        print(f"erro: space '{args.slug}' já está com uma migração em andamento (lock ativo em {migration.migration_lock_path(cwd)})", file=sys.stderr)
+        sys.exit(1)
+
+    if before["agent_status"] not in ("idle", "done"):
+        print(f"'{rev_name}' está '{before['agent_status']}' — pulando esta passada (não é erro fatal)", file=sys.stderr)
+        migration.release_migration_lock(cwd)
+        sys.exit(2)
+
+    if migration.round_in_flight(cwd):
+        print(f"space '{args.slug}' tem rodada de review/ask em voo — pulando esta passada", file=sys.stderr)
+        migration.release_migration_lock(cwd)
+        sys.exit(2)
+
+    print(f"renomeando '{rev_name}' -> '{rev1_name}'...")
+    try:
+        _rename(rev_name, rev1_name)
+    except RuntimeError as exc:
+        print(f"erro: rename falhou ({exc}) — nada foi tocado, liberando lock", file=sys.stderr)
+        migration.release_migration_lock(cwd)
+        sys.exit(1)
+
+    try:
+        after = get_agent(rev1_name)
+    except RuntimeError as exc:
+        print(f"erro: rename aplicou mas '{rev1_name}' não é encontrável depois ({exc}) — revertendo", file=sys.stderr)
+        if not _revert_or_pending_manual(cwd, rev1_name, rev_name, str(exc)):
+            migration.release_migration_lock(cwd)
+        sys.exit(1)
+
+    mismatches = [f for f in FIELDS_TO_MATCH if before.get(f) != after.get(f)]
+    if mismatches:
+        detail = ", ".join(f"{f}: {before.get(f)!r} -> {after.get(f)!r}" for f in mismatches)
+        print(f"erro: metadata pós-rename não bate ({detail}) — revertendo", file=sys.stderr)
+        if not _revert_or_pending_manual(cwd, rev1_name, rev_name, detail):
+            migration.release_migration_lock(cwd)
+        sys.exit(1)
+
+    try:
+        rev2_kind = get_agent(rev2_name)["agent"]
+    except RuntimeError:
+        rev2_kind = migration.read_migration_state(cwd)["rev2_kind"]
+
+    try:
+        siblings = [n for n in (rev2_name, f"{args.slug}-exec") if core.agent_status_safe(n)]
+        prompt = core.role_reinforcement_prompt(rev1_name, args.slug, cwd, siblings)
+        api("agent", "prompt", rev1_name, prompt)
+    except RuntimeError as exc:
+        print(f"aviso: rename ok mas falhei reenviando o reforço de papel: {exc}", file=sys.stderr)
+
+    migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
+    migration.release_migration_lock(cwd)
+    print(f"'{args.slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
+
+
+def _revert_or_pending_manual(cwd, current_name, target_name, reason):
+    """Tenta reverter o rename. Retorna True se o resultado final é
+    'pending-manual' (lock deve continuar travado — NÃO chamar
+    release_migration_lock depois disto); False se reverteu com sucesso
+    (voltou a phase=legacy, lock pode ser liberado normalmente)."""
+    try:
+        _rename(current_name, target_name)
+        print(f"revertido: '{current_name}' -> '{target_name}'. Space continua em phase=legacy.", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "legacy", "note": f"reversão automática: {reason}"})
+        return False
+    except RuntimeError as exc2:
+        print(
+            f"erro: reversão também falhou ({exc2}) — space fica em phase=pending-manual, "
+            "lock NÃO liberado, precisa de intervenção manual "
+            f"(confira qual nome existe de verdade: '{current_name}' ou '{target_name}')",
+            file=sys.stderr,
+        )
+        migration.write_migration_state_atomic(
+            cwd, {"phase": "pending-manual", "note": f"rename falhou: {reason}; reversão falhou: {exc2}"}
+        )
+        return True
+
+
+if __name__ == "__main__":
+    main()

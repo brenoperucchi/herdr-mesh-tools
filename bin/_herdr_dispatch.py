@@ -238,6 +238,8 @@ enquanto isso."""
 def _infer_role(name):
     if name.endswith("-rev-2"):
         return "rev-2"
+    if name.endswith("-rev-1"):
+        return "rev"  # mesmo papel lógico de "-rev", só o nome mudou
     if name.endswith("-rev"):
         return "rev"
     if name.endswith("-scout"):
