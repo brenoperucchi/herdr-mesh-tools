@@ -153,9 +153,27 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
             print(f"erro: {note} — estado desconhecido, marcando pending-manual", file=sys.stderr)
             migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
             sys.exit(1)
-        # Sem `before` (o agent antigo já não existe), não dá pra comparar
-        # campo a campo — mas as checagens absolutas continuam válidas
-        # (achado P2-2 herdr-10: não exigir menos que o caminho normal).
+        # Achado P1-3 herdr-14 (herdr-rev): a versão anterior não provava
+        # que o '{rev1_name}' visto AGORA (sob o lock) é o MESMO agent
+        # observado em `after_only` (o snapshot tirado ANTES de adquirir o
+        # lock, na chamada original em `main()`) — só checava
+        # interactive_ready/agent_status em isolamento. Se o target tiver
+        # sido reocupado/reiniciado entre as duas consultas, um pane
+        # DIFERENTE, mas idle e interativo, seria aceito e finalizado como
+        # se fosse a migração original. Reusa FIELDS_TO_MATCH, a mesma
+        # comparação que o caminho normal já faz entre `before`/`after` do
+        # rename — aqui compara `after_only`/`after` do self-heal.
+        mismatches = [f for f in FIELDS_TO_MATCH if after_only.get(f) != after.get(f)]
+        if _agent_session_value(after_only) != _agent_session_value(after):
+            mismatches.append("agent_session")
+        if mismatches:
+            detail = ", ".join(f"{f}: {after_only.get(f)!r} -> {after.get(f)!r}" for f in mismatches)
+            note = f"self-heal: '{rev1_name}' mudou de identidade entre a leitura inicial e sob o lock ({detail})"
+            print(f"erro: {note} — marcando pending-manual (não confirma que é o mesmo agent do rename)", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+        # As checagens absolutas continuam válidas em cima disso (achado
+        # P2-2 herdr-10: não exigir menos que o caminho normal).
         if after.get("interactive_ready") is not True:
             note = f"self-heal: '{rev1_name}' encontrado mas interactive_ready != True"
             print(f"erro: {note} — marcando pending-manual", file=sys.stderr)

@@ -566,6 +566,36 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         self.assertEqual(state["phase"], "migrated")
         self.assertEqual(state["rev2_kind"], "grok")
 
+    def test_self_heal_detects_rev1_reoccupied_between_snapshots(self):
+        # Achado P1-3 herdr-14 (herdr-rev): a versão anterior não provava que
+        # o '{rev1_name}' visto SOB O LOCK é o mesmo agent observado na
+        # leitura inicial (antes do lock) - só checava interactive_ready e
+        # agent_status em isolamento. Simula reocupação: pane_id muda entre
+        # as duas consultas, ambas idle/interactive_ready=True.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok"})
+        calls = {"n": 0}
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                calls["n"] += 1
+                info = self._agent_info("idle")
+                info["pane_id"] = "p1" if calls["n"] == 1 else "p2-reocupado"
+                return info
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "pending-manual", "identidade divergente entre leitura inicial e sob o lock não pode ser finalizada silenciosamente")
+        self.assertIn("pane_id", state["note"])
+
     def test_self_heal_infra_failure_keeps_phase_migrating_not_observed_phase(self):
         # Achado P1-1 herdr-13 (herdr-rev): a versão anterior restaurava
         # `observed_phase` quando a rechecagem de ausência sob o lock falhava
