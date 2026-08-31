@@ -286,7 +286,7 @@ def main():
 
     cwd = core.project_root(os.getcwd())
 
-    if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+    if migration.space_is_gated(cwd):
         print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — tente de novo depois", file=sys.stderr)
         sys.exit(1)
 

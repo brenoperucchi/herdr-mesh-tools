@@ -6,20 +6,30 @@ Diferente de herdr-swap: isto NÃO troca o kind do agent, só o nome pelo qual
 o Herdr o reconhece — o processo, pane, cwd e família continuam os mesmos.
 Por isso é um `herdr agent rename` direto, sem pane novo, sem nome
 provisório e sem o mecanismo de handoff do herdr-swap (nada é perdido, o
-processo nem reinicia).
+processo nem reinicia) — confirmado pelo par fixo na rodada herdr-7: a
+categoria do bug de nome provisório só existe quando dois agents precisam
+coexistir pra trocar kind sem perder o pane; aqui não há segundo agent.
 
-Sequência (ver docs/plans/migration-plan-rev-to-rev1-v3.md e
-_herdr_migration.py):
-  1. Adquire o lock de migração do space (recusa se já estiver migrando).
-  2. Confirma `<slug>-rev` idle/done e nenhuma rodada em voo naquele space.
-  3. `herdr agent rename <slug>-rev <slug>-rev-1`.
-  4. Confirma metadata pós-rename (só o nome deveria ter mudado) e reenvia
-     o reforço de papel.
-  5. Sucesso: grava phase=migrated (com o rev2_kind observado agora) e
-     libera o lock.
-  6. Falha em (3) ou (4): reverte o rename; se a reversão falhar também,
-     grava phase=pending-manual (lock NÃO liberado, exige intervenção
-     manual).
+Sequência (ver _herdr_migration.py e os vereditos de herdr-6/herdr-7 em
+.herdr/review/):
+  1. Recusa de saída se phase já for "pending-manual" (estado terminal,
+     nunca é resolvido automaticamente).
+  2. Adquire o flock do space (recusa se outro processo já detém).
+  3. Grava phase=migrating (preservando rev2_kind) — marca durável de que
+     uma migração está em andamento, sobrevive mesmo que o flock se perca.
+  4. RE-checa `<slug>-rev` idle/done e nenhuma rodada em voo (depois do
+     lock, não antes — achado P2-4 herdr-7: checar antes permitia um
+     dispatch escapar pela janela entre o snapshot e o lock).
+  5. `herdr agent rename <slug>-rev <slug>-rev-1`.
+  6. Consulta os DOIS nomes (não assume nada a partir do retorno da chamada
+     — achado P1 herdr-7: timeout/erro do lado cliente não prova que o
+     servidor não aplicou) pra decidir o que realmente aconteceu.
+  7. Sucesso: valida metadata completa, reenvia reforço de papel (falha
+     nisso vira pending-manual, não "migrated" silencioso), grava
+     phase=migrated.
+  8. Qualquer resultado que não seja "só o novo nome vivo, com metadata
+     batendo e reforço de papel confirmado" vira pending-manual — nunca um
+     "revert automático" que também pode falhar ambiguamente.
 
 Uso:
   herdr-migrate-rev <slug>
@@ -35,12 +45,17 @@ import _herdr_migration as migration
 api = core.api
 get_agent = core.get_agent_info
 
+# Campos que devem ser idênticos antes/depois do rename — só o nome muda.
+# Achado P1 herdr-7 (validação incompleta): a versão anterior não conferia
+# pane_id, agent_session nem interactive_ready.
+FIELDS_TO_MATCH = (
+    "pane_id", "workspace_id", "tab_id", "cwd", "foreground_cwd",
+    "agent", "interactive_ready",
+)
 
-FIELDS_TO_MATCH = ("workspace_id", "cwd", "foreground_cwd", "agent", "tab_id")
 
-
-def _rename(old, new):
-    api("agent", "rename", old, new)
+def _agent_session_value(info):
+    return (info.get("agent_session") or {}).get("value")
 
 
 def main():
@@ -64,42 +79,94 @@ def main():
 
     cwd = core.project_root(before["cwd"])
 
-    if not migration.acquire_migration_lock(cwd):
-        print(f"erro: space '{args.slug}' já está com uma migração em andamento (lock ativo em {migration.migration_lock_path(cwd)})", file=sys.stderr)
+    existing_state = migration.read_migration_state(cwd)
+    if existing_state["phase"] == "pending-manual":
+        print(
+            f"erro: space '{args.slug}' está em phase=pending-manual "
+            f"(nota: {existing_state.get('note')!r}) — precisa de intervenção "
+            "manual antes de qualquer nova tentativa automática",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    lock_handle = migration.acquire_migration_lock(cwd)
+    if lock_handle is None:
+        print(f"erro: space '{args.slug}' já está com uma migração em andamento (lock ativo)", file=sys.stderr)
+        sys.exit(1)
+
+    # Marca durável de "em andamento" — sobrevive independente do flock (que
+    # é só exclusão mútua enquanto ESTE processo roda). Preserva rev2_kind
+    # já persistido (write_migration_state_atomic faz merge com o disco).
+    migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
+
+    try:
+        _run(args.slug, rev_name, rev1_name, rev2_name, cwd, before)
+    finally:
+        migration.release_migration_lock(lock_handle)
+
+
+def _run(slug, rev_name, rev1_name, rev2_name, cwd, before):
+    # Re-checa DEPOIS do lock — achado P2-4 herdr-7: o snapshot pré-lock
+    # podia estar desatualizado o suficiente pra um dispatch concorrente
+    # escapar pela janela entre a leitura e a aquisição do lock.
+    try:
+        before = get_agent(rev_name)
+    except RuntimeError as exc:
+        print(f"erro: '{rev_name}' desapareceu entre a checagem inicial e o lock ({exc})", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
         sys.exit(1)
 
     if before["agent_status"] not in ("idle", "done"):
         print(f"'{rev_name}' está '{before['agent_status']}' — pulando esta passada (não é erro fatal)", file=sys.stderr)
-        migration.release_migration_lock(cwd)
+        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
         sys.exit(2)
 
-    if migration.round_in_flight(cwd):
-        print(f"space '{args.slug}' tem rodada de review/ask em voo — pulando esta passada", file=sys.stderr)
-        migration.release_migration_lock(cwd)
+    blocker = migration.find_in_flight_round(cwd)
+    if blocker is not None:
+        print(f"space '{slug}' tem rodada de review/ask em voo ({blocker}) — pulando esta passada", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
         sys.exit(2)
 
     print(f"renomeando '{rev_name}' -> '{rev1_name}'...")
     try:
-        _rename(rev_name, rev1_name)
+        api("agent", "rename", rev_name, rev1_name)
     except RuntimeError as exc:
-        print(f"erro: rename falhou ({exc}) — nada foi tocado, liberando lock", file=sys.stderr)
-        migration.release_migration_lock(cwd)
+        print(f"aviso: chamada de rename retornou erro ({exc}) — confirmando o que aconteceu de fato antes de decidir (não assumo que nada mudou)", file=sys.stderr)
+
+    # Nunca confiar só no retorno da chamada (achado P1 herdr-rev/herdr-7:
+    # timeout/erro do lado cliente não prova ausência de efeito no servidor)
+    # — consulta os dois nomes de verdade.
+    rev_alive = core.agent_status_safe(rev_name)
+    rev1_alive = core.agent_status_safe(rev1_name)
+
+    if rev_alive and not rev1_alive:
+        print(f"confirmado: rename não aplicou ('{rev_name}' continua vivo, '{rev1_name}' não existe) — nada foi tocado", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
         sys.exit(1)
 
-    try:
-        after = get_agent(rev1_name)
-    except RuntimeError as exc:
-        print(f"erro: rename aplicou mas '{rev1_name}' não é encontrável depois ({exc}) — revertendo", file=sys.stderr)
-        if not _revert_or_pending_manual(cwd, rev1_name, rev_name, str(exc)):
-            migration.release_migration_lock(cwd)
+    if rev_alive and rev1_alive:
+        note = f"os dois nomes ('{rev_name}' e '{rev1_name}') existem depois da chamada de rename"
+        print(f"erro: {note} — estado ambíguo, marcando pending-manual", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
         sys.exit(1)
 
+    if not rev_alive and not rev1_alive:
+        note = f"nenhum dos dois nomes ('{rev_name}' nem '{rev1_name}') existe depois da chamada de rename"
+        print(f"erro: {note} — estado desconhecido, marcando pending-manual", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        sys.exit(1)
+
+    # só '{rev1_name}' vivo, exatamente o esperado — segue pra validação.
+    after = get_agent(rev1_name)
     mismatches = [f for f in FIELDS_TO_MATCH if before.get(f) != after.get(f)]
+    if _agent_session_value(before) != _agent_session_value(after):
+        mismatches.append("agent_session")
+
     if mismatches:
         detail = ", ".join(f"{f}: {before.get(f)!r} -> {after.get(f)!r}" for f in mismatches)
-        print(f"erro: metadata pós-rename não bate ({detail}) — revertendo", file=sys.stderr)
-        if not _revert_or_pending_manual(cwd, rev1_name, rev_name, detail):
-            migration.release_migration_lock(cwd)
+        note = f"metadata pós-rename não bate ({detail})"
+        print(f"erro: {note} — marcando pending-manual (não reverto automaticamente um estado que não entendo)", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
         sys.exit(1)
 
     try:
@@ -108,38 +175,17 @@ def main():
         rev2_kind = migration.read_migration_state(cwd)["rev2_kind"]
 
     try:
-        siblings = [n for n in (rev2_name, f"{args.slug}-exec") if core.agent_status_safe(n)]
-        prompt = core.role_reinforcement_prompt(rev1_name, args.slug, cwd, siblings)
+        siblings = [n for n in (rev2_name, f"{slug}-exec") if core.agent_status_safe(n)]
+        prompt = core.role_reinforcement_prompt(rev1_name, slug, cwd, siblings)
         api("agent", "prompt", rev1_name, prompt)
     except RuntimeError as exc:
-        print(f"aviso: rename ok mas falhei reenviando o reforço de papel: {exc}", file=sys.stderr)
+        note = f"rename e metadata OK, mas reforço de papel falhou: {exc}"
+        print(f"erro: {note} — marcando pending-manual em vez de declarar migrado silenciosamente", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        sys.exit(1)
 
     migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
-    migration.release_migration_lock(cwd)
-    print(f"'{args.slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
-
-
-def _revert_or_pending_manual(cwd, current_name, target_name, reason):
-    """Tenta reverter o rename. Retorna True se o resultado final é
-    'pending-manual' (lock deve continuar travado — NÃO chamar
-    release_migration_lock depois disto); False se reverteu com sucesso
-    (voltou a phase=legacy, lock pode ser liberado normalmente)."""
-    try:
-        _rename(current_name, target_name)
-        print(f"revertido: '{current_name}' -> '{target_name}'. Space continua em phase=legacy.", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "legacy", "note": f"reversão automática: {reason}"})
-        return False
-    except RuntimeError as exc2:
-        print(
-            f"erro: reversão também falhou ({exc2}) — space fica em phase=pending-manual, "
-            "lock NÃO liberado, precisa de intervenção manual "
-            f"(confira qual nome existe de verdade: '{current_name}' ou '{target_name}')",
-            file=sys.stderr,
-        )
-        migration.write_migration_state_atomic(
-            cwd, {"phase": "pending-manual", "note": f"rename falhou: {reason}; reversão falhou: {exc2}"}
-        )
-        return True
+    print(f"'{slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
 
 
 if __name__ == "__main__":

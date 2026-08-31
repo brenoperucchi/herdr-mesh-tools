@@ -104,8 +104,15 @@ def main():
     old_kind = info["agent"]
     pane_id = info["pane_id"]
     cwd = info["cwd"]
+    # project_root(), não o cwd cru do agent — achado P2-2 herdr-7: um cwd
+    # registrado num subdiretório ou path vizinho ao repo (ex:
+    # claude-bridge-exec com cwd=~/.claude-bridge vs repo em
+    # ~/Devs/claude-bridge) faria este lock apontar pra um .herdr/ diferente
+    # do que os outros consumidores (herdr-migrate-rev, herdr-review-dispatch,
+    # herdr-ask) consultam, tornando a checagem cega justamente nesse caso.
+    migration_cwd = core.project_root(cwd)
 
-    if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+    if migration.space_is_gated(migration_cwd):
         print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — não troco kind durante isso", file=sys.stderr)
         sys.exit(1)
 

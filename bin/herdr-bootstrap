@@ -171,10 +171,17 @@ def main():
 
     for label, cwd, exec_agent, scout in SPACES:
         slug = label.lower()
-        if migration.is_locked(cwd) or migration.read_migration_state(cwd)["phase"] == "migrating":
+        # project_root(), não o cwd cru da tupla — achado P3-1 herdr-7: o
+        # mesmo path pode ser lido de formas diferentes por herdr-migrate-rev
+        # (que usa o cwd real do agent vivo) e por aqui (valor estático de
+        # SPACES); normalizar os dois pelo mesmo git root evita ler
+        # migration-state.json do lugar errado quando o path aqui aponta pra
+        # um subdiretório do repo real.
+        migration_cwd = core.project_root(cwd)
+        if migration.space_is_gated(migration_cwd):
             print(f"space {label}: migração de nome em andamento (lock ativo) — pulando esta rodada")
             continue
-        tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, cwd)
+        tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, migration_cwd)
 
         ws = workspaces.get(label)
         if ws is None:

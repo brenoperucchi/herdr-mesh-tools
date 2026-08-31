@@ -63,40 +63,58 @@ class MigrationStateTests(unittest.TestCase):
         leftovers = [f for f in os.listdir(herdr_dir) if ".tmp." in f]
         self.assertEqual(leftovers, [], "escrita atômica não deve deixar arquivo temporário pra trás")
 
-    # --- lock via O_EXCL ----------------------------------------------
+    def test_atomic_write_merges_with_disk_not_with_default(self):
+        # Achado P2-1 herdr-7: um patch parcial não pode apagar um campo
+        # não-default já persistido só porque não foi citado no patch.
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "migrated", "rev2_kind": "grok"})
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "note": "revertido"})
+        state = self.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "legacy")
+        self.assertEqual(state["rev2_kind"], "grok", "rev2_kind não pode voltar pro default só por causa de um patch parcial")
+        self.assertEqual(state["note"], "revertido")
+
+    # --- lock via flock (achado P1 herdr-7: lock anterior, baseado em
+    # existência de arquivo + heurística de idade/pid, tinha uma corrida
+    # real entre "detectar stale" e "recriar", e liberava sem checar
+    # ownership. flock é preso ao file descriptor: nenhuma heurística de
+    # staleness é necessária, e só quem detém pode liberar) -------------
 
     def test_second_lock_acquire_fails_while_first_active(self):
-        self.assertTrue(self.migration.acquire_migration_lock(self.cwd, owner={"pid": os.getpid(), "hostname": "h"}))
-        self.assertFalse(self.migration.acquire_migration_lock(self.cwd, owner={"pid": os.getpid(), "hostname": "h"}))
+        handle = self.migration.acquire_migration_lock(self.cwd, owner={"pid": os.getpid(), "hostname": "h"})
+        self.assertIsNotNone(handle)
+        self.assertIsNone(self.migration.acquire_migration_lock(self.cwd, owner={"pid": os.getpid(), "hostname": "h"}))
         self.assertTrue(self.migration.is_locked(self.cwd))
 
     def test_lock_release_allows_new_acquire(self):
-        self.migration.acquire_migration_lock(self.cwd)
-        self.migration.release_migration_lock(self.cwd)
+        handle = self.migration.acquire_migration_lock(self.cwd)
+        self.migration.release_migration_lock(handle)
         self.assertFalse(self.migration.is_locked(self.cwd))
-        self.assertTrue(self.migration.acquire_migration_lock(self.cwd))
+        handle2 = self.migration.acquire_migration_lock(self.cwd)
+        self.assertIsNotNone(handle2)
+        self.migration.release_migration_lock(handle2)
 
-    def test_stale_lock_from_dead_pid_is_taken_over(self):
-        # PID improvável de existir; simula processo morto sem heartbeat há muito tempo.
-        dead_owner = {"pid": 999999, "hostname": "h", "ts": time.time() - (self.migration.LOCK_STALE_S + 60)}
-        lock_path = self.migration.migration_lock_path(self.cwd)
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        import json
-        with open(lock_path, "w") as f:
-            json.dump(dead_owner, f)
+    def test_lock_auto_releases_when_holder_process_exits(self):
+        # flock morre com o processo que o detém - simula isso fechando o fd
+        # sem passar por release_migration_lock (equivalente a um crash: o
+        # kernel fecha os fds abertos quando o processo morre).
+        handle = self.migration.acquire_migration_lock(self.cwd)
+        os.close(handle)
+        self.assertFalse(self.migration.is_locked(self.cwd), "lock não deveria sobreviver ao fechamento do fd que o detém")
 
-        self.assertTrue(self.migration.acquire_migration_lock(self.cwd))
+    def test_space_is_gated_true_while_locked(self):
+        handle = self.migration.acquire_migration_lock(self.cwd)
+        self.assertTrue(self.migration.space_is_gated(self.cwd))
+        self.migration.release_migration_lock(handle)
+        self.assertFalse(self.migration.space_is_gated(self.cwd))
 
-    def test_fresh_lock_from_dead_pid_is_not_taken_over(self):
-        # pid morto mas dentro da janela de stale ainda - nao deve destravar.
-        dead_owner = {"pid": 999999, "hostname": "h", "ts": time.time()}
-        lock_path = self.migration.migration_lock_path(self.cwd)
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        import json
-        with open(lock_path, "w") as f:
-            json.dump(dead_owner, f)
-
-        self.assertFalse(self.migration.acquire_migration_lock(self.cwd))
+    def test_space_is_gated_true_for_pending_manual_even_without_lock(self):
+        # Achado P1-2 herdr-7: phase=pending-manual precisa continuar
+        # bloqueando MESMO depois que o lock (e o processo que o detinha)
+        # já não existem mais - ao contrário do lock antigo, que expirava
+        # sozinho e "esquecia" o pending-manual.
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "pending-manual", "note": "algo deu errado"})
+        self.assertFalse(self.migration.is_locked(self.cwd))
+        self.assertTrue(self.migration.space_is_gated(self.cwd))
 
     # --- dual-read fail-closed ------------------------------------------
 
@@ -169,6 +187,40 @@ class MigrationStateTests(unittest.TestCase):
         with open(os.path.join(round_dir, "answer.md"), "w") as f:
             f.write("posição: ...")
         self.assertFalse(self.migration.round_in_flight(self.cwd))
+
+    def test_round_in_flight_ignores_orphaned_request_older_than_window(self):
+        # Achado P1-1 herdr-7, o mais grave da rodada: a versão sem janela
+        # de tempo trocou o falso-negativo do metrics.json por um
+        # falso-positivo PERMANENTE — uma rodada abandonada em qualquer
+        # momento do passado (revisor travado, timeout, cancelada) deixava
+        # request.md órfão pra sempre, bloqueando a migração daquele space
+        # pra sempre também. Medido ao vivo: 5 dos 6 spaces reais tinham
+        # pelo menos uma rodada órfã histórica.
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
+            f.write("x")
+        old_ts = time.time() - 3600  # 1h atrás, bem além da janela default (1200s)
+        os.utime(request_path, (old_ts, old_ts))
+        self.assertFalse(self.migration.round_in_flight(self.cwd, window_s=1200))
+
+    def test_round_in_flight_true_for_recent_orphaned_request(self):
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")  # mtime = agora, dentro da janela default
+        self.assertTrue(self.migration.round_in_flight(self.cwd, window_s=1200))
+
+    def test_find_in_flight_round_returns_blocking_path_for_diagnostics(self):
+        # Achado P1-1 herdr-7: a versão anterior não dizia QUAL diretório
+        # bloqueou, tornando o falso-positivo impossível de diagnosticar.
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")
+        blocker = self.migration.find_in_flight_round(self.cwd)
+        self.assertEqual(blocker, round_dir)
 
     # --- contrato de leitura histórica -----------------------------------
 
