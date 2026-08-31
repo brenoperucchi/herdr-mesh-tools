@@ -31,6 +31,7 @@ now_iso = core.now_iso
 agent_status = core.agent_status
 agent_status_safe = core.agent_status_safe
 agent_cwd = core.agent_cwd
+validate_agent_project = core.validate_agent_project
 get_agent_info = core.get_agent_info
 freeze_files = core.freeze_files
 dispatch_and_wait_all = core.dispatch_and_wait_all
@@ -57,6 +58,16 @@ edite nada além dele.
 Isso NÃO é um bug hunt — não há severidade P0-P3 nem "APPROVE". É uma
 pergunta de design aberta. Estruture sua resposta assim:
 
+Antes de responder, faça a attestation read-only: confirme com `herdr agent
+get <seu-nome>` (e `herdr agent list` se necessário) seu nome, pane,
+workspace/space, raiz do projeto, família/kind, estado e `interactive_ready`
+contra o request e a rodada. Registre a confirmação na resposta. Não infira a
+posição por uma hierarquia genérica do modelo; se a CLI ou a metadata não
+permitirem confirmá-la, pare e registre a inconsistência. Breno é a
+autoridade humana/owner e `<slug>-exec` é o coordenador/mecanismo delegado,
+não autorização para inventar agentes ou canais. Preserve a cegueira e não
+leia o artifact do colega cego.
+
 1. **A decisão** — sua posição, em uma frase.
 2. **As premissas** (2-3) que sustentam essa decisão, explicitamente
    rotuladas: "se X for falso, minha resposta muda". Isso é o que torna duas
@@ -66,6 +77,11 @@ pergunta de design aberta. Estruture sua resposta assim:
 3. **O argumento** — pode discordar de uma sub-pergunta específica se houver
    mais de uma, pode dizer "não vale a pena", pode ter baixa confiança — diga
    isso explicitamente em vez de forçar uma posição.
+
+Antes de responder, releia `AGENTS.md` e `.herdr/reviewer.md`. Este é o aviso
+operacional obrigatório: não use AgentRelay nem subagentes nativos, não crie
+agent/pane novo para contornar fricção e, se a consulta tratar de uma
+discordância factual, siga apenas a rota aprovada de `herdr-ask`.
 
 {context_instruction}
 """
@@ -106,8 +122,11 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
 
 
 def prompt_text(verdict_dir):
+    expected_name = os.path.basename(os.path.normpath(verdict_dir))
     return (
-        f"Leia {verdict_dir}/request.md e siga o protocolo nele. O único arquivo "
+        f"Você foi chamado pelo dispatcher como `{expected_name}`. Antes de agir, "
+        f"confirme essa identidade em modo read-only. Leia {verdict_dir}/request.md "
+        f"e siga o protocolo nele. O único arquivo "
         f"que você deve escrever é {verdict_dir}/answer.md — as regras de "
         f"leitura estão no request.md."
     )
@@ -154,7 +173,13 @@ def main():
             print(f"erro: '{name}' está '{status}' — não vou disparar em cima de working/blocked", file=sys.stderr)
             sys.exit(1)
 
-    cwd = agent_cwd(f"{args.slug}-exec") if agent_status_safe(f"{args.slug}-exec") else agent_cwd(target_names[0])
+    cwd = core.project_root(os.getcwd())
+    try:
+        for name in target_names:
+            validate_agent_project(name, cwd)
+    except RuntimeError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        sys.exit(1)
     round_dir, n = core.next_round_dir(cwd, args.slug, namespace="ask")
     print(f"consulta {n}: {round_dir}")
 

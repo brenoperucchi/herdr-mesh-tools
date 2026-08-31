@@ -81,24 +81,17 @@ Monte uma tabela por achado, em três classes:
 | **ÚNICO** | Só um achou — o outro simplesmente não mencionou | Você avalia e corrige se procede |
 | **CONFLITO** | Um revisor **contesta explicitamente** a validade do que o outro apontou (não apenas deixou de encontrar) | Nunca você sozinho — veja abaixo |
 
-## CONFLITO — árbitro sob demanda, opcional
+## CONFLITO — rota aprovada, sem terceiro agent
 
-Se quiser uma terceira opinião antes de escalar (não é obrigatório), suba um
-`gpt-5.6-sol` efêmero:
+Se houver uma discordância factual genuína, não crie pane ou agent novo e não
+use AgentRelay nem o mecanismo nativo de subagentes da sua CLI. Redispare a
+consulta pela rota aprovada de `herdr-ask`, usando os colegas fixos e o
+contexto congelado exigido pelo protocolo. O resultado não substitui a
+decisão humana nem autoriza o exec a descartar o achado.
 
-```bash
-herdr pane split --current --direction right --cwd "$PWD" --no-focus
-# use o pane_id retornado:
-herdr agent start "${slug}-arbiter" --kind codex --pane <pane_id> -- --model gpt-5.6-sol -c model_reasoning_effort=high
-```
-
-Mande o achado disputado + as duas posições completas (o árbitro **não é cego** —
-sua função é pesar as duas narrativas, ao contrário dos revisores). Ele não edita
-código, não inventa achado novo, dá um veredito por achado (confirmed / rejected /
-needs-human-evidence). Feche o pane depois (`herdr pane close <pane_id>`).
-
-O veredito do árbitro **não substitui sua decisão** — ele só enriquece o que você
-leva pro usuário. Todo CONFLITO, arbitrado ou não, ainda vai pro usuário.
+Se um revisor estiver travado ou indisponível, redispare para o mesmo revisor
+via `herdr-review`; não invente uma lente substituta. Se o caminho de
+`herdr-ask` não puder ser executado, pare e reporte o bloqueio.
 
 ## Corrigir e ciclar
 
@@ -120,4 +113,5 @@ recomendações mutuamente incompatíveis entre os dois revisores.
 - Não rode `herdr-review-dispatch` em cima de trabalho não commitado que não é
   seu — confirme que o diff é da unidade que você mesmo terminou.
 - Não trate `TIMEOUT` ou revisor `BLOCKED` como aprovação.
-- Não decida sozinho que um CONFLITO não procede, mesmo com o árbitro do seu lado.
+- Não decida sozinho que um CONFLITO não procede, mesmo que a rota de
+  `herdr-ask` produza uma posição favorável.
