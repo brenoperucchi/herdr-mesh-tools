@@ -58,6 +58,88 @@ def _agent_session_value(info):
     return (info.get("agent_session") or {}).get("value")
 
 
+def _reinforce_and_finalize(slug, rev1_name, rev2_name, cwd):
+    """Reenvia o reforço de papel e só então grava phase=migrated; falha no
+    reforço vira pending-manual, nunca "migrated" silencioso. Usado pelo
+    caminho normal E pelo self-heal — achado P2-2 herdr-10: declarar
+    "migrated" não pode exigir menos num caminho que no outro."""
+    try:
+        rev2_kind = get_agent(rev2_name)["agent"]
+    except RuntimeError:
+        rev2_kind = migration.read_migration_state(cwd)["rev2_kind"]
+
+    try:
+        siblings = [n for n in (rev2_name, f"{slug}-exec") if core.agent_status_safe(n)]
+        prompt = core.role_reinforcement_prompt(rev1_name, slug, cwd, siblings)
+        api("agent", "prompt", rev1_name, prompt)
+    except RuntimeError as exc:
+        note = f"rename e metadata OK, mas reforço de papel falhou: {exc}"
+        print(f"erro: {note} — marcando pending-manual em vez de declarar migrado silenciosamente", file=sys.stderr)
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        sys.exit(1)
+
+    migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
+    print(f"'{slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
+
+
+def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observed_phase):
+    """`<slug>-rev` não existe, `<slug>-rev-1` existe, e a phase persistida
+    não é `migrated` nem `pending-manual` (pode ser `migrating` — o caso
+    canônico de crash entre o rename e o write final — ou `legacy`/algo
+    desconhecido, um registro atrasado em relação à realidade observada).
+
+    Achado P1-1 herdr-10 (os dois revisores, independentemente): a versão
+    anterior gravava o estado final SEM adquirir o lock — e a assinatura
+    "rev sumiu, rev-1 existe, phase=migrating" é IDÊNTICA tanto pra um
+    crash real quanto pra uma migração legítima ainda em andamento (entre
+    o rename e o reforço de papel, que pode levar segundos). Sem o lock,
+    não dá pra distinguir os dois. Agora só reconcilia se conseguir
+    adquirir o lock — se outro processo o detém, não é crash, é migração
+    ativa, e este processo desiste sem tocar em nada."""
+    cwd = core.project_root(after_only["cwd"])
+    lock_handle = migration.acquire_migration_lock(cwd)
+    if lock_handle is None:
+        print(
+            f"erro: '{rev_name}' não existe mas '{rev1_name}' existe e phase={observed_phase!r} — "
+            "parece uma migração ATIVA (lock detido por outro processo), não um crash; "
+            "não vou reconciliar, tente de novo depois",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        # Sob o lock, confirma de novo — o estado pode ter mudado entre a
+        # leitura inicial (sem lock) e agora.
+        if core.agent_status_safe(rev_name):
+            print(f"'{rev_name}' reapareceu depois do lock — não é mais um caso de self-heal, rode de novo", file=sys.stderr)
+            sys.exit(2)
+        try:
+            after = get_agent(rev1_name)
+        except RuntimeError as exc:
+            note = f"self-heal: '{rev1_name}' desapareceu sob o lock ({exc})"
+            print(f"erro: {note} — estado desconhecido, marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+        # Sem `before` (o agent antigo já não existe), não dá pra comparar
+        # campo a campo — mas as checagens absolutas continuam válidas
+        # (achado P2-2 herdr-10: não exigir menos que o caminho normal).
+        if after.get("interactive_ready") is not True:
+            note = f"self-heal: '{rev1_name}' encontrado mas interactive_ready != True"
+            print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+
+        print(
+            f"'{rev_name}' não existe mas '{rev1_name}' existe e phase={observed_phase!r}, "
+            "sem detentor ativo do lock — tratando como crash pós-rename, completando o registro",
+            file=sys.stderr,
+        )
+        _reinforce_and_finalize(slug, rev1_name, rev2_name, cwd)
+        sys.exit(0)
+    finally:
+        migration.release_migration_lock(lock_handle)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
@@ -74,10 +156,7 @@ def main():
     # Achado P1-4/P2-2 herdr-9: se o nome antigo já não existe, o caminho
     # anterior falhava aqui direto ("nada a migrar"), ANTES de consultar a
     # phase — deixando sem diagnóstico o cenário exato que a phase=migrating
-    # foi criada pra cobrir (crash entre o rename e o write final: o rename
-    # JÁ aplicou, só o registro final que não foi gravado). Tenta o nome
-    # novo antes de desistir, e completa o registro sozinho se for
-    # claramente esse caso.
+    # foi criada pra cobrir. Tenta o nome novo antes de desistir.
     try:
         before = get_agent(rev_name)
     except RuntimeError as exc:
@@ -88,17 +167,25 @@ def main():
             sys.exit(1)
         cwd = core.project_root(after_only["cwd"])
         state = migration.read_migration_state(cwd)
-        if state["phase"] != "migrating":
-            print(f"'{rev_name}' não encontrado, mas '{rev1_name}' existe e phase={state['phase']!r} — já migrado, nada a fazer", file=sys.stderr)
+        # Achado P2-1 herdr-10: a versão anterior só tratava "migrating"
+        # como pendente de reconciliação e classificava QUALQUER outra
+        # coisa — inclusive pending-manual e legacy — como "já migrado,
+        # nada a fazer", contradizendo os outros 4 comandos que recusam
+        # pending-manual explicitamente. Agora as três phases terminais são
+        # explícitas; qualquer outra (migrating, legacy, ou desconhecida)
+        # tenta a reconciliação sob lock.
+        if state["phase"] == "migrated":
+            print(f"'{rev_name}' não encontrado, mas '{rev1_name}' existe e phase=migrated — já migrado, nada a fazer", file=sys.stderr)
             sys.exit(0)
-        print(f"'{rev_name}' não existe mas '{rev1_name}' existe e phase=migrating — rename já tinha aplicado antes de um crash; completando o registro", file=sys.stderr)
-        try:
-            rev2_kind = get_agent(rev2_name)["agent"]
-        except RuntimeError:
-            rev2_kind = state["rev2_kind"]
-        migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
-        print(f"'{args.slug}': completado (self-heal). '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
-        sys.exit(0)
+        if state["phase"] == "pending-manual":
+            print(
+                f"erro: space '{args.slug}' está em phase=pending-manual "
+                f"(nota: {state.get('note')!r}) — precisa de intervenção manual",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _attempt_self_heal(args.slug, rev_name, rev1_name, rev2_name, after_only, state["phase"])
+        return  # inalcançável — _attempt_self_heal sempre chama sys.exit
 
     cwd = core.project_root(before["cwd"])
 
@@ -197,23 +284,7 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
         migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
         sys.exit(1)
 
-    try:
-        rev2_kind = get_agent(rev2_name)["agent"]
-    except RuntimeError:
-        rev2_kind = migration.read_migration_state(cwd)["rev2_kind"]
-
-    try:
-        siblings = [n for n in (rev2_name, f"{slug}-exec") if core.agent_status_safe(n)]
-        prompt = core.role_reinforcement_prompt(rev1_name, slug, cwd, siblings)
-        api("agent", "prompt", rev1_name, prompt)
-    except RuntimeError as exc:
-        note = f"rename e metadata OK, mas reforço de papel falhou: {exc}"
-        print(f"erro: {note} — marcando pending-manual em vez de declarar migrado silenciosamente", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
-        sys.exit(1)
-
-    migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
-    print(f"'{slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
+    _reinforce_and_finalize(slug, rev1_name, rev2_name, cwd)
 
 
 if __name__ == "__main__":

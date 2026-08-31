@@ -210,6 +210,13 @@ def space_gate_reason(cwd):
     - "locked": o flock está preso por um processo ativo agora (janela
       curta, tipicamente segundos — não confundir com "migrating", que é
       a marca durável).
+    - "unknown-phase": o `migration-state.json` tem uma `phase` que não é
+      nenhuma das quatro reconhecidas (`legacy`, `migrating`,
+      `pending-manual`, `migrated`) — JSON corrompido/editado à mão/typo.
+      Achado P4 herdr-10 (herdr-rev): a versão anterior só reconhecia
+      `migrating`/`pending-manual` como bloqueio e tratava QUALQUER outra
+      coisa como livre, inclusive uma phase inválida — um marcador de
+      segurança corrompido liberava o dispatch em vez de bloquear.
 
     Duas mensagens diferentes existiam pra três estados de natureza
     diferente (achado P2-2 herdr-8); os chamadores devem usar isto pra dar
@@ -221,6 +228,8 @@ def space_gate_reason(cwd):
         return "pending-manual"
     if phase == "migrating":
         return "migrating"
+    if phase not in ("legacy", "migrated"):
+        return "unknown-phase"
     if is_locked(cwd):
         return "locked"
     return None
@@ -251,6 +260,13 @@ def space_gate_message(cwd, slug):
             f"tente de novo depois; se persistir e você suspeitar de um processo morto "
             f"no meio, rode `herdr-migrate-rev {slug}` de novo (ele completa o registro "
             f"sozinho se o rename já tiver aplicado, achado herdr-9)"
+        )
+    if reason == "unknown-phase":
+        phase = read_migration_state(cwd).get("phase")
+        return (
+            f"space '{slug}' tem migration-state.json com phase={phase!r}, que não é "
+            f"reconhecida (esperado legacy/migrating/pending-manual/migrated) — "
+            f"falhando fechado; verifique o arquivo manualmente"
         )
     return f"space '{slug}' está com o lock de migração ativo agora — tente de novo em instantes"
 

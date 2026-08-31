@@ -142,6 +142,22 @@ class MigrationStateTests(unittest.TestCase):
         self.assertEqual(self.migration.space_gate_reason(self.cwd), "locked")
         self.migration.release_migration_lock(handle)
 
+        self.assertEqual(self.migration.space_gate_reason(self.cwd), None, "livre de novo depois de liberar o lock")
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "migrated"})
+        self.assertIsNone(self.migration.space_gate_reason(self.cwd))
+
+    def test_space_gate_reason_fails_closed_on_unrecognized_phase(self):
+        # Achado P4 herdr-10 (herdr-rev): a versão anterior só bloqueava em
+        # migrating/pending-manual e liberava QUALQUER outro valor -
+        # inclusive um marcador de segurança logicamente corrompido (JSON
+        # válido, phase inválida/typo/null).
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "renaming"})
+        self.assertEqual(self.migration.space_gate_reason(self.cwd), "unknown-phase")
+        self.assertTrue(self.migration.space_is_gated(self.cwd))
+        msg = self.migration.space_gate_message(self.cwd, "foo")
+        self.assertIn("renaming", msg)
+        self.assertIn("falhando fechado", msg)
+
     def test_space_gate_message_includes_note_for_pending_manual(self):
         # Achado P2-2 herdr-8: as quatro mensagens antigas diziam "lock
         # ativo — tente de novo depois" pra pending-manual também, o que é
@@ -469,7 +485,9 @@ class MigrateRevGiveUpTests(unittest.TestCase):
                 return {"agent": "grok"}
             raise AssertionError(f"get_agent inesperado: {name!r}")
 
-        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent):
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate, "api", return_value={}), \
+             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
             with self.assertRaises(SystemExit) as ctx:
                 with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
                     self.migrate.main()
@@ -478,6 +496,107 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         state = self.migrate.migration.read_migration_state(self.cwd)
         self.assertEqual(state["phase"], "migrated")
         self.assertEqual(state["rev2_kind"], "grok")
+
+    def test_self_heal_refuses_when_lock_held_by_an_active_process(self):
+        # Achado P1-1 herdr-10 (os dois revisores, independentemente): a
+        # assinatura "rev sumiu, rev-1 existe, phase=migrating" é IDÊNTICA
+        # entre um crash real e uma migração legítima ainda em andamento
+        # (entre o rename e o reforço de papel). Só o lock distingue os
+        # dois. Simula o segundo caso segurando o lock nós mesmos, como se
+        # fôssemos o processo legítimo ainda trabalhando.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok"})
+        held_lock = self.migrate.migration.acquire_migration_lock(self.cwd)
+        self.assertIsNotNone(held_lock, "pré-condição do teste: o lock precisa estar livre pra eu conseguir segurá-lo")
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("working")  # processo legítimo ainda mexendo nele
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        try:
+            with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent):
+                with self.assertRaises(SystemExit) as ctx:
+                    with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                        self.migrate.main()
+            self.assertNotEqual(ctx.exception.code, 0, "não deveria declarar sucesso enquanto outro processo detém o lock")
+        finally:
+            self.migrate.migration.release_migration_lock(held_lock)
+
+        # Não deveria ter escrito NADA - a phase continua exatamente como
+        # o processo legítimo (simulado) a deixou.
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "migrating")
+        self.assertEqual(state["rev2_kind"], "grok")
+
+    def test_old_name_gone_and_phase_pending_manual_reports_not_nothing_to_do(self):
+        # Achado P2-1 herdr-10: a versão anterior classificava QUALQUER
+        # phase != "migrating" (inclusive pending-manual) como "já migrado,
+        # nada a fazer" com exit 0 - contradizendo os outros 4 comandos, que
+        # recusam pending-manual explicitamente com a nota gravada.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "pending-manual", "note": "motivo especifico"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertNotEqual(ctx.exception.code, 0, "pending-manual não é 'nada a fazer' - precisa de intervenção humana")
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "pending-manual", "não deveria ter mexido no estado")
+
+    def test_old_name_gone_and_phase_migrated_is_a_true_noop(self):
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrated", "rev2_kind": "claude"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 0)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "migrated")
+        self.assertEqual(state["rev2_kind"], "claude", "não deveria ter reescrito nada")
+
+    def test_self_heal_refuses_when_rev1_not_interactive_ready(self):
+        # Achado P2-2 herdr-10: o self-heal não pode exigir menos do que o
+        # caminho normal exige pra declarar "migrated" - o caminho normal
+        # confere interactive_ready via FIELDS_TO_MATCH.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                info = self._agent_info("idle")
+                info["interactive_ready"] = False
+                return info
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertNotEqual(ctx.exception.code, 0)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "pending-manual")
 
 
 if __name__ == "__main__":
