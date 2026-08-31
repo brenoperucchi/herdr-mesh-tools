@@ -75,10 +75,15 @@ def _reinforce_and_finalize(slug, rev1_name, rev2_name, cwd):
     except RuntimeError as exc:
         note = f"rename e metadata OK, mas reforço de papel falhou: {exc}"
         print(f"erro: {note} — marcando pending-manual em vez de declarar migrado silenciosamente", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
         sys.exit(1)
 
-    migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None})
+    # Limpa o marcador de proveniência (achado P1-2 herdr-15): a migração
+    # concluiu, então ele deixou de ser necessário — deixá-lo no disco não
+    # causaria um falso-positivo futuro (agent_session é único por
+    # processo), mas zerar aqui evita a classe de bug por completo em vez de
+    # confiar nessa premissa indefinidamente.
+    migration.write_migration_state_atomic(cwd, {"phase": "migrated", "rev2_kind": rev2_kind, "note": None, "pending_rename_session": None})
     print(f"'{slug}': migrado. '{rev1_name}' vivo, phase=migrated, rev2_kind={rev2_kind}.")
 
 
@@ -95,7 +100,24 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
     o rename e o reforço de papel, que pode levar segundos). Sem o lock,
     não dá pra distinguir os dois. Agora só reconcilia se conseguir
     adquirir o lock — se outro processo o detém, não é crash, é migração
-    ativa, e este processo desiste sem tocar em nada."""
+    ativa, e este processo desiste sem tocar em nada.
+
+    Achado P1-2 herdr-15 (herdr-rev): comparar `after_only` (snapshot antes
+    do lock) com `after` (snapshot sob o lock) — achado da herdr-14 — só
+    prova que o ocupante ficou ESTÁVEL entre as duas leituras, não que é o
+    MESMO agent que este mecanismo de fato renomeou. Um ocupante
+    pré-existente ou reatribuído que só por coincidência mantivesse todos os
+    campos de identidade entre as duas leituras passaria. A prova real
+    precisa vir de ANTES do rename: `main()` agora persiste
+    `pending_rename_session` (o `agent_session` de `<slug>-rev` capturado
+    ANTES de escrever phase=migrating, ou seja, antes de qualquer tentativa
+    de rename) no `migration-state.json`. Self-heal só reconcilia
+    automaticamente se esse marcador existir E bater com o `agent_session`
+    do `rev1_name` observado agora — do contrário, marca pending-manual em
+    vez de aceitar por semelhança. Isso também fecha, por construção, o
+    caso "phase=legacy/desconhecida, nome antigo ausente" (achado herdr-9):
+    sem uma migração real ter começado por este mecanismo, o marcador nunca
+    existiu, então a auto-recuperação sempre recusa esses casos agora."""
     cwd = core.project_root(after_only["cwd"])
     lock_handle = migration.acquire_migration_lock(cwd)
     if lock_handle is None:
@@ -106,6 +128,12 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Lido ANTES de qualquer escrita nossa — write_migration_state_atomic
+    # faz merge com o disco, então a escrita de phase=migrating logo abaixo
+    # não apaga isto, mas ler primeiro deixa a dependência explícita: este
+    # valor tem que vir de ANTES desta tentativa de self-heal existir.
+    expected_session = migration.read_migration_state(cwd).get("pending_rename_session")
 
     # Marca durável de "em andamento" — simétrico ao caminho normal (achado
     # P1-1 herdr-11: a versão anterior adquiria o lock mas não gravava esta
@@ -151,8 +179,33 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         except RuntimeError as exc:
             note = f"self-heal: '{rev1_name}' desapareceu sob o lock ({exc})"
             print(f"erro: {note} — estado desconhecido, marcando pending-manual", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
+        # Achado P1-2 herdr-15 (herdr-rev): a comparação after_only/after
+        # (achado herdr-14, mantida abaixo) prova estabilidade, não
+        # proveniência. Exige o marcador persistido ANTES do rename E que
+        # ele bata com quem está vivo agora — sem isso, não reconcilia
+        # sozinho por mais que tudo pareça consistente entre as duas
+        # leituras feitas AGORA.
+        if observed_phase != "migrating" or not expected_session:
+            note = (
+                f"self-heal: sem marcador de proveniência do rename (phase observada={observed_phase!r}, "
+                f"pending_rename_session={expected_session!r}) — não dá pra provar que "
+                f"'{rev1_name}' veio de uma migração real deste '{rev_name}' feita por este mecanismo"
+            )
+            print(f"erro: {note} — recusando reconciliar sozinho, marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
+            sys.exit(1)
+        actual_session = _agent_session_value(after)
+        if actual_session != expected_session:
+            note = (
+                f"self-heal: agent_session de '{rev1_name}' ({actual_session!r}) não bate com o "
+                f"marcador persistido antes do rename ({expected_session!r}) — não é o mesmo agent que foi renomeado"
+            )
+            print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
+            sys.exit(1)
+
         # Achado P1-3 herdr-14 (herdr-rev): a versão anterior não provava
         # que o '{rev1_name}' visto AGORA (sob o lock) é o MESMO agent
         # observado em `after_only` (o snapshot tirado ANTES de adquirir o
@@ -162,7 +215,9 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         # DIFERENTE, mas idle e interativo, seria aceito e finalizado como
         # se fosse a migração original. Reusa FIELDS_TO_MATCH, a mesma
         # comparação que o caminho normal já faz entre `before`/`after` do
-        # rename — aqui compara `after_only`/`after` do self-heal.
+        # rename — aqui compara `after_only`/`after` do self-heal (defesa em
+        # profundidade: o marcador acima já prova proveniência; isto prova
+        # que nada mudou entre as duas leituras do próprio self-heal).
         mismatches = [f for f in FIELDS_TO_MATCH if after_only.get(f) != after.get(f)]
         if _agent_session_value(after_only) != _agent_session_value(after):
             mismatches.append("agent_session")
@@ -170,14 +225,14 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
             detail = ", ".join(f"{f}: {after_only.get(f)!r} -> {after.get(f)!r}" for f in mismatches)
             note = f"self-heal: '{rev1_name}' mudou de identidade entre a leitura inicial e sob o lock ({detail})"
             print(f"erro: {note} — marcando pending-manual (não confirma que é o mesmo agent do rename)", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
         # As checagens absolutas continuam válidas em cima disso (achado
         # P2-2 herdr-10: não exigir menos que o caminho normal).
         if after.get("interactive_ready") is not True:
             note = f"self-heal: '{rev1_name}' encontrado mas interactive_ready != True"
             print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
         # Achado P1-2 herdr-13 (herdr-rev): a versão anterior só checava
         # `interactive_ready`, ao contrário do caminho normal (`:283-285`),
@@ -188,7 +243,7 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         if after.get("agent_status") not in ("idle", "done"):
             note = f"self-heal: '{rev1_name}' encontrado mas agent_status={after.get('agent_status')!r} (esperado idle/done)"
             print(f"erro: {note} — marcando pending-manual", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
 
         print(
@@ -279,7 +334,14 @@ def main():
     # Marca durável de "em andamento" — sobrevive independente do flock (que
     # é só exclusão mútua enquanto ESTE processo roda). Preserva rev2_kind
     # já persistido (write_migration_state_atomic faz merge com o disco).
-    migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
+    #
+    # Achado P1-2 herdr-15 (herdr-rev): `pending_rename_session` é o
+    # marcador de proveniência que o self-heal exige pra reconciliar
+    # sozinho depois de um crash — capturado AQUI, ANTES de qualquer
+    # tentativa de rename (`before` já foi lido no topo de `main()`), é a
+    # prova de que uma migração REAL começou por este mecanismo, não uma
+    # coincidência entre duas leituras feitas depois do fato.
+    migration.write_migration_state_atomic(cwd, {"phase": "migrating", "pending_rename_session": _agent_session_value(before)})
 
     try:
         _run(args.slug, rev_name, rev1_name, rev2_name, cwd, before, existing_state["phase"])
@@ -294,7 +356,7 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
     # `<slug>-rev` reaparecido — e é exatamente o valor que faz
     # `build_rev_agents()` recriar o nome antigo).
     def _give_up(exit_code):
-        migration.write_migration_state_atomic(cwd, {"phase": phase_before_migrating})
+        migration.write_migration_state_atomic(cwd, {"phase": phase_before_migrating, "pending_rename_session": None})
         sys.exit(exit_code)
 
     # Re-checa DEPOIS do lock — achado P2-4 herdr-7: o snapshot pré-lock
@@ -342,7 +404,7 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
         except RuntimeError as exc:
             note = f"falha reconfirmando '{name}' após o rename ({exc})"
             print(f"erro: {note} — não decido com base numa pergunta que falhou, marcando pending-manual", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
 
     rev_alive = _confirm_or_pending_manual(rev_name)
@@ -355,13 +417,13 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
     if rev_alive and rev1_alive:
         note = f"os dois nomes ('{rev_name}' e '{rev1_name}') existem depois da chamada de rename"
         print(f"erro: {note} — estado ambíguo, marcando pending-manual", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
         sys.exit(1)
 
     if not rev_alive and not rev1_alive:
         note = f"nenhum dos dois nomes ('{rev_name}' nem '{rev1_name}') existe depois da chamada de rename"
         print(f"erro: {note} — estado desconhecido, marcando pending-manual", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
         sys.exit(1)
 
     # só '{rev1_name}' vivo, exatamente o esperado — segue pra validação.
@@ -374,7 +436,7 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
         detail = ", ".join(f"{f}: {before.get(f)!r} -> {after.get(f)!r}" for f in mismatches)
         note = f"metadata pós-rename não bate ({detail})"
         print(f"erro: {note} — marcando pending-manual (não reverto automaticamente um estado que não entendo)", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+        migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
         sys.exit(1)
 
     _reinforce_and_finalize(slug, rev1_name, rev2_name, cwd)

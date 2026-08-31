@@ -57,6 +57,13 @@ _DEFAULT_STATE = {
     "rev2_kind": "claude",
     "updated_at": None,
     "note": None,
+    # Marcador de proveniência do rename (achado P1-2 herdr-15, herdr-rev):
+    # o `agent_session` de `<slug>-rev` capturado por `herdr-migrate-rev`
+    # ANTES de qualquer tentativa de rename, pra self-heal exigir prova de
+    # que uma migração REAL começou por este mecanismo (não uma coincidência
+    # entre duas leituras feitas depois do fato). None = nenhuma migração em
+    # andamento por este mecanismo agora (ou já concluída/desistida).
+    "pending_rename_session": None,
 }
 
 
@@ -207,9 +214,6 @@ def space_gate_reason(cwd):
       essa fase precisamente pra ser lida aqui. Sem isso, um crash entre
       gravar "migrating" e gravar o estado final deixava o space
       desprotegido assim que o flock morria com o processo.
-    - "locked": o flock está preso por um processo ativo agora (janela
-      curta, tipicamente segundos — não confundir com "migrating", que é
-      a marca durável).
     - "unknown-phase": o `migration-state.json` tem uma `phase` que não é
       nenhuma das quatro reconhecidas (`legacy`, `migrating`,
       `pending-manual`, `migrated`) — JSON corrompido/editado à mão/typo.
@@ -217,6 +221,30 @@ def space_gate_reason(cwd):
       `migrating`/`pending-manual` como bloqueio e tratava QUALQUER outra
       coisa como livre, inclusive uma phase inválida — um marcador de
       segurança corrompido liberava o dispatch em vez de bloquear.
+
+    Achado P2-1 herdr-15 (herdr-rev-2): esta função tratava o flock
+    ISOLADO (sem `phase == "migrating"`) como bloqueio ("locked"). Isso
+    fazia sentido enquanto o único detentor do lock era o próprio
+    `herdr-migrate-rev`, cuja janela entre `acquire_migration_lock` e
+    gravar `phase="migrating"` é de dois statements, tipicamente
+    microssegundos. Mas a partir da herdr-15, `herdr-worker.ts`
+    (claude-bridge) também segura o MESMO lock — pelo `agent.prompt`
+    inteiro, até `DEFAULT_TIMEOUT_MS` (2 minutos por padrão) — pra ter
+    exclusão mútua real com este migrador. Sob a semântica antiga, isso
+    fazia os QUATRO leitores deste módulo (herdr-review-dispatch,
+    herdr-ask, herdr-swap, herdr-bootstrap) abortarem com "migração em
+    andamento" sempre que um worker rev-1 estivesse simplesmente em uso —
+    sem migração nenhuma acontecendo. O lock agora tem dois papéis: pro
+    `herdr-migrate-rev`, "detenho o lock" significa "posso migrar com
+    segurança" (ele SEGUE usando `acquire_migration_lock`/`is_locked`
+    diretamente pra isso). Pros LEITORES (esta função), o que importa é "há
+    uma migração", e isso é exatamente o que `phase` já significa — por
+    isso não consulta mais `is_locked` aqui. A janela residual (o lock
+    detido por `herdr-migrate-rev` antes de escrever `phase="migrating"`)
+    não fica descoberta: o próprio `_run`/`_attempt_self_heal` re-checa
+    `agent_status` idle/done e `round_in_flight` DEPOIS de adquirir o lock,
+    então um dispatch que escapou por essa janela de microssegundos ainda
+    é pego ali, não aqui.
 
     Duas mensagens diferentes existiam pra três estados de natureza
     diferente (achado P2-2 herdr-8); os chamadores devem usar isto pra dar
@@ -230,8 +258,6 @@ def space_gate_reason(cwd):
         return "migrating"
     if phase not in ("legacy", "migrated"):
         return "unknown-phase"
-    if is_locked(cwd):
-        return "locked"
     return None
 
 
@@ -261,14 +287,14 @@ def space_gate_message(cwd, slug):
             f"no meio, rode `herdr-migrate-rev {slug}` de novo (ele completa o registro "
             f"sozinho se o rename já tiver aplicado, achado herdr-9)"
         )
-    if reason == "unknown-phase":
-        phase = read_migration_state(cwd).get("phase")
-        return (
-            f"space '{slug}' tem migration-state.json com phase={phase!r}, que não é "
-            f"reconhecida (esperado legacy/migrating/pending-manual/migrated) — "
-            f"falhando fechado; verifique o arquivo manualmente"
-        )
-    return f"space '{slug}' está com o lock de migração ativo agora — tente de novo em instantes"
+    # "unknown-phase" é o único motivo restante (achado P2-1 herdr-15:
+    # "locked" deixou de existir como motivo de gate — ver space_gate_reason).
+    phase = read_migration_state(cwd).get("phase")
+    return (
+        f"space '{slug}' tem migration-state.json com phase={phase!r}, que não é "
+        f"reconhecida (esperado legacy/migrating/pending-manual/migrated) — "
+        f"falhando fechado; verifique o arquivo manualmente"
+    )
 
 
 def agent_truly_absent(exc):
