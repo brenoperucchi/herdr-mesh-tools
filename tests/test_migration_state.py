@@ -202,38 +202,80 @@ class MigrationStateTests(unittest.TestCase):
     def test_round_in_flight_true_when_agent_still_working(self):
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
             f.write("x")
+        self._backdate_past_startup_grace(request_path)
         with patch.object(self.core, "get_agent_info", return_value={"agent_status": "working"}):
             self.assertTrue(self.migration.round_in_flight(self.cwd))
 
     def test_round_in_flight_true_when_agent_blocked(self):
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
             f.write("x")
+        self._backdate_past_startup_grace(request_path)
         with patch.object(self.core, "get_agent_info", return_value={"agent_status": "blocked"}):
             self.assertTrue(self.migration.round_in_flight(self.cwd))
 
+    def _backdate_past_startup_grace(self, path):
+        # Além de _DISPATCH_STARTUP_GRACE_S, pra exercitar o ramo do
+        # agent_status em vez do grace period de largada (achado P1
+        # herdr-9) que, sozinho, já tornaria qualquer request.md recente
+        # "em voo" independente do que o agent_status diga.
+        old_ts = time.time() - (self.migration._DISPATCH_STARTUP_GRACE_S + 30)
+        os.utime(path, (old_ts, old_ts))
+
     def test_round_in_flight_false_when_agent_idle_regardless_of_request_age(self):
-        # O ponto central do achado P1-2: uma rodada abandonada com o
-        # revisor de volta a idle/done não conta como em voo, não importa
-        # há quanto tempo (nem sequer testamos idade aqui de propósito —
-        # não é mais o sinal usado).
+        # O ponto central do achado P1-2 da herdr-8: uma rodada abandonada
+        # com o revisor de volta a idle/done não conta como em voo, não
+        # importa há quanto tempo.
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
             f.write("x")
+        self._backdate_past_startup_grace(request_path)
         with patch.object(self.core, "get_agent_info", return_value={"agent_status": "idle"}):
             self.assertFalse(self.migration.round_in_flight(self.cwd))
 
-    def test_round_in_flight_false_when_agent_no_longer_exists(self):
+    def test_round_in_flight_false_when_agent_truly_not_found(self):
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
+            f.write("x")
+        self._backdate_past_startup_grace(request_path)
+        with patch.object(self.core, "get_agent_info", side_effect=RuntimeError("agent target foo-rev: agent_not_found")):
+            self.assertFalse(self.migration.round_in_flight(self.cwd), "agent que não existe mais não é algo a esperar")
+
+    def test_round_in_flight_true_when_agent_query_fails_for_other_reason(self):
+        # Achado P2-1 herdr-9: um RuntimeError genérico (timeout, servidor
+        # travado, JSON inválido) NÃO é a mesma coisa que "agent não existe
+        # mais" - falha de infraestrutura tem que falhar fechado (bloquear),
+        # não autorizar a migração por omissão.
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
+            f.write("x")
+        self._backdate_past_startup_grace(request_path)
+        with patch.object(self.core, "get_agent_info", side_effect=RuntimeError("sem resposta em 30s (server do Herdr travado?)")):
+            self.assertTrue(self.migration.round_in_flight(self.cwd))
+
+    def test_round_in_flight_true_within_dispatch_startup_grace_regardless_of_status(self):
+        # Achado P1 herdr-9: entre o dispatcher escrever request.md e o
+        # agent efetivamente entrar em working, o agent ainda está
+        # legitimamente idle/done - uma leitura pontual de status não
+        # distingue isso de uma rodada abandonada. O grace period cobre
+        # exatamente essa largada, mesmo com agent_status "idle".
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
         with open(os.path.join(round_dir, "request.md"), "w") as f:
-            f.write("x")
-        with patch.object(self.core, "get_agent_info", side_effect=RuntimeError("not found")):
-            self.assertFalse(self.migration.round_in_flight(self.cwd), "agent que não existe mais não é algo a esperar")
+            f.write("x")  # mtime = agora, dentro do grace period
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "idle"}):
+            self.assertTrue(self.migration.round_in_flight(self.cwd))
 
     def test_round_in_flight_true_regardless_of_how_slow_the_round_is(self):
         # Rodada real mais lenta medida (mfc-56/mfc-rev, 1365s) não teria
@@ -254,8 +296,10 @@ class MigrationStateTests(unittest.TestCase):
         # bloqueou, tornando o falso-positivo impossível de diagnosticar.
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
             f.write("x")
+        self._backdate_past_startup_grace(request_path)
         with patch.object(self.core, "get_agent_info", return_value={"agent_status": "working"}):
             blocker = self.migration.find_in_flight_round(self.cwd)
         self.assertEqual(blocker, round_dir)
@@ -379,9 +423,14 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         self.migrate.migration.core = self.migrate.core  # mesmo módulo mockável nos dois lados
         self.tmpdir = tempfile.TemporaryDirectory()
         self.cwd = self.tmpdir.name
-        os.environ["HERDR_ENV"] = "1"
+        # patch.dict restaura o valor original no tearDown automaticamente
+        # (achado P3-3 herdr-9: setar via os.environ direto vazava pro resto
+        # do processo de teste, sem contrapartida).
+        self._env_patch = patch.dict(os.environ, {"HERDR_ENV": "1"})
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         self.tmpdir.cleanup()
 
     def _agent_info(self, status):
@@ -401,6 +450,33 @@ class MigrateRevGiveUpTests(unittest.TestCase):
 
         state = self.migrate.migration.read_migration_state(self.cwd)
         self.assertEqual(state["phase"], "migrated", "desistir não pode rebaixar um space já migrado pra legacy")
+        self.assertEqual(state["rev2_kind"], "grok")
+
+    def test_main_self_heals_when_old_name_gone_and_phase_stuck_migrating(self):
+        # Achado P1-4/P2-2 herdr-9: crash entre o rename e o write final
+        # deixava phase=migrating travada, e a próxima execução falhava no
+        # lookup do nome ANTIGO antes mesmo de consultar a phase - sem
+        # diagnóstico nem recuperação automática do caso "rename já tinha
+        # aplicado, só faltou registrar".
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            if name == "foo-rev-2":
+                return {"agent": "grok"}
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 0, "self-heal bem-sucedido deveria sair com 0, não erro")
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "migrated")
         self.assertEqual(state["rev2_kind"], "grok")
 
 

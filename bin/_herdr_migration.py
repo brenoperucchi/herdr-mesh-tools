@@ -246,7 +246,12 @@ def space_gate_message(cwd, slug):
             f"novo (nota: {note!r})"
         )
     if reason == "migrating":
-        return f"space '{slug}' tem uma migração de nome em andamento (phase=migrating) — tente de novo depois"
+        return (
+            f"space '{slug}' tem uma migração de nome em andamento (phase=migrating) — "
+            f"tente de novo depois; se persistir e você suspeitar de um processo morto "
+            f"no meio, rode `herdr-migrate-rev {slug}` de novo (ele completa o registro "
+            f"sozinho se o rename já tiver aplicado, achado herdr-9)"
+        )
     return f"space '{slug}' está com o lock de migração ativo agora — tente de novo em instantes"
 
 
@@ -284,32 +289,52 @@ def _artifact_dirs(space_root, namespace):
 
 _TERMINAL_ARTIFACT = {"review": "verdict.md", "ask": "answer.md"}
 
+# Janela curta só pra cobrir a largada: entre o dispatcher escrever
+# request.md e o agent efetivamente entrar em "working" pelo agent.prompt,
+# o agent ainda está idle/done legitimamente (achado P1 herdr-9, confirmado
+# no próprio docstring de dispatch_and_wait_all: uma leitura pontual de
+# status não distingue "idle porque nada foi disparado" de "idle porque
+# ainda não processou o que acabou de receber" — é por isso que o
+# dispatcher usa `agent prompt --wait` em vez de `agent wait` sozinho).
+# Não precisa ser grande: só cobre o tempo entre escrever o request.md e o
+# primeiro agent.prompt, não a rodada inteira (isso é o agent_status).
+_DISPATCH_STARTUP_GRACE_S = 60
+
 
 def find_in_flight_round(space_root):
     """Uma rodada conta como 'em voo' se existir <round>/<name>/request.md
     sem o artefato terminal irmão (verdict.md p/ review, answer.md p/ ask)
-    E o `agent_status` AO VIVO daquele revisor não for `idle`/`done` agora.
+    E (o `agent_status` AO VIVO daquele revisor não for `idle`/`done` OU o
+    `request.md` foi escrito há menos de `_DISPATCH_STARTUP_GRACE_S`).
+
+    Histórico dos sinais tentados (achado de fecho, herdr-9): cada versão
+    trocou um falso por outro, nunca somou os dois. `metrics.json` (herdr-6)
+    → falso-negativo. Sem janela (herdr-7) → falso-positivo permanente.
+    Janela fixa de 1200s medindo o DISPARO (herdr-8) → falso-negativo na
+    cauda (rodadas lentas; medido: 9 de 364 rodadas reais ultrapassavam
+    qualquer janela fixa razoável). `agent_status` sozinho (herdr-9, v1)
+    → falso-negativo na largada (o instante entre escrever request.md e o
+    agent entrar em working). A correção final é a DISJUNÇÃO: `agent_status`
+    cobre a cauda (não importa há quanto tempo começou), o grace period
+    curto cobre a largada (só o intervalo de dispatch, não a rodada
+    inteira) — cada um falha exatamente onde o outro funciona.
 
     `metrics.json` NUNCA entra nessa checagem — sua ausência não significa
-    rodada em voo (achado herdr-6). O sinal é o `agent_status` ao vivo, não
-    o mtime do `request.md` (achado P1-2 herdr-8): uma janela de tempo fixa
-    mede há quanto tempo a rodada foi DISPARADA, não há quanto tempo está
-    PARADA — medido contra as 364 rodadas reais já concluídas nos 6 spaces,
-    p50=279s, p90=739s, máximo observado 1365s; qualquer janela fixa
-    "razoável" erra pras rodadas mais lentas, justamente as que mais
-    precisam da proteção. `agent_status` não tem esse problema: `working`/
-    `blocked` é em voo não importa há quanto tempo começou; `idle`/`done`
-    sem artefato terminal é abandonada não importa há quão pouco tempo. O
-    nome do diretório É o nome do agent (o dispatcher grava
-    `verdict_dirs[name] = round_dir/name`), então não precisa de mapeamento
-    extra pra descobrir quem perguntar.
+    rodada em voo (achado herdr-6). O nome do diretório É o nome do agent (o
+    dispatcher grava `verdict_dirs[name] = round_dir/name`), então não
+    precisa de mapeamento extra pra descobrir quem perguntar.
 
-    Se o agent não existir mais (ex: já foi renomeado), nada a esperar por
-    ele — não conta como bloqueio.
+    Falha de infraestrutura ao consultar o agent (timeout, servidor
+    travado, JSON inválido) NÃO é tratada como "agent não existe" (achado
+    P2-1 herdr-9: um `except RuntimeError` genérico igualava as duas coisas,
+    fail-open justo quando a consulta em si já não é confiável). Só um erro
+    estruturado `agent_not_found` da API do Herdr conta como "nada a esperar
+    por ele"; qualquer outro erro falha fechado (bloqueia).
 
     Retorna o path do `reviewer_dir` bloqueador (diagnóstico — achado P1-1
     herdr-7: "qual diretório" faltava na versão original), ou None se nada
     estiver em voo."""
+    now = time.time()
     for namespace, terminal_name in _TERMINAL_ARTIFACT.items():
         for round_dir in _artifact_dirs(space_root, namespace):
             for entry in os.listdir(round_dir):
@@ -320,10 +345,14 @@ def find_in_flight_round(space_root):
                 terminal_path = os.path.join(reviewer_dir, terminal_name)
                 if not os.path.isfile(request_path) or os.path.isfile(terminal_path):
                     continue
+                if now - os.path.getmtime(request_path) < _DISPATCH_STARTUP_GRACE_S:
+                    return reviewer_dir
                 try:
                     status = core.get_agent_info(entry)["agent_status"]
-                except RuntimeError:
-                    continue
+                except RuntimeError as exc:
+                    if "agent_not_found" in str(exc):
+                        continue
+                    return reviewer_dir  # falha de infra: fail-closed, não assume liberado
                 if status not in ("idle", "done"):
                     return reviewer_dir
     return None
