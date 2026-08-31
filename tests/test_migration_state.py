@@ -468,6 +468,40 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         self.assertEqual(state["phase"], "migrated", "desistir não pode rebaixar um space já migrado pra legacy")
         self.assertEqual(state["rev2_kind"], "grok")
 
+    def test_self_heal_writes_migrating_before_attempting_reinforcement(self):
+        # Achado P1-1 herdr-11 (os dois revisores, independentemente): o
+        # self-heal adquiria o lock mas não gravava a marca durável
+        # phase=migrating antes de tentar o reforço de papel (a chamada mais
+        # demorada do fluxo) - um crash ali deixava o space com a phase
+        # ANTIGA (ex: legacy) e nenhum gate, mesmo com o lock corretamente
+        # adquirido antes. Prova isto observando a phase no disco durante a
+        # própria chamada de reforço, não só o resultado final.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
+        observed = {}
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            if name == "foo-rev-2":
+                return {"agent": "grok"}
+            raise AssertionError(f"get_agent inesperado: {name!r}")
+
+        def fake_api(*args):
+            if args[:2] == ("agent", "prompt"):
+                observed["phase_during_reinforcement"] = self.migrate.migration.read_migration_state(self.cwd)["phase"]
+            return {}
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate, "api", side_effect=fake_api), \
+             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
+            with self.assertRaises(SystemExit):
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+
+        self.assertEqual(observed.get("phase_during_reinforcement"), "migrating", "a marca durável precisa existir ANTES da chamada mais demorada do fluxo")
+
     def test_main_self_heals_when_old_name_gone_and_phase_stuck_migrating(self):
         # Achado P1-4/P2-2 herdr-9: crash entre o rename e o write final
         # deixava phase=migrating travada, e a próxima execução falhava no

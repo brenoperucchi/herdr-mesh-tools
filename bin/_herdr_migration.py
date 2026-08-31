@@ -271,6 +271,32 @@ def space_gate_message(cwd, slug):
     return f"space '{slug}' está com o lock de migração ativo agora — tente de novo em instantes"
 
 
+def agent_truly_absent(exc):
+    """True só se `exc` for o erro estruturado `agent_not_found` da API do
+    Herdr — qualquer outro texto (timeout, servidor travado, JSON inválido)
+    é falha de infraestrutura, não confirmação de ausência (achado P2-1
+    herdr-9/herdr-11: `core.agent_status_safe` e um `except RuntimeError`
+    genérico apagam essa distinção por construção, em pontos que decidem
+    se uma migração é reconciliada ou uma rodada é liberada)."""
+    return "agent_not_found" in str(exc)
+
+
+def agent_status_or_raise(name):
+    """Como `core.agent_status_safe`, mas só devolve `None` quando o erro é
+    `agent_not_found` — qualquer outro erro é PROPAGADO em vez de virar
+    `False` silenciosamente. Use isto (não `agent_status_safe`) em qualquer
+    ponto onde a resposta decide se uma migração reconcilia, uma rodada é
+    liberada, ou um estado ambíguo é declarado — os lugares onde a
+    diferença entre "não existe" e "não consegui perguntar" importa de
+    verdade."""
+    try:
+        return core.agent_status(name)
+    except RuntimeError as exc:
+        if agent_truly_absent(exc):
+            return None
+        raise
+
+
 def resolve_reviewer_name(cwd, slug):
     """Dual-read do primeiro revisor: <slug>-rev-1 se vivo, senão <slug>-rev.
     Fail-closed (RuntimeError) se os dois estiverem vivos ao mesmo tempo
@@ -364,11 +390,11 @@ def find_in_flight_round(space_root):
                 if now - os.path.getmtime(request_path) < _DISPATCH_STARTUP_GRACE_S:
                     return reviewer_dir
                 try:
-                    status = core.get_agent_info(entry)["agent_status"]
-                except RuntimeError as exc:
-                    if "agent_not_found" in str(exc):
-                        continue
+                    status = agent_status_or_raise(entry)
+                except RuntimeError:
                     return reviewer_dir  # falha de infra: fail-closed, não assume liberado
+                if status is None:
+                    continue  # agent_not_found confirmado - nada a esperar
                 if status not in ("idle", "done"):
                     return reviewer_dir
     return None

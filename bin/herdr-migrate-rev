@@ -107,11 +107,31 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         )
         sys.exit(2)
 
+    # Marca durável de "em andamento" — simétrico ao caminho normal (achado
+    # P1-1 herdr-11: a versão anterior adquiria o lock mas não gravava esta
+    # marca; um crash DURANTE o self-heal — ex: no meio do reforço de papel,
+    # que pode levar até CLI_TIMEOUT_S — deixava o space sem gate assim que
+    # o flock morresse com o processo, com `<slug>-rev-1` vivo e a phase
+    # antiga (`legacy`, por exemplo) ainda persistida).
+    migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
+
     try:
         # Sob o lock, confirma de novo — o estado pode ter mudado entre a
-        # leitura inicial (sem lock) e agora.
-        if core.agent_status_safe(rev_name):
+        # leitura inicial (sem lock) e agora. Achado P2-1 herdr-11: usa
+        # agent_status_or_raise, não agent_status_safe — esta re-checagem
+        # existe especificamente pra pegar "o nome antigo reapareceu", e
+        # `agent_status_safe` apagaria um timeout aqui como se fosse
+        # "não existe", autorizando a reconciliação sem confirmação real.
+        try:
+            reappeared = migration.agent_status_or_raise(rev_name) is not None
+        except RuntimeError as exc:
+            note = f"self-heal: falha reconfirmando ausência de '{rev_name}' sob o lock ({exc})"
+            print(f"erro: {note} — não vou reconciliar por segurança, marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+        if reappeared:
             print(f"'{rev_name}' reapareceu depois do lock — não é mais um caso de self-heal, rode de novo", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": observed_phase})
             sys.exit(2)
         try:
             after = get_agent(rev1_name)
@@ -160,6 +180,16 @@ def main():
     try:
         before = get_agent(rev_name)
     except RuntimeError as exc:
+        # Achado P2-1 herdr-11: um RuntimeError genérico (timeout, servidor
+        # travado, JSON inválido) não é confirmação de que '{rev_name}' não
+        # existe — só o erro estruturado agent_not_found é. Qualquer outra
+        # falha aqui é infraestrutura instável, e não deve entrar no
+        # caminho de self-heal (que decide se uma migração é declarada
+        # concluída) com base numa pergunta que nem chegou a ser
+        # respondida.
+        if not migration.agent_truly_absent(exc):
+            print(f"erro: falha consultando '{rev_name}' ({exc}) — não confirma ausência, abortando sem tocar em nada", file=sys.stderr)
+            sys.exit(1)
         try:
             after_only = get_agent(rev1_name)
         except RuntimeError:
@@ -251,9 +281,22 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
 
     # Nunca confiar só no retorno da chamada (achado P1 herdr-rev/herdr-7:
     # timeout/erro do lado cliente não prova ausência de efeito no servidor)
-    # — consulta os dois nomes de verdade.
-    rev_alive = core.agent_status_safe(rev_name)
-    rev1_alive = core.agent_status_safe(rev1_name)
+    # — consulta os dois nomes de verdade. agent_status_or_raise, não
+    # agent_status_safe (achado P2-1 herdr-11, mesma classe): uma falha de
+    # infra aqui não pode virar "não existe" silenciosamente — a decisão
+    # entre "rename aplicou limpo" e "estado ambíguo" depende exatamente
+    # dessa distinção.
+    def _confirm_or_pending_manual(name):
+        try:
+            return migration.agent_status_or_raise(name) is not None
+        except RuntimeError as exc:
+            note = f"falha reconfirmando '{name}' após o rename ({exc})"
+            print(f"erro: {note} — não decido com base numa pergunta que falhou, marcando pending-manual", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
+            sys.exit(1)
+
+    rev_alive = _confirm_or_pending_manual(rev_name)
+    rev1_alive = _confirm_or_pending_manual(rev1_name)
 
     if rev_alive and not rev1_alive:
         print(f"confirmado: rename não aplicou ('{rev_name}' continua vivo, '{rev1_name}' não existe) — nada foi tocado", file=sys.stderr)
