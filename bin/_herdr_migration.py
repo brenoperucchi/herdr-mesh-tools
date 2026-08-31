@@ -239,12 +239,24 @@ def space_gate_reason(cwd):
     segurança" (ele SEGUE usando `acquire_migration_lock`/`is_locked`
     diretamente pra isso). Pros LEITORES (esta função), o que importa é "há
     uma migração", e isso é exatamente o que `phase` já significa — por
-    isso não consulta mais `is_locked` aqui. A janela residual (o lock
-    detido por `herdr-migrate-rev` antes de escrever `phase="migrating"`)
-    não fica descoberta: o próprio `_run`/`_attempt_self_heal` re-checa
-    `agent_status` idle/done e `round_in_flight` DEPOIS de adquirir o lock,
-    então um dispatch que escapou por essa janela de microssegundos ainda
-    é pego ali, não aqui.
+    isso não consulta mais `is_locked` aqui.
+
+    Achado P3-2 herdr-16 (herdr-rev-2): a versão anterior deste parágrafo
+    afirmava que a janela residual (o lock detido por `herdr-migrate-rev`
+    entre `acquire_migration_lock` e escrever `phase="migrating"`, poucos
+    statements) "não fica descoberta" porque `round_in_flight`/`agent_status`
+    pegariam qualquer dispatch que escapasse por ela. Medido: isso é falso
+    como garantia — um dispatcher que passou pelo gate ainda precisa
+    percorrer vários round-trips de socket e congelar o snapshot antes do
+    `request.md` existir em disco (~8ms medidos só nos round-trips), e
+    durante essa faixa inteira `round_in_flight` não encontra `request.md`
+    nenhum e o revisor está `idle` justamente porque a rodada ainda não foi
+    disparada — os dois sinais leem "não há rodada" e o rename segue. A
+    exposição real é a janela de sub-milissegundo entre adquirir o lock e
+    gravar `migrating`; o pior desfecho plausível é um dispatch que falha
+    com `agent_not_found` (não corrupção). Isto é um risco residual medido e
+    aceito — não coberto — e reverter para `is_locked` aqui reabriria o
+    P2-1 acima; por isso o risco fica, documentado como tal.
 
     Duas mensagens diferentes existiam pra três estados de natureza
     diferente (achado P2-2 herdr-8); os chamadores devem usar isto pra dar

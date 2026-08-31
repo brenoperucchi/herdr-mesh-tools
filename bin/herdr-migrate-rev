@@ -193,6 +193,24 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
                 f"pending_rename_session={expected_session!r}) — não dá pra provar que "
                 f"'{rev1_name}' veio de uma migração real deste '{rev_name}' feita por este mecanismo"
             )
+            # Achado P1-1 herdr-16 (herdr-rev-2): a versão anterior escalava
+            # SEMPRE pra pending-manual aqui — mas "legacy" (o default de
+            # todo space que nunca rodou este migrador; hoje é o estado dos
+            # seis spaces reais) NÃO é uma fase gateada (`space_gate_reason`
+            # trata "legacy" como livre). Recusar reconciliar e ainda assim
+            # gravar pending-manual TRANSFORMA um space livre num space
+            # permanentemente morto (nenhuma ferramenta do repo sai de
+            # pending-manual sozinha) — provado como regressão contra o
+            # commit-pai (6a6a479 concluía com sucesso o mesmo cenário).
+            # "migrating"/desconhecida já eram fases gateadas antes de
+            # chegar aqui, então escalar pra pending-manual nesses dois
+            # casos não piora nada — só "legacy" precisa do tratamento
+            # `_give_up`: recusa (exit 1, nunca declara "migrated" sem
+            # prova) mas restaura a fase observada em vez de gatear.
+            if observed_phase == "legacy":
+                print(f"erro: {note} — recusando reconciliar sozinho; mantendo phase=legacy (space continua livre, sem gate)", file=sys.stderr)
+                migration.write_migration_state_atomic(cwd, {"phase": "legacy", "pending_rename_session": None})
+                sys.exit(1)
             print(f"erro: {note} — recusando reconciliar sozinho, marcando pending-manual", file=sys.stderr)
             migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note, "pending_rename_session": None})
             sys.exit(1)
@@ -324,6 +342,16 @@ def main():
             "manual antes de qualquer nova tentativa automática",
             file=sys.stderr,
         )
+        sys.exit(1)
+
+    # Achado P3-3 herdr-16 (herdr-rev-2): sem agent_session em `before`, o
+    # marcador de proveniência gravado logo abaixo nasceria None — uma
+    # migração cuja recuperação automática já se sabe impossível de antemão
+    # (o self-heal nunca teria como provar proveniência depois de um crash).
+    # Aborta ANTES de tocar em qualquer coisa (nem lock, nem write) em vez de
+    # começar uma migração que já nasce sem rede de segurança.
+    if _agent_session_value(before) is None:
+        print(f"erro: '{rev_name}' não trouxe agent_session na resposta — sem isso não dá pra gravar o marcador de proveniência que o self-heal exige; abortando sem tocar em nada", file=sys.stderr)
         sys.exit(1)
 
     lock_handle = migration.acquire_migration_lock(cwd)

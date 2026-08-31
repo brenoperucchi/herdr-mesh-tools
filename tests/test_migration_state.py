@@ -641,15 +641,26 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         self.assertEqual(state["rev2_kind"], "grok")
         self.assertIsNone(state["pending_rename_session"], "marcador de proveniência precisa ser limpo após concluir")
 
-    def test_self_heal_refuses_legacy_phase_without_provenance_marker(self):
-        # Achado P1-2 herdr-15 (herdr-rev), o requisito central da rodada:
-        # phase="legacy" (ou qualquer coisa que não seja "migrating") com o
-        # nome antigo ausente e '{rev1_name}' presente é EXATAMENTE o cenário
-        # que o achado herdr-9 original mandava reconciliar automaticamente
-        # - mas sem uma migração real ter começado por este mecanismo, não
-        # existe (e nunca existiu) marcador de proveniência. Mesmo com tudo
-        # consistente (idle, interactive_ready), o self-heal agora recusa e
-        # exige intervenção manual em vez de aceitar por semelhança.
+    def test_self_heal_refuses_legacy_phase_without_provenance_marker_but_does_not_gate_it(self):
+        # Achado P1-2 herdr-15 (herdr-rev), o requisito central daquela
+        # rodada: phase="legacy" com o nome antigo ausente e '{rev1_name}'
+        # presente é EXATAMENTE o cenário que o achado herdr-9 original
+        # mandava reconciliar automaticamente - mas sem uma migração real
+        # ter começado por este mecanismo, não existe (e nunca existiu)
+        # marcador de proveniência. O self-heal recusa declarar "migrated"
+        # sem prova, mesmo com tudo consistente (idle, interactive_ready).
+        #
+        # Achado P1-1 herdr-16 (herdr-rev-2): a versão anterior deste teste
+        # congelava uma REGRESSÃO - gravava "pending-manual" aqui, o que
+        # transforma todo space LIVRE (phase="legacy" é o default; nenhum
+        # dos seis spaces reais tem migration-state.json hoje) num space
+        # permanentemente gateado na primeira vez que alguém rodar
+        # `herdr-migrate-rev` depois de um rename manual - sem nenhuma
+        # ferramenta do repo pra sair de pending-manual sozinha. "legacy"
+        # não é uma fase gateada (`space_gate_reason` trata como livre);
+        # recusar reconciliar não pode, por si só, criar um gate que não
+        # existia. O comportamento certo é `_give_up`: recusa (exit 1,
+        # nunca declara sucesso sem prova) mas RESTAURA a fase observada.
         self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
 
         def fake_get_agent(name):
@@ -664,11 +675,12 @@ class MigrateRevGiveUpTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
                     self.migrate.main()
-        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(ctx.exception.code, 1, "recusa em declarar migrado sem prova continua sendo um erro, não sucesso silencioso")
 
         state = self.migrate.migration.read_migration_state(self.cwd)
-        self.assertEqual(state["phase"], "pending-manual", "sem marcador de proveniência, self-heal não pode reconciliar sozinho")
-        self.assertIn("proveniência", state["note"])
+        self.assertEqual(state["phase"], "legacy", "recusar reconciliar não pode gatear um space que estava livre")
+        self.assertFalse(self.migrate.migration.space_is_gated(self.cwd), "space precisa continuar utilizável pelos outros 4 comandos")
+        self.assertIsNone(state["pending_rename_session"])
 
     def test_self_heal_refuses_when_session_marker_mismatches(self):
         # Achado P1-2 herdr-15: mesmo com phase="migrating" e um marcador
@@ -695,6 +707,59 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         state = self.migrate.migration.read_migration_state(self.cwd)
         self.assertEqual(state["phase"], "pending-manual")
         self.assertIn("não bate", state["note"])
+
+    def test_self_heal_escalates_unknown_phase_without_provenance_to_pending_manual(self):
+        # Achado P1-1 herdr-16 (herdr-rev-2): o tratamento especial (restaurar
+        # em vez de gatear) é só pra "legacy", que não é uma fase gateada.
+        # "unknown-phase" (qualquer coisa fora de legacy/migrating/
+        # pending-manual/migrated) JÁ é gateada por space_gate_reason antes
+        # mesmo de chegar aqui - escalar pra pending-manual nesse caso não
+        # piora nada, e continua sendo a resposta certa pra um estado que já
+        # era anômalo.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "algo-desconhecido", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "pending-manual", "unknown-phase já era gateada antes do self-heal - escalar não é regressão")
+
+    def test_main_aborts_before_touching_anything_when_before_has_no_agent_session(self):
+        # Achado P3-3 herdr-16 (herdr-rev-2): se a resposta de '{rev_name}'
+        # não trouxer agent_session, o marcador de proveniência gravado
+        # nasceria None - uma migração cuja recuperação automática já se
+        # sabe impossível de antemão. Abortar ANTES de adquirir o lock ou
+        # escrever qualquer coisa é melhor que começar uma migração sem rede
+        # de segurança.
+        before_info_without_session = self._agent_info("idle")
+        del before_info_without_session["agent_session"]
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                return before_info_without_session
+            raise AssertionError(f"get_agent inesperado: {name!r} - nada deveria ser consultado além de foo-rev")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+            with self.assertRaises(SystemExit) as ctx:
+                self.migrate.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        # Nada deveria ter sido escrito em disco - nem o lock foi adquirido.
+        self.assertFalse(self.migrate.migration.is_locked(self.cwd))
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "legacy", "phase default - nada foi escrito")
 
     def test_self_heal_detects_rev1_reoccupied_between_snapshots(self):
         # Achado P1-3 herdr-14 (herdr-rev): a versão anterior não provava que
