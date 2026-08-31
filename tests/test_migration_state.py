@@ -682,6 +682,80 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         self.assertFalse(self.migrate.migration.space_is_gated(self.cwd), "space precisa continuar utilizável pelos outros 4 comandos")
         self.assertIsNone(state["pending_rename_session"])
 
+    def test_self_heal_legacy_without_marker_refuses_before_reading_rev1_even_on_infra_failure(self):
+        # Achado P1-1 herdr-17 (herdr-rev, "caminho A"): a correção da
+        # herdr-16 só cobria o ramo em que a checagem de proveniência roda e
+        # retorna diretamente. Mas se `get_agent(rev1_name)` sob o lock
+        # falhasse por infra (não por ausência confirmada), o código ANTIGO
+        # escalava pra pending-manual antes de sequer chegar na checagem de
+        # proveniência - bricando um space legacy livre por causa de um
+        # timeout, não de um problema real. Agora o guard intercepta ANTES
+        # dessa consulta - `get_agent(rev1_name)` nem chega a ser chamado
+        # pra decidir o desfecho (só foi chamado uma vez, em `main()`, pra
+        # montar `after_only`).
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
+        calls = []
+
+        def fake_get_agent(name):
+            calls.append(name)
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        def fake_agent_status_or_raise(name):
+            raise AssertionError(f"agent_status_or_raise não deveria ser chamado - guard deve interceptar antes: {name!r}")
+
+        with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+             patch.object(self.migrate.migration, "agent_status_or_raise", side_effect=fake_agent_status_or_raise):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+        self.assertEqual(ctx.exception.code, 1)
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "legacy")
+        self.assertFalse(self.migrate.migration.space_is_gated(self.cwd))
+        # Só a consulta original em main() (montando after_only) - o guard
+        # intercepta antes de qualquer reconfirmação sob o lock.
+        self.assertEqual(calls.count("foo-rev-1"), 1)
+        # O guard fica DENTRO do try/finally que libera o lock (achado
+        # corrigido durante a implementação desta mesma rodada) - confirma
+        # que uma nova aquisição funciona depois do sys.exit.
+        self.assertFalse(self.migrate.migration.is_locked(self.cwd), "lock precisa ter sido liberado mesmo saindo pelo guard novo")
+
+    def test_self_heal_legacy_without_marker_never_gets_stuck_in_migrating_across_retries(self):
+        # Achado P1-1 herdr-17 (herdr-rev-2, "caminho B", o mais grave dos
+        # dois): no código antigo, uma falha de infra reconfirmando ausência
+        # de `rev_name` sob o lock mantinha phase=migrating (comportamento
+        # correto da herdr-13) - mas SEM marcador de proveniência, a
+        # PRÓXIMA tentativa lia phase=migrating (não mais "legacy") e
+        # escalava pra pending-manual, atravessando a proteção da herdr-16 um
+        # passo depois. Simula duas tentativas: a primeira nunca deveria
+        # sequer chegar no ponto de gravar migrating (o guard intercepta
+        # antes), e uma segunda tentativa confirma que o space continua
+        # exatamente onde estava.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
+
+        def fake_get_agent(name):
+            if name == "foo-rev":
+                raise RuntimeError("agent target foo-rev: agent_not_found")
+            if name == "foo-rev-1":
+                return self._agent_info("idle")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
+
+        for attempt in (1, 2):
+            with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
+                 patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
+                with self.assertRaises(SystemExit) as ctx:
+                    with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                        self.migrate.main()
+            self.assertEqual(ctx.exception.code, 1, f"tentativa {attempt}")
+            state = self.migrate.migration.read_migration_state(self.cwd)
+            self.assertEqual(state["phase"], "legacy", f"tentativa {attempt}: nunca deveria ter saído de legacy")
+            self.assertFalse(self.migrate.migration.space_is_gated(self.cwd), f"tentativa {attempt}")
+
     def test_self_heal_refuses_when_session_marker_mismatches(self):
         # Achado P1-2 herdr-15: mesmo com phase="migrating" e um marcador
         # presente, se o agent_session observado agora não bater com o que
@@ -804,7 +878,13 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         # por infra — mas essa fase pode ser "legacy", que o gate do worker
         # trata como livre, reabrindo o space pra uso durante um estado ainda
         # não confirmado. Agora deve permanecer "migrating" (bloqueado).
-        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy", "rev2_kind": "grok"})
+        #
+        # phase inicial precisa ser "migrating" (não "legacy") - achado
+        # P1-1 herdr-17: "legacy" sem marcador agora é interceptado ANTES de
+        # sequer tentar reconfirmar `rev_name`, então o cenário que este
+        # teste verifica (falha de infra DURANTE a reconfirmação) só é
+        # alcançável quando já se passou por esse guard.
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating", "rev2_kind": "grok", "pending_rename_session": "s1"})
 
         def fake_get_agent(name):
             if name == "foo-rev-1":

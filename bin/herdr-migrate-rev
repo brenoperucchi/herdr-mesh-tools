@@ -135,15 +135,50 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
     # valor tem que vir de ANTES desta tentativa de self-heal existir.
     expected_session = migration.read_migration_state(cwd).get("pending_rename_session")
 
-    # Marca durável de "em andamento" — simétrico ao caminho normal (achado
-    # P1-1 herdr-11: a versão anterior adquiria o lock mas não gravava esta
-    # marca; um crash DURANTE o self-heal — ex: no meio do reforço de papel,
-    # que pode levar até CLI_TIMEOUT_S — deixava o space sem gate assim que
-    # o flock morresse com o processo, com `<slug>-rev-1` vivo e a phase
-    # antiga (`legacy`, por exemplo) ainda persistida).
-    migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
-
+    # Achado P1-1 herdr-17 (herdr-rev e herdr-rev-2, convergente sobre o
+    # mesmo defeito): a correção da herdr-16 só tratava o ramo em que a
+    # checagem de proveniência (mais abaixo) roda e retorna diretamente —
+    # mas DOIS caminhos anteriores no meio deste `try` (falha de infra
+    # reconfirmando ausência de `rev_name`, falha de infra consultando
+    # `rev1_name`) ainda escalavam um space `legacy` livre pra
+    # `pending-manual`, ou deixavam `phase=migrating` travada sem marcador —
+    # que a PRÓXIMA tentativa então escalava, atravessando a correção um
+    # passo depois (a própria mensagem de erro desses ramos instrui "tente
+    # de novo", levando o operador direto pro caminho que gateia).
+    #
+    # Quando `observed_phase == "legacy"` sem marcador, o desfecho já está
+    # determinado ANTES de qualquer consulta abaixo: nunca vai reconciliar
+    # de qualquer jeito. Recusa aqui, antes de gravar `migrating` — o
+    # arquivo de estado nem chega a ser tocado, então nenhuma falha de
+    # infra ou crash no meio do `try` pode deixar o space preso no caminho.
+    # `migrating`/`unknown-phase` continuam indo pro ramo mais abaixo (já
+    # eram fases gateadas antes de chegar aqui, escalar não piora nada).
     try:
+        # Achado P1-1 herdr-17: este guard fica DENTRO do try/finally (que
+        # libera o lock) — colocá-lo antes, mesmo saindo via sys.exit(1),
+        # deixaria o release explícito sem rodar (correto em produção, onde
+        # o processo termina e o kernel libera o flock sozinho, mas quebra
+        # a simetria de release explícito que o resto do arquivo mantém, e
+        # importa de verdade quando este código roda embutido, como nos
+        # testes).
+        if observed_phase == "legacy" and not expected_session:
+            note = (
+                "self-heal: sem marcador de proveniência do rename (phase observada='legacy', "
+                "pending_rename_session=None) — não dá pra provar que "
+                f"'{rev1_name}' veio de uma migração real deste '{rev_name}' feita por este mecanismo"
+            )
+            print(f"erro: {note} — recusando reconciliar sozinho; space continua phase=legacy (livre, sem gate), nada foi tocado", file=sys.stderr)
+            sys.exit(1)
+
+        # Marca durável de "em andamento" — simétrico ao caminho normal
+        # (achado P1-1 herdr-11: a versão anterior adquiria o lock mas não
+        # gravava esta marca; um crash DURANTE o self-heal — ex: no meio do
+        # reforço de papel, que pode levar até CLI_TIMEOUT_S — deixava o
+        # space sem gate assim que o flock morresse com o processo, com
+        # `<slug>-rev-1` vivo e a phase antiga (`legacy`, por exemplo) ainda
+        # persistida).
+        migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
+
         # Sob o lock, confirma de novo — o estado pode ter mudado entre a
         # leitura inicial (sem lock) e agora. Achado P2-1 herdr-11: usa
         # agent_status_or_raise, não agent_status_safe — esta re-checagem
@@ -207,6 +242,13 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
             # casos não piora nada — só "legacy" precisa do tratamento
             # `_give_up`: recusa (exit 1, nunca declara "migrated" sem
             # prova) mas restaura a fase observada em vez de gatear.
+            #
+            # Achado P1-1 herdr-17 (herdr-rev/herdr-rev-2): o caso comum
+            # "legacy" sem marcador já é interceptado ANTES de gravar
+            # `migrating` (ver o guard logo no início desta função) — este
+            # ramo agora só é alcançável defensivamente pra "legacy" com um
+            # marcador presente mas de proveniência duvidosa (ex: leftover
+            # manual), continuando conservador em vez de confiar nele.
             if observed_phase == "legacy":
                 print(f"erro: {note} — recusando reconciliar sozinho; mantendo phase=legacy (space continua livre, sem gate)", file=sys.stderr)
                 migration.write_migration_state_atomic(cwd, {"phase": "legacy", "pending_rename_session": None})
@@ -350,7 +392,15 @@ def main():
     # (o self-heal nunca teria como provar proveniência depois de um crash).
     # Aborta ANTES de tocar em qualquer coisa (nem lock, nem write) em vez de
     # começar uma migração que já nasce sem rede de segurança.
-    if _agent_session_value(before) is None:
+    #
+    # Achado P3-2 herdr-17 (herdr-rev-2): usa `not` (falsy), não `is None` —
+    # o self-heal consome este mesmo valor mais adiante com `not
+    # expected_session`, e uma resposta com agent_session={"value": ""}
+    # produziria uma string vazia que passaria por `is None` mas seria
+    # rejeitada como proveniência lá. As duas pontas precisam concordar por
+    # construção, não por coincidência de os 22 agents reais nunca terem
+    # esse valor vazio hoje.
+    if not _agent_session_value(before):
         print(f"erro: '{rev_name}' não trouxe agent_session na resposta — sem isso não dá pra gravar o marcador de proveniência que o self-heal exige; abortando sem tocar em nada", file=sys.stderr)
         sys.exit(1)
 
