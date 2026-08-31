@@ -6,27 +6,33 @@ Isto é o mecanismo, não a decisão de quando migrar: `herdr-migrate-rev`
 vez. `herdr-review-dispatch`, `herdr-ask` e `herdr-bootstrap` só *leem* o
 estado escrito aqui — nenhum dispatcher escreve em `migration-state.json`.
 
-Histórico: quatro rodadas de revisão (`herdr-4` a `herdr-7` em
+Histórico: cinco rodadas de revisão (`herdr-4` a `herdr-8` em
 `.herdr/review/`) reprovaram versões anteriores deste mecanismo — as três
 primeiras por falta de lock atômico de verdade, identidade de escrita
 divergindo da attestation, e `_infer_role` sem `-rev-1`; a quarta (`herdr-7`,
-primeira revisão de código real) por: lock baseado em existência de arquivo
-com corrida real entre detectar-stale e recriar, `phase=pending-manual` não
-respeitado em lugar nenhum, `round_in_flight` sem janela de tempo (trocou um
-falso-negativo por um falso-positivo PERMANENTE), e resultado de `agent
-rename` tratado como certo sem consultar o que aconteceu de fato.
+primeira revisão de código real) por lock baseado em existência de arquivo
+com corrida real, `pending-manual` não respeitado, `round_in_flight` sem
+janela de tempo, e resultado de `agent rename` tratado como certo sem
+consultar o que aconteceu de fato; a quinta (`herdr-8`) por dois efeitos
+colaterais das próprias correções da `herdr-7`: `space_is_gated()` dizia
+cobrir `phase="migrating"` mas só testava `pending-manual` e o flock (bug
+real, não só de documentação — `grep` confirmou zero leitores de
+`"migrating"`), e a janela de tempo do `round_in_flight` media a idade do
+**disparo** da rodada (mtime do `request.md`), não a inatividade — medido
+contra 364 rodadas reais concluídas, 9 (2,5%) já ultrapassavam qualquer
+janela fixa razoável (a mais lenta levou 1365s).
 
-Limitação residual conhecida (achado herdr-7, não fechada por completo):
-`herdr-review-dispatch`/`herdr-ask`/`herdr-swap` checam `space_is_gated()`
-uma vez, no início, mas não seguram um lock durante toda a própria operação
-(que pode levar até `--timeout`, tipicamente 1200s) — uma migração pode
-começar depois dessa checagem e antes do prompt de fato ser enviado. Fechar
-isso de vez exigiria um lock leitor/escritor compartilhado entre despacho e
-migração, não implementado aqui por escopo; `herdr-migrate-rev` reduz o
-dano prático ao re-checar idle/round-em-voo DEPOIS de adquirir o próprio
-lock (não antes), e ao nunca assumir sucesso do rename sem consultar os
-dois nomes de verdade — mas a janela entre "dispatcher decidiu prosseguir"
-e "migração começa" continua existindo.
+A `herdr-8` também respondeu à pergunta sobre a limitação residual descrita
+antes desta versão (dispatchers não seguram lock durante toda a própria
+operação): os dois revisores concordaram em **não** construir um lock
+leitor/escritor. O argumento decisivo (herdr-rev-2): o cenário perigoso é
+justamente quando o dispatcher **não está mais vivo** (interrompido, morto,
+ou já retornou com os revisores ainda trabalhando) — um lock preso ao
+processo do dispatcher não cobre esse caso de jeito nenhum. O que cobre a
+duração inteira de uma rodada, independente de quem está vivo, é o
+marcador em disco (`find_in_flight_round`, agora baseado no `agent_status`
+ao vivo do revisor, não em mtime) — por isso ele é a peça que teve que ser
+corrigida, não um lock novo.
 """
 import fcntl
 import json
@@ -39,14 +45,6 @@ import _herdr_dispatch as core
 
 HERDR = core.HERDR
 CLI_TIMEOUT_S = core.CLI_TIMEOUT_S
-
-# Janela padrão pra round_in_flight() considerar um request.md órfão como
-# "ainda em voo" (achado P1 herdr-7: sem recorte de tempo, uma rodada
-# abandonada em qualquer momento do passado trava a migração PRA SEMPRE,
-# não só temporariamente — bug pior que o falso-negativo do metrics.json que
-# esta checagem substituiu na herdr-6). Bate com o --timeout default dos
-# dispatchers.
-DEFAULT_IN_FLIGHT_WINDOW_S = 1200
 
 # rev2_kind default: "claude" (Opus) é a política padrão; Grok foi usado como
 # fallback temporário enquanto a cota semanal do Opus estava estourada
@@ -157,37 +155,99 @@ def release_migration_lock(handle):
 
 
 def is_locked(cwd):
-    """Tenta adquirir sem bloquear; se conseguir, não estava travado (libera
-    de novo antes de retornar True/False). Ao contrário da versão anterior
-    (baseada em existência de arquivo + heurística de idade), isto usa a
-    MESMA primitiva de exclusão mútua do `acquire_migration_lock` — não há
-    mais duas noções divergentes do que conta como "travado" (achado P2-5
-    herdr-7)."""
+    """Consulta sem criar nada em disco (achado P2-1 herdr-8: a versão
+    anterior fazia `os.makedirs`/`os.open(O_CREAT, ...)` mesmo só pra
+    perguntar, materializando `.herdr/migration.lock` fantasma em cwds que
+    nem existem — real pro `MFC` quando `HERDR_MFC_CWD` não está setada, e
+    pro `claude-bridge`, cujo `.herdr/` é versionado e não está no
+    `.gitignore`). Arquivo ausente = não travado, sem abrir nada.
+
+    Quando o arquivo existe, tenta adquirir sem bloquear; se conseguir, não
+    estava travado (libera de novo antes de retornar). Mesma primitiva de
+    exclusão mútua do `acquire_migration_lock` (achado P2-5 herdr-7: antes
+    havia duas noções divergentes do que contava como "travado").
+
+    Falha fechado (retorna True) se a checagem em si não puder ser feita
+    (`OSError`/`PermissionError` — ex: filesystem somente leitura, ou sem
+    suporte a `flock`) — achado P3-1 herdr-8: um gate de segurança que
+    derruba o chamador com stacktrace é pior que um que responde
+    "bloqueado"."""
     lock_path = migration_lock_path(cwd)
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    if not os.path.isfile(lock_path):
+        return False
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        return True
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        os.close(fd)
         return True
-    fcntl.flock(fd, fcntl.LOCK_UN)
-    os.close(fd)
-    return False
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def space_gate_reason(cwd):
+    """Motivo, se houver, pelo qual o space não deve receber
+    dispatch/bootstrap/swap agora — ou None se estiver livre:
+
+    - "pending-manual": estado terminal, nunca expira sozinho, só sai por
+      ação humana explícita (a `note` gravada por `herdr-migrate-rev`
+      explica o motivo).
+    - "migrating": uma migração está em andamento (marca durável, sobrevive
+      mesmo que o flock se perca — ex: o processo que a escreveu morreu
+      antes de gravar o estado final). Achado P1-1 herdr-8: uma versão
+      anterior desta checagem só olhava `pending-manual` e o flock, nunca
+      `phase == "migrating"` — apesar do próprio `herdr-migrate-rev` gravar
+      essa fase precisamente pra ser lida aqui. Sem isso, um crash entre
+      gravar "migrating" e gravar o estado final deixava o space
+      desprotegido assim que o flock morria com o processo.
+    - "locked": o flock está preso por um processo ativo agora (janela
+      curta, tipicamente segundos — não confundir com "migrating", que é
+      a marca durável).
+
+    Duas mensagens diferentes existiam pra três estados de natureza
+    diferente (achado P2-2 herdr-8); os chamadores devem usar isto pra dar
+    uma mensagem específica, não "lock ativo — tente de novo depois" pra
+    tudo (isso é ativamente enganoso em pending-manual, que não é
+    transitório)."""
+    phase = read_migration_state(cwd).get("phase")
+    if phase == "pending-manual":
+        return "pending-manual"
+    if phase == "migrating":
+        return "migrating"
+    if is_locked(cwd):
+        return "locked"
+    return None
 
 
 def space_is_gated(cwd):
-    """True se o space não deve receber dispatch/bootstrap/swap agora: uma
-    migração está ativamente rodando (flock preso) OU o estado persistido
-    exige intervenção manual (`phase == "pending-manual"`, que — ao
-    contrário do lock — nunca expira sozinho; só uma ação humana explícita
-    muda essa fase). Achado P1-2 herdr-7: nenhum consumidor checava
-    `pending-manual`, e o lock antigo baseado em arquivo expirava sozinho em
-    LOCK_STALE_S, dissolvendo a própria proteção que o estado deveria
-    garantir."""
-    if read_migration_state(cwd).get("phase") == "pending-manual":
-        return True
-    return is_locked(cwd)
+    return space_gate_reason(cwd) is not None
+
+
+def space_gate_message(cwd, slug):
+    """Mensagem pronta pra stderr, específica por motivo (achado P2-2
+    herdr-8) — ou None se o space não estiver bloqueado. `pending-manual`
+    inclui a `note` gravada, já que "tente de novo depois" é enganoso pra
+    um estado que só sai por ação humana."""
+    reason = space_gate_reason(cwd)
+    if reason is None:
+        return None
+    if reason == "pending-manual":
+        note = read_migration_state(cwd).get("note")
+        return (
+            f"space '{slug}' está em phase=pending-manual — precisa de "
+            f"intervenção manual, não vai se resolver sozinho tentando de "
+            f"novo (nota: {note!r})"
+        )
+    if reason == "migrating":
+        return f"space '{slug}' tem uma migração de nome em andamento (phase=migrating) — tente de novo depois"
+    return f"space '{slug}' está com o lock de migração ativo agora — tente de novo em instantes"
 
 
 def resolve_reviewer_name(cwd, slug):
@@ -225,25 +285,31 @@ def _artifact_dirs(space_root, namespace):
 _TERMINAL_ARTIFACT = {"review": "verdict.md", "ask": "answer.md"}
 
 
-def find_in_flight_round(space_root, window_s=DEFAULT_IN_FLIGHT_WINDOW_S):
+def find_in_flight_round(space_root):
     """Uma rodada conta como 'em voo' se existir <round>/<name>/request.md
     sem o artefato terminal irmão (verdict.md p/ review, answer.md p/ ask)
-    E o `request.md` tiver sido escrito há no máximo `window_s` segundos.
+    E o `agent_status` AO VIVO daquele revisor não for `idle`/`done` agora.
 
-    metrics.json NUNCA entra nessa checagem — sua ausência não significa
-    rodada em voo (achado herdr-6: várias rodadas históricas legítimas nunca
-    tiveram metrics.json). A janela de tempo existe porque a versão anterior
-    desta função (sem janela) trocou aquele falso-negativo por um
-    falso-positivo PERMANENTE: uma rodada abandonada em qualquer momento do
-    passado (revisor travado, timeout, cancelamento manual) deixa
-    `request.md` órfão pra sempre, e sem janela isso bloqueia a migração
-    daquele space para sempre também (achado P1-1 herdr-7 — medido: 5 dos 6
-    spaces tinham pelo menos uma rodada órfã histórica).
+    `metrics.json` NUNCA entra nessa checagem — sua ausência não significa
+    rodada em voo (achado herdr-6). O sinal é o `agent_status` ao vivo, não
+    o mtime do `request.md` (achado P1-2 herdr-8): uma janela de tempo fixa
+    mede há quanto tempo a rodada foi DISPARADA, não há quanto tempo está
+    PARADA — medido contra as 364 rodadas reais já concluídas nos 6 spaces,
+    p50=279s, p90=739s, máximo observado 1365s; qualquer janela fixa
+    "razoável" erra pras rodadas mais lentas, justamente as que mais
+    precisam da proteção. `agent_status` não tem esse problema: `working`/
+    `blocked` é em voo não importa há quanto tempo começou; `idle`/`done`
+    sem artefato terminal é abandonada não importa há quão pouco tempo. O
+    nome do diretório É o nome do agent (o dispatcher grava
+    `verdict_dirs[name] = round_dir/name`), então não precisa de mapeamento
+    extra pra descobrir quem perguntar.
 
-    Retorna o path do `reviewer_dir` bloqueador (pra diagnóstico — "qual
-    diretório" é exatamente o que faltava na versão anterior), ou None se
-    nada estiver em voo."""
-    now = time.time()
+    Se o agent não existir mais (ex: já foi renomeado), nada a esperar por
+    ele — não conta como bloqueio.
+
+    Retorna o path do `reviewer_dir` bloqueador (diagnóstico — achado P1-1
+    herdr-7: "qual diretório" faltava na versão original), ou None se nada
+    estiver em voo."""
     for namespace, terminal_name in _TERMINAL_ARTIFACT.items():
         for round_dir in _artifact_dirs(space_root, namespace):
             for entry in os.listdir(round_dir):
@@ -254,14 +320,17 @@ def find_in_flight_round(space_root, window_s=DEFAULT_IN_FLIGHT_WINDOW_S):
                 terminal_path = os.path.join(reviewer_dir, terminal_name)
                 if not os.path.isfile(request_path) or os.path.isfile(terminal_path):
                     continue
-                age = now - os.path.getmtime(request_path)
-                if age <= window_s:
+                try:
+                    status = core.get_agent_info(entry)["agent_status"]
+                except RuntimeError:
+                    continue
+                if status not in ("idle", "done"):
                     return reviewer_dir
     return None
 
 
-def round_in_flight(space_root, window_s=DEFAULT_IN_FLIGHT_WINDOW_S):
-    return find_in_flight_round(space_root, window_s) is not None
+def round_in_flight(space_root):
+    return find_in_flight_round(space_root) is not None
 
 
 def resolve_historical_artifact(round_dir, name, filename):

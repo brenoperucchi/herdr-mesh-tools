@@ -178,8 +178,9 @@ def main():
         # migration-state.json do lugar errado quando o path aqui aponta pra
         # um subdiretório do repo real.
         migration_cwd = core.project_root(cwd)
-        if migration.space_is_gated(migration_cwd):
-            print(f"space {label}: migração de nome em andamento (lock ativo) — pulando esta rodada")
+        gate_msg = migration.space_gate_message(migration_cwd, slug)
+        if gate_msg is not None:
+            print(f"space {label}: {gate_msg} — pulando esta rodada")
             continue
         tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, migration_cwd)
 

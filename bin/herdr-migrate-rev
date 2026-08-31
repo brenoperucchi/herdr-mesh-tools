@@ -100,12 +100,21 @@ def main():
     migration.write_migration_state_atomic(cwd, {"phase": "migrating"})
 
     try:
-        _run(args.slug, rev_name, rev1_name, rev2_name, cwd, before)
+        _run(args.slug, rev_name, rev1_name, rev2_name, cwd, before, existing_state["phase"])
     finally:
         migration.release_migration_lock(lock_handle)
 
 
-def _run(slug, rev_name, rev1_name, rev2_name, cwd, before):
+def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrating):
+    # Restaura a phase de ANTES de gravarmos "migrating" nos caminhos de
+    # desistência abaixo (achado P2-4 herdr-8: gravar "legacy" incondicional
+    # rebaixava um space já "migrated" que, por qualquer motivo, tivesse
+    # `<slug>-rev` reaparecido — e é exatamente o valor que faz
+    # `build_rev_agents()` recriar o nome antigo).
+    def _give_up(exit_code):
+        migration.write_migration_state_atomic(cwd, {"phase": phase_before_migrating})
+        sys.exit(exit_code)
+
     # Re-checa DEPOIS do lock — achado P2-4 herdr-7: o snapshot pré-lock
     # podia estar desatualizado o suficiente pra um dispatch concorrente
     # escapar pela janela entre a leitura e a aquisição do lock.
@@ -113,19 +122,16 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before):
         before = get_agent(rev_name)
     except RuntimeError as exc:
         print(f"erro: '{rev_name}' desapareceu entre a checagem inicial e o lock ({exc})", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
-        sys.exit(1)
+        _give_up(1)
 
     if before["agent_status"] not in ("idle", "done"):
         print(f"'{rev_name}' está '{before['agent_status']}' — pulando esta passada (não é erro fatal)", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
-        sys.exit(2)
+        _give_up(2)
 
     blocker = migration.find_in_flight_round(cwd)
     if blocker is not None:
         print(f"space '{slug}' tem rodada de review/ask em voo ({blocker}) — pulando esta passada", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
-        sys.exit(2)
+        _give_up(2)
 
     print(f"renomeando '{rev_name}' -> '{rev1_name}'...")
     try:
@@ -141,8 +147,7 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before):
 
     if rev_alive and not rev1_alive:
         print(f"confirmado: rename não aplicou ('{rev_name}' continua vivo, '{rev1_name}' não existe) — nada foi tocado", file=sys.stderr)
-        migration.write_migration_state_atomic(cwd, {"phase": "legacy"})
-        sys.exit(1)
+        _give_up(1)
 
     if rev_alive and rev1_alive:
         note = f"os dois nomes ('{rev_name}' e '{rev1_name}') existem depois da chamada de rename"

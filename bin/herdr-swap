@@ -112,8 +112,9 @@ def main():
     # herdr-ask) consultam, tornando a checagem cega justamente nesse caso.
     migration_cwd = core.project_root(cwd)
 
-    if migration.space_is_gated(migration_cwd):
-        print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — não troco kind durante isso", file=sys.stderr)
+    gate_msg = migration.space_gate_message(migration_cwd, args.slug)
+    if gate_msg is not None:
+        print(f"erro: {gate_msg} (não troco kind durante isso)", file=sys.stderr)
         sys.exit(1)
 
     if args.kind == old_kind:

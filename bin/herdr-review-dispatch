@@ -286,8 +286,9 @@ def main():
 
     cwd = core.project_root(os.getcwd())
 
-    if migration.space_is_gated(cwd):
-        print(f"erro: space '{args.slug}' está em migração de nome (lock ativo) — tente de novo depois", file=sys.stderr)
+    gate_msg = migration.space_gate_message(cwd, args.slug)
+    if gate_msg is not None:
+        print(f"erro: {gate_msg}", file=sys.stderr)
         sys.exit(1)
 
     try:

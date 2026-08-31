@@ -116,6 +116,52 @@ class MigrationStateTests(unittest.TestCase):
         self.assertFalse(self.migration.is_locked(self.cwd))
         self.assertTrue(self.migration.space_is_gated(self.cwd))
 
+    def test_space_is_gated_true_for_migrating_even_without_lock(self):
+        # Achado P1-1 herdr-8: uma versão intermediária desta função
+        # gravava phase=migrating (marca durável, propositalmente pensada
+        # pra sobreviver ao flock) mas NUNCA a lia de volta — cobria só
+        # pending-manual e o flock. Cenário real: herdr-migrate-rev grava
+        # migrating, morre antes de gravar o estado final (crash/SIGKILL),
+        # o flock morre com o processo — sem este teste, o space voltaria a
+        # parecer livre.
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating"})
+        self.assertFalse(self.migration.is_locked(self.cwd), "o cenário do achado é justamente o lock já ter sumido")
+        self.assertTrue(self.migration.space_is_gated(self.cwd))
+
+    def test_space_gate_reason_distinguishes_the_three_states(self):
+        self.assertIsNone(self.migration.space_gate_reason(self.cwd))
+
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "migrating"})
+        self.assertEqual(self.migration.space_gate_reason(self.cwd), "migrating")
+
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "pending-manual", "note": "x"})
+        self.assertEqual(self.migration.space_gate_reason(self.cwd), "pending-manual")
+
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "legacy"})
+        handle = self.migration.acquire_migration_lock(self.cwd)
+        self.assertEqual(self.migration.space_gate_reason(self.cwd), "locked")
+        self.migration.release_migration_lock(handle)
+
+    def test_space_gate_message_includes_note_for_pending_manual(self):
+        # Achado P2-2 herdr-8: as quatro mensagens antigas diziam "lock
+        # ativo — tente de novo depois" pra pending-manual também, o que é
+        # enganoso (não há lock, e "de novo" nunca resolve sozinho).
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "pending-manual", "note": "motivo específico"})
+        msg = self.migration.space_gate_message(self.cwd, "foo")
+        self.assertIn("pending-manual", msg)
+        self.assertIn("motivo específico", msg)
+        self.assertNotIn("tente de novo", msg)
+
+    def test_is_locked_does_not_create_anything_on_disk(self):
+        # Achado P2-1 herdr-8: a versão anterior fazia os.makedirs +
+        # os.open(O_CREAT, ...) só pra CONSULTAR se estava travado,
+        # materializando .herdr/migration.lock fantasma inclusive em cwds
+        # que nem existem.
+        nonexistent_cwd = os.path.join(self.cwd, "nao-existe-ainda")
+        self.assertFalse(os.path.isdir(nonexistent_cwd))
+        self.assertFalse(self.migration.is_locked(nonexistent_cwd))
+        self.assertFalse(os.path.isdir(nonexistent_cwd), "consultar não deveria criar nada em disco")
+
     # --- dual-read fail-closed ------------------------------------------
 
     def test_resolve_reviewer_name_only_rev(self):
@@ -148,14 +194,71 @@ class MigrationStateTests(unittest.TestCase):
         self.assertNotIn("não determinado", prompt)
         self.assertIn("papel `rev`", prompt)
 
-    # --- detector de rodada em voo ----------------------------------------
+    # --- detector de rodada em voo (sinal: agent_status ao vivo, não mtime
+    # — achado P1-2 herdr-8: uma janela de tempo fixa mede há quanto tempo a
+    # rodada foi disparada, não há quanto tempo está parada; medido contra
+    # 364 rodadas reais, 9 já ultrapassavam qualquer janela fixa razoável) --
 
-    def test_round_in_flight_true_when_request_without_verdict(self):
+    def test_round_in_flight_true_when_agent_still_working(self):
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
         os.makedirs(round_dir)
         with open(os.path.join(round_dir, "request.md"), "w") as f:
             f.write("x")
-        self.assertTrue(self.migration.round_in_flight(self.cwd))
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "working"}):
+            self.assertTrue(self.migration.round_in_flight(self.cwd))
+
+    def test_round_in_flight_true_when_agent_blocked(self):
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "blocked"}):
+            self.assertTrue(self.migration.round_in_flight(self.cwd))
+
+    def test_round_in_flight_false_when_agent_idle_regardless_of_request_age(self):
+        # O ponto central do achado P1-2: uma rodada abandonada com o
+        # revisor de volta a idle/done não conta como em voo, não importa
+        # há quanto tempo (nem sequer testamos idade aqui de propósito —
+        # não é mais o sinal usado).
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "idle"}):
+            self.assertFalse(self.migration.round_in_flight(self.cwd))
+
+    def test_round_in_flight_false_when_agent_no_longer_exists(self):
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")
+        with patch.object(self.core, "get_agent_info", side_effect=RuntimeError("not found")):
+            self.assertFalse(self.migration.round_in_flight(self.cwd), "agent que não existe mais não é algo a esperar")
+
+    def test_round_in_flight_true_regardless_of_how_slow_the_round_is(self):
+        # Rodada real mais lenta medida (mfc-56/mfc-rev, 1365s) não teria
+        # passado numa janela fixa de 1200s. Com o sinal por agent_status,
+        # o tempo decorrido é irrelevante.
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        request_path = os.path.join(round_dir, "request.md")
+        with open(request_path, "w") as f:
+            f.write("x")
+        very_old = time.time() - 1365
+        os.utime(request_path, (very_old, very_old))
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "working"}):
+            self.assertTrue(self.migration.round_in_flight(self.cwd))
+
+    def test_find_in_flight_round_returns_blocking_path_for_diagnostics(self):
+        # Achado P1-1 herdr-7: a versão anterior não dizia QUAL diretório
+        # bloqueou, tornando o falso-positivo impossível de diagnosticar.
+        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
+        os.makedirs(round_dir)
+        with open(os.path.join(round_dir, "request.md"), "w") as f:
+            f.write("x")
+        with patch.object(self.core, "get_agent_info", return_value={"agent_status": "working"}):
+            blocker = self.migration.find_in_flight_round(self.cwd)
+        self.assertEqual(blocker, round_dir)
 
     def test_round_in_flight_false_when_verdict_present(self):
         round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
@@ -188,39 +291,6 @@ class MigrationStateTests(unittest.TestCase):
             f.write("posição: ...")
         self.assertFalse(self.migration.round_in_flight(self.cwd))
 
-    def test_round_in_flight_ignores_orphaned_request_older_than_window(self):
-        # Achado P1-1 herdr-7, o mais grave da rodada: a versão sem janela
-        # de tempo trocou o falso-negativo do metrics.json por um
-        # falso-positivo PERMANENTE — uma rodada abandonada em qualquer
-        # momento do passado (revisor travado, timeout, cancelada) deixava
-        # request.md órfão pra sempre, bloqueando a migração daquele space
-        # pra sempre também. Medido ao vivo: 5 dos 6 spaces reais tinham
-        # pelo menos uma rodada órfã histórica.
-        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
-        os.makedirs(round_dir)
-        request_path = os.path.join(round_dir, "request.md")
-        with open(request_path, "w") as f:
-            f.write("x")
-        old_ts = time.time() - 3600  # 1h atrás, bem além da janela default (1200s)
-        os.utime(request_path, (old_ts, old_ts))
-        self.assertFalse(self.migration.round_in_flight(self.cwd, window_s=1200))
-
-    def test_round_in_flight_true_for_recent_orphaned_request(self):
-        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
-        os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
-            f.write("x")  # mtime = agora, dentro da janela default
-        self.assertTrue(self.migration.round_in_flight(self.cwd, window_s=1200))
-
-    def test_find_in_flight_round_returns_blocking_path_for_diagnostics(self):
-        # Achado P1-1 herdr-7: a versão anterior não dizia QUAL diretório
-        # bloqueou, tornando o falso-positivo impossível de diagnosticar.
-        round_dir = os.path.join(self.cwd, ".herdr", "review", "foo-1", "foo-rev")
-        os.makedirs(round_dir)
-        with open(os.path.join(round_dir, "request.md"), "w") as f:
-            f.write("x")
-        blocker = self.migration.find_in_flight_round(self.cwd)
-        self.assertEqual(blocker, round_dir)
 
     # --- contrato de leitura histórica -----------------------------------
 
@@ -295,6 +365,43 @@ class BootstrapRevAgentsTests(unittest.TestCase):
         rev2 = next(a for a in agents if a[0] == "foo-rev-2")
         self.assertEqual(rev2[1], "claude")
         self.assertEqual(rev2[2], ["--model", "opus"])
+
+
+class MigrateRevGiveUpTests(unittest.TestCase):
+    """Achado P2-4 herdr-8: os caminhos de "pulando esta passada" do
+    herdr-migrate-rev gravavam phase="legacy" incondicionalmente, podendo
+    rebaixar um space que já estava "migrated" (se `<slug>-rev` reaparecer
+    por qualquer motivo) para o valor exato que faz build_rev_agents()
+    recriar o nome antigo."""
+
+    def setUp(self):
+        self.migrate = _load("herdr-migrate-rev", "herdr_migrate_rev_giveup_tests")
+        self.migrate.migration.core = self.migrate.core  # mesmo módulo mockável nos dois lados
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cwd = self.tmpdir.name
+        os.environ["HERDR_ENV"] = "1"
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _agent_info(self, status):
+        return {
+            "agent_status": status, "cwd": self.cwd, "foreground_cwd": self.cwd,
+            "pane_id": "p1", "workspace_id": "w1", "tab_id": "t1",
+            "agent": "codex", "interactive_ready": True,
+        }
+
+    def test_give_up_restores_prior_phase_not_legacy(self):
+        self.migrate.migration.write_migration_state_atomic(self.cwd, {"phase": "migrated", "rev2_kind": "grok"})
+        # <slug>-rev "working" força o caminho de desistência dentro de _run.
+        with patch.object(self.migrate, "get_agent", return_value=self._agent_info("working")):
+            with self.assertRaises(SystemExit):
+                with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
+                    self.migrate.main()
+
+        state = self.migrate.migration.read_migration_state(self.cwd)
+        self.assertEqual(state["phase"], "migrated", "desistir não pode rebaixar um space já migrado pra legacy")
+        self.assertEqual(state["rev2_kind"], "grok")
 
 
 if __name__ == "__main__":
