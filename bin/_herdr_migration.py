@@ -295,6 +295,15 @@ def agent_status_or_raise(name):
         if agent_truly_absent(exc):
             return None
         raise
+    except OSError as exc:
+        # Achado P3-1 herdr-12: core.api só converte subprocess.TimeoutExpired
+        # em RuntimeError — um binário ausente ou sem permissão de execução
+        # levanta FileNotFoundError/PermissionError (subclasses de OSError),
+        # que escapava sem tratamento aqui e virava stacktraceback bruto nos
+        # chamadores (todos esperam RuntimeError). Reembala como RuntimeError
+        # pra entrar no mesmo tratamento fail-closed dos outros erros de
+        # infra, em vez de atravessar tudo cru.
+        raise RuntimeError(f"falha executando o CLI do Herdr pra '{name}': {exc}") from exc
 
 
 def resolve_reviewer_name(cwd, slug):

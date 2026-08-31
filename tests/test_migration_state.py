@@ -480,22 +480,33 @@ class MigrateRevGiveUpTests(unittest.TestCase):
         observed = {}
 
         def fake_get_agent(name):
+            # Também serve de side_effect pra core.get_agent_info (usado por
+            # agent_status_safe/agent_status_or_raise) - qualquer nome não
+            # listado precisa "não existir" de verdade, não estourar
+            # AssertionError, já que _reinforce_and_finalize consulta
+            # "{slug}-exec" pra montar a lista de siblings.
             if name == "foo-rev":
                 raise RuntimeError("agent target foo-rev: agent_not_found")
             if name == "foo-rev-1":
                 return self._agent_info("idle")
             if name == "foo-rev-2":
-                return {"agent": "grok"}
-            raise AssertionError(f"get_agent inesperado: {name!r}")
+                return {"agent": "grok", "agent_status": "idle"}
+            raise RuntimeError(f"agent target {name}: agent_not_found")
 
         def fake_api(*args):
             if args[:2] == ("agent", "prompt"):
                 observed["phase_during_reinforcement"] = self.migrate.migration.read_migration_state(self.cwd)["phase"]
             return {}
 
+        # Achado P2-2 herdr-12: agent_status_or_raise chama
+        # core.agent_status -> core.get_agent_info, não agent_status_safe
+        # (que já não é usado neste caminho) - mockar o alias errado deixa a
+        # chamada real escapar pro binário `herdr`. Reusa fake_get_agent:
+        # mesma forma (name) -> info/raise que a rechecagem sob o lock
+        # precisa pra "foo-rev".
         with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
              patch.object(self.migrate, "api", side_effect=fake_api), \
-             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
             with self.assertRaises(SystemExit):
                 with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
                     self.migrate.main()
@@ -516,12 +527,12 @@ class MigrateRevGiveUpTests(unittest.TestCase):
             if name == "foo-rev-1":
                 return self._agent_info("idle")
             if name == "foo-rev-2":
-                return {"agent": "grok"}
-            raise AssertionError(f"get_agent inesperado: {name!r}")
+                return {"agent": "grok", "agent_status": "idle"}
+            raise RuntimeError(f"agent target {name}: agent_not_found")
 
         with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
              patch.object(self.migrate, "api", return_value={}), \
-             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
             with self.assertRaises(SystemExit) as ctx:
                 with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
                     self.migrate.main()
@@ -620,10 +631,10 @@ class MigrateRevGiveUpTests(unittest.TestCase):
                 info = self._agent_info("idle")
                 info["interactive_ready"] = False
                 return info
-            raise AssertionError(f"get_agent inesperado: {name!r}")
+            raise RuntimeError(f"agent target {name}: agent_not_found")
 
         with patch.object(self.migrate, "get_agent", side_effect=fake_get_agent), \
-             patch.object(self.migrate.core, "agent_status_safe", return_value=False):
+             patch.object(self.migrate.core, "get_agent_info", side_effect=fake_get_agent):
             with self.assertRaises(SystemExit) as ctx:
                 with patch.object(sys, "argv", ["herdr-migrate-rev", "foo"]):
                     self.migrate.main()

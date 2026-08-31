@@ -125,10 +125,18 @@ def _attempt_self_heal(slug, rev_name, rev1_name, rev2_name, after_only, observe
         try:
             reappeared = migration.agent_status_or_raise(rev_name) is not None
         except RuntimeError as exc:
+            # Achado P2-3 herdr-12: nada foi alterado no mundo até este
+            # ponto (o rename é feito por `_reinforce_and_finalize`, mais
+            # abaixo) — uma falha de infra aqui (timeout, servidor sob
+            # carga) não é um estado corrompido que exija intervenção
+            # humana, é "não consegui confirmar, tente de novo". Mesmo
+            # desfecho do ramo "reapareceu" logo abaixo: restaura a phase
+            # observada, exit 2. `pending-manual` fica reservado pra
+            # ambiguidade real observada no mundo (ex: pós-rename).
             note = f"self-heal: falha reconfirmando ausência de '{rev_name}' sob o lock ({exc})"
-            print(f"erro: {note} — não vou reconciliar por segurança, marcando pending-manual", file=sys.stderr)
-            migration.write_migration_state_atomic(cwd, {"phase": "pending-manual", "note": note})
-            sys.exit(1)
+            print(f"erro: {note} — não vou reconciliar por segurança, tente de novo", file=sys.stderr)
+            migration.write_migration_state_atomic(cwd, {"phase": observed_phase})
+            sys.exit(2)
         if reappeared:
             print(f"'{rev_name}' reapareceu depois do lock — não é mais um caso de self-heal, rode de novo", file=sys.stderr)
             migration.write_migration_state_atomic(cwd, {"phase": observed_phase})
@@ -257,11 +265,19 @@ def _run(slug, rev_name, rev1_name, rev2_name, cwd, before, phase_before_migrati
 
     # Re-checa DEPOIS do lock — achado P2-4 herdr-7: o snapshot pré-lock
     # podia estar desatualizado o suficiente pra um dispatch concorrente
-    # escapar pela janela entre a leitura e a aquisição do lock.
+    # escapar pela janela entre a leitura e a aquisição do lock. Nada foi
+    # tocado ainda neste ponto (o rename é mais abaixo) — desistir aqui é
+    # seguro tanto se '{rev_name}' genuinamente sumiu quanto se foi só uma
+    # falha de infra passageira, então _give_up (que restaura a phase
+    # anterior) serve pros dois casos; só a mensagem precisa não afirmar
+    # "desapareceu" quando não foi confirmado (achado P1 herdr-12).
     try:
         before = get_agent(rev_name)
     except RuntimeError as exc:
-        print(f"erro: '{rev_name}' desapareceu entre a checagem inicial e o lock ({exc})", file=sys.stderr)
+        if migration.agent_truly_absent(exc):
+            print(f"erro: '{rev_name}' desapareceu entre a checagem inicial e o lock ({exc})", file=sys.stderr)
+        else:
+            print(f"erro: falha consultando '{rev_name}' entre a checagem inicial e o lock ({exc}) — não confirma ausência, mas nada foi tocado ainda", file=sys.stderr)
         _give_up(1)
 
     if before["agent_status"] not in ("idle", "done"):
