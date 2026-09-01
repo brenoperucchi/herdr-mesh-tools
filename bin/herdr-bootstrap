@@ -57,18 +57,24 @@ SPACES = [
     # cai no fallback "phase=legacy" de sempre.
     ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", []),
         ("dre-scout", "codex", [])),
-    # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
-    # Claude, porque e' o projeto que testa o papel de orquestrador externo.
-    # cwd e' o repo de codigo real (~/Devs/claude-bridge), nao o dir de
-    # runtime (~/.claude-bridge, so broker.sqlite/tokens.json) - achado
-    # 2026-08-29: claude-bridge-exec relatou honestamente que AGENTS.md/
-    # CLAUDE.md/.herdr/reviewer.md nao existiam no cwd registrado porque
-    # apontava pro dir errado; o proprio exec ja trabalhava de fato em
-    # ~/Devs/claude-bridge (onde o codigo/git realmente vive).
-    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "codex", []),
+    # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
+    # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
+    # broker.sqlite/tokens.json) - achado 2026-08-29: claude-bridge-exec
+    # relatou honestamente que AGENTS.md/CLAUDE.md/.herdr/reviewer.md nao
+    # existiam no cwd registrado porque apontava pro dir errado; o proprio
+    # exec ja trabalhava de fato em ~/Devs/claude-bridge (onde o codigo/git
+    # realmente vive). exec era Codex no design original (testar o papel de
+    # orquestrador externo), trocado pra Claude no batch-swap manual de
+    # 2026-08-31 (achado 2026-09-01: esta tabela tinha ficado stale depois
+    # da troca - herdr-bootstrap so age em pane vazio, entao nao teria
+    # revertido o swap sozinho, mas recriar o agent do zero um dia teria).
+    # scout continua Codex (nao fez parte daquele swap, confirmado ao vivo).
+    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "claude", []),
         ("claude-bridge-scout", "codex", [])),
+    # exec trocado pra Claude no mesmo batch-swap de 2026-08-31 (ver
+    # claude-bridge acima) - mesma correcao de tabela stale.
     ("content-insights-collector", f"{HOME}/Devs/content-insights-collector",
-        ("content-insights-collector-exec", "codex", []), None),
+        ("content-insights-collector-exec", "claude", []), None),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
