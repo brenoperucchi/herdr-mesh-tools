@@ -52,6 +52,11 @@ SPACES = [
         ("mfc-scout", "codex", [])),
     ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", []),
         None),
+    # DRE: analise financeira (Demonstrativo de Resultado), nao um repo git -
+    # herdr-bootstrap nao exige git, so migration.read_migration_state()
+    # cai no fallback "phase=legacy" de sempre.
+    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", []),
+        ("dre-scout", "codex", [])),
     # claude-bridge: o proprio orquestrador (Fluxo B) - exec e' Codex, nao
     # Claude, porque e' o projeto que testa o papel de orquestrador externo.
     # cwd e' o repo de codigo real (~/Devs/claude-bridge), nao o dir de
