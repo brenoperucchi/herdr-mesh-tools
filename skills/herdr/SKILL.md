@@ -1,6 +1,6 @@
 ---
 name: herdr
-description: "Control Herdr, a terminal multiplexer for coding agents. Use only when the user explicitly mentions Herdr or asks to use Herdr to inspect or control panes, tabs, workspaces, commands, or another agent. Do not use merely because a task could benefit from a background terminal, delegation, or parallel work. Requires HERDR_ENV=1."
+description: "Control Herdr, a terminal multiplexer for coding agents. Use only when the user explicitly mentions Herdr or asks to use Herdr to inspect or control panes, tabs, workspaces, commands, or another agent. Do not use merely because a task could benefit from a background terminal, delegation, or parallel work. Requires running inside a Herdr-managed pane — confirm with `herdr agent list`, not just $HERDR_ENV (see below)."
 ---
 
 # Herdr
@@ -13,7 +13,35 @@ Before issuing any control command, verify that this agent is running inside a H
 test "${HERDR_ENV:-}" = 1
 ```
 
-If the check fails, say that you are not running inside Herdr and stop. Do not inspect or control the focused Herdr session from outside Herdr.
+Achado 2026-09-01 (confirmado ao vivo contra um Codex real): `$HERDR_ENV`
+lê **vazio de dentro do sandbox de execução de shell do Codex**
+(`codex-code-mode-host`), mesmo quando o processo do agent — e o filho
+direto `codex-code-mode-host` — têm a variável corretamente setada no
+próprio `environ` (`env | grep -c '^HERDR'` devolveu `0` rodado por dentro
+do Codex, contra 59/59 variáveis idênticas comparando `/proc/<pid>/environ`
+do pai e do filho direto). O sandbox aplica algum tipo de allowlist/scrub de
+ambiente na hora de executar o comando de fato, depois de herdar o
+`environ` completo — não é um bug do Herdr nem do agent, é uma camada de
+isolamento do próprio Codex que este check não previa. Um Claude usando a
+ferramenta Bash não sofre disso (o ambiente chega intacto).
+
+Por isso, `$HERDR_ENV` vazio/ausente **não é prova de estar fora do
+Herdr** para um CLI que roda comandos via sandbox (confirmado com Codex; se
+outro CLI também sandboxar exec, mesma ressalva vale). Se o check acima
+falhar, confirme com o próprio binário `herdr` antes de concluir qualquer
+coisa — ele fala com o servidor real, independente de variável de ambiente:
+
+```bash
+herdr agent list
+```
+
+Se isso retornar JSON válido (não um erro de conexão/socket), você está
+dentro de uma sessão gerida pelo Herdr, mesmo que `$HERDR_ENV` tenha vindo
+vazio — foi o sandbox que escondeu a variável, não a sessão que deixou de
+existir. Só conclua que está fora do Herdr, e pare, se **os dois** falharem:
+`$HERDR_ENV` vazio E `herdr agent list`/`herdr agent get <seu-nome>` não
+conseguir alcançar o servidor. Não inspecione nem controle a sessão do
+Herdr em foco a partir de fora do Herdr.
 
 When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, create terminal layout, start agents and commands, read output, and wait for state changes.
 

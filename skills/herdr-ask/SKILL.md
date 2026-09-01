@@ -18,6 +18,14 @@ Antes de qualquer coisa, confirme que está num pane do Herdr:
 test "${HERDR_ENV:-}" = 1
 ```
 
+`$HERDR_ENV` vazio não é prova de estar fora do Herdr se você é um CLI que
+roda comandos via sandbox (confirmado 2026-09-01 com Codex: o sandbox de
+execução do `codex-code-mode-host` esconde toda variável `HERDR_*`, mesmo o
+processo do agent tendo-a de verdade). Se o check acima falhar, confirme com
+`herdr agent list` antes de concluir qualquer coisa — ver a skill `herdr`
+para o achado completo e o critério de quando realmente concluir que está
+fora do Herdr.
+
 ## Quando usar
 
 Antes de construir algo com mais de uma abordagem plausível, ou antes de

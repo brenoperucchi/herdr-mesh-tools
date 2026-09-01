@@ -322,9 +322,10 @@ def main():
     ap.add_argument("slug")
     args = ap.parse_args()
 
-    if os.environ.get("HERDR_ENV") != "1":
-        print("erro: rode isso de dentro de um pane gerenciado pelo Herdr (HERDR_ENV=1)", file=sys.stderr)
-        sys.exit(1)
+    # Achado 2026-09-01: $HERDR_ENV vazio nao e mais suficiente pra recusar
+    # sozinho -- ver core.require_herdr_pane() pro porque (sandbox de exec
+    # do Codex esconde env vars HERDR_*, confirmado ao vivo).
+    core.require_herdr_pane()
 
     rev_name = f"{args.slug}-rev"
     rev1_name = f"{args.slug}-rev-1"

@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -51,6 +52,50 @@ def agent_status_safe(name):
         return True
     except RuntimeError:
         return False
+
+
+def require_herdr_pane():
+    """Confirma que este processo roda dentro de um pane gerenciado pelo
+    Herdr, antes de qualquer ação. `sys.exit(1)` na falha (mesma convenção
+    dos quatro chamadores: herdr-review-dispatch, herdr-ask, herdr-swap,
+    herdr-migrate-rev).
+
+    Achado 2026-09-01 (confirmado ao vivo contra um Codex real, `herdr-rev`,
+    a pedido de um bug real no space DRE): `$HERDR_ENV` lê VAZIO de dentro do
+    sandbox de execução de shell do Codex (`codex-code-mode-host`) — `env |
+    grep -c '^HERDR'` devolveu `0` rodado por dentro do Codex, contra 59/59
+    variáveis idênticas comparando `/proc/<pid>/environ` do processo do
+    agent e do filho direto `codex-code-mode-host`. O sandbox aplica algum
+    tipo de allowlist/scrub de ambiente na hora de executar o comando de
+    fato, depois de herdar o `environ` completo — não é ausência de sessão,
+    é o sandbox escondendo a prova. Um `$HERDR_ENV` vazio checado antes desta
+    correção fazia QUALQUER um destes quatro scripts recusar rodar quando
+    chamado por um `*-exec` Codex (ex: `claude-bridge-exec`,
+    `content-insights-collector-exec`) de dentro do próprio sandbox, com uma
+    mensagem de erro literalmente falsa ("rode isso de dentro de um pane
+    gerenciado pelo Herdr" — mas já estava).
+
+    Por isso: `$HERDR_ENV` vazio não é mais suficiente pra recusar sozinho.
+    Confirma com o próprio binário `herdr` (que fala com o servidor real,
+    independente de env var) antes de concluir que não há sessão — só falha
+    se os DOIS sinais falharem."""
+    if os.environ.get("HERDR_ENV") == "1":
+        return
+    try:
+        api("agent", "list")
+    except RuntimeError as exc:
+        print(
+            f"erro: rode isso de dentro de um pane gerenciado pelo Herdr "
+            f"(HERDR_ENV vazio e 'herdr agent list' não respondeu: {exc})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        "aviso: HERDR_ENV veio vazio (sandbox de exec do CLI provavelmente "
+        "escondendo env vars — achado 2026-09-01 com Codex), mas 'herdr "
+        "agent list' respondeu de verdade — seguindo",
+        file=sys.stderr,
+    )
 
 
 def agent_cwd(name):
