@@ -31,6 +31,22 @@ DRY = "--dry-run" in sys.argv
 # metrics.json / artifact "Ciclo de Revisao").
 REV_EFFORT = ["-c", "model_reasoning_effort=high"]
 
+# Override pontual de model/effort dos revisores, por slug - a maioria dos
+# spaces usa REV_EFFORT/rev2_kind (default "claude", sem effort explicito) e
+# nao precisa entrar aqui. So existe quando o usuario pede explicitamente um
+# par mais caro que o default pra um space especifico (achado 2026-09-02,
+# pedido explicito pro space "llm": Codex gpt-5.6-luna @ max e Claude Opus @
+# max - mais caro que o "um degrau abaixo de max" que REV_EFFORT decidiu como
+# padrao pra todo o resto). Nao generaliza pra migration-state.json (que so
+# guarda rev2_kind) porque isto e' decisao de custo pontual do usuario, nao
+# estado de migracao do space.
+REV_OVERRIDES = {
+    "llm": {
+        "rev_extra_args": ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max"],
+        "rev2_extra_args": ["--model", "opus", "--effort", "max"],
+    },
+}
+
 # label -> (cwd, exec_agent_or_None, scout)
 # scout e' sempre tab PROPRIA no workspace (herdr tab create), nunca mais um
 # pane splitado na tab 1 - achado explicito do usuario (2026-08-29): scout
@@ -75,6 +91,15 @@ SPACES = [
     # claude-bridge acima) - mesma correcao de tabela stale.
     ("content-insights-collector", f"{HOME}/Devs/content-insights-collector",
         ("content-insights-collector-exec", "claude", []), None),
+    # llm-gateway: label do workspace que o usuario ja tinha criado na mao
+    # (llm-exec ja vivo la antes deste script rodar) - slug "llm" (5o
+    # elemento) porque foi assim que o usuario nomeou os revisores
+    # pedidos (llm-rev/llm-rev-2/llm-scout, nao llm-gateway-rev). rev/rev-2
+    # mais caros que o default (ver REV_OVERRIDES) e scout customizado (Sol
+    # xhigh) - pedido explicito do usuario 2026-09-02.
+    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "claude", []),
+        ("llm-scout", "codex", ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=xhigh"]),
+        "llm"),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
@@ -90,13 +115,19 @@ def build_rev_agents(slug, cwd):
     """Monta as tuplas (nome, kind, extra_args) dos dois revisores em
     runtime, lendo a fase e o rev2_kind de migration-state.json daquele
     space. Nunca cria "<slug>-rev-1" fora da fase "migrated"; nunca recria
-    "<slug>-rev" depois de "migrated"."""
+    "<slug>-rev" depois de "migrated". REV_OVERRIDES[slug], se existir,
+    substitui os extra_args default (REV_EFFORT / extra_args_for_rev2) -
+    ver comentario da constante pro porque isto nao vive em
+    migration-state.json."""
     state = migration.read_migration_state(cwd)
     rev_name = f"{slug}-rev-1" if state["phase"] == "migrated" else f"{slug}-rev"
     rev2_kind = state["rev2_kind"]
+    override = REV_OVERRIDES.get(slug, {})
+    rev_extra_args = override.get("rev_extra_args", REV_EFFORT)
+    rev2_extra_args = override.get("rev2_extra_args", migration.extra_args_for_rev2(rev2_kind))
     return [
-        (rev_name, "codex", REV_EFFORT),
-        (f"{slug}-rev-2", rev2_kind, migration.extra_args_for_rev2(rev2_kind)),
+        (rev_name, "codex", rev_extra_args),
+        (f"{slug}-rev-2", rev2_kind, rev2_extra_args),
     ]
 
 
@@ -180,8 +211,17 @@ def main():
     busy = {a["pane_id"] for a in api("agent", "list")["agents"]}
     existing_agent_names = {a.get("name") for a in api("agent", "list")["agents"] if a.get("name")}
 
-    for label, cwd, exec_agent, scout in SPACES:
-        slug = label.lower()
+    for entry in SPACES:
+        label, cwd, exec_agent, scout = entry[:4]
+        # 5o elemento opcional: slug explicito, quando o label do workspace
+        # (que so pode ser o de um workspace ja existente - nao renomeamos
+        # nada aqui) diverge do slug usado nos nomes dos agents. Achado
+        # 2026-09-02: o usuario ja tinha criado o workspace "llm-gateway"
+        # (com llm-exec rodando) manualmente ANTES de pedir os revisores;
+        # renomear o workspace dele nao era uma opcao, entao o slug "llm"
+        # (que da nome a llm-rev/llm-rev-2/llm-scout) precisa ficar
+        # desacoplado do label "llm-gateway" so pra este space.
+        slug = entry[4] if len(entry) > 4 else label.lower()
         # project_root(), não o cwd cru da tupla — achado P3-1 herdr-7: o
         # mesmo path pode ser lido de formas diferentes por herdr-migrate-rev
         # (que usa o cwd real do agent vivo) e por aqui (valor estático de
