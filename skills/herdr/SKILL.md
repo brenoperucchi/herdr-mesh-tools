@@ -43,6 +43,38 @@ existir. Só conclua que está fora do Herdr, e pare, se **os dois** falharem:
 conseguir alcançar o servidor. Não inspecione nem controle a sessão do
 Herdr em foco a partir de fora do Herdr.
 
+## Revisão, consulta de design e segunda opinião — sempre pelas skills, nunca sub-agente nativo
+
+Regra que não muda entre CLI (Claude ou Codex) nem entre troca de kind, e
+vale pra qualquer papel (`exec`, `rev`, `rev-2`, `scout`) de qualquer space:
+TODA revisão de código, consulta de design ou "segunda opinião" passa pelas
+skills `herdr-review` (código já pronto, pra revisar) ou `herdr-ask`
+(pergunta de design ABERTA, antes de construir) — nunca uma pela outra, e
+nunca um atalho fora das duas. As duas despacham pros panes reais e vivos
+do mesmo space (`<slug>-rev`, `<slug>-rev-2`); veja o `SKILL.md` de cada uma
+pro critério exato de quando usar qual.
+
+NUNCA use o sistema nativo de sub-agentes do seu próprio CLI (ex:
+`agents`/`pipeline_reviewer` do Codex, ou o tool `Agent` do Claude) como
+substituto de `herdr-review`/`herdr-ask` — isso spawna processo efêmero e
+invisível, fora do Herdr, sem pane, sem identidade persistente; o usuário
+não consegue ver nem confiar no resultado. Se der vontade de "fazer mais
+uma rodada rápida e independente por conta própria", isso é sinal de voltar
+pro `herdr-review`/`herdr-ask` de novo, não de usar um atalho nativo do seu
+CLI.
+
+Achado 2026-09-02: esta regra só existia no texto do reforço de papel
+(`ROLE_REINFORCEMENT_PROMPT` em `bin/_herdr_dispatch.py`), entregue ao vivo
+uma vez no bootstrap/troca de papel — nenhum `.md` de projeto (nem
+`AGENTS.md`/`CLAUDE.md` genéricos, nem os de space específico) a
+documentava, então ela desaparecia do seu conhecimento assim que o contexto
+daquela entrega original saísse da janela. Vive aqui agora porque esta
+skill é a única compartilhada por todo o mesh (symlink em
+`~/.claude/skills/herdr/` a partir de qualquer projeto), ao contrário de um
+`AGENTS.md` por repositório — releia esta seção sempre que a dúvida
+"devo pedir revisão/consulta ou resolver sozinho?" aparecer, não só quando
+alguém reforçar seu papel.
+
 When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, create terminal layout, start agents and commands, read output, and wait for state changes.
 
 ## Learn the current CLI

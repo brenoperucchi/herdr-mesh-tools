@@ -249,8 +249,13 @@ sistema nativo de sub-agentes do seu próprio CLI (ex: `agents`/
 isso spawna processo efêmero e invisível, fora do Herdr, sem pane, sem
 identidade persistente; o usuário não consegue ver nem confiar no resultado.
 Se der vontade de "fazer mais uma rodada rápida e independente por conta
-própria", isso é sinal de voltar pro `herdr-review` de novo, não de usar um
-atalho nativo do seu CLI.
+própria", isso é sinal de voltar pro `herdr-review`/`herdr-ask` de novo, não
+de usar um atalho nativo do seu CLI. Esta mensagem é a entrega AO VIVO desta
+regra, não a única fonte dela — a versão durável (pra reler depois que este
+prompt sair da sua janela de contexto) mora na skill `herdr` (achado
+2026-09-02: nenhum AGENTS.md/CLAUDE.md de projeto documentava isso antes
+disso, então a regra sumia assim que o contexto desta entrega saía da
+janela).
 
 Você tem o CLI `herdr` disponível (mesmas ferramentas que eu uso pra
 gerenciar você) — não é só pra ser gerenciado, é pra você também usar: se
