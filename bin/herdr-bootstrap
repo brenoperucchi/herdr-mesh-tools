@@ -89,8 +89,12 @@ SPACES = [
         ("claude-bridge-scout", "codex", [])),
     # exec trocado pra Claude no mesmo batch-swap de 2026-08-31 (ver
     # claude-bridge acima) - mesma correcao de tabela stale.
-    ("content-insights-collector", f"{HOME}/Devs/content-insights-collector",
-        ("content-insights-collector-exec", "claude", []), None),
+    # Workspace e todos os agents foram renomeados de
+    # "content-insights-collector"/"content-insights-collector-*" pra
+    # "cic"/"cic-*" fora desta sessao - achado 2026-09-04 (dry-run ia criar
+    # um workspace DUPLICADO porque o label aqui nao batia mais com o real).
+    ("cic", f"{HOME}/Devs/content-insights-collector",
+        ("cic-exec", "claude", []), None),
     # llm-gateway: label do workspace que o usuario ja tinha criado na mao
     # (llm-exec ja vivo la antes deste script rodar) - slug "llm" (5o
     # elemento) porque foi assim que o usuario nomeou os revisores
@@ -100,6 +104,13 @@ SPACES = [
     ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "claude", []),
         ("llm-scout", "codex", ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=xhigh"]),
         "llm"),
+    # llm-bench: workspace e exec ja existiam na mao (pane sem nome, so
+    # renomeado pra "llm-bench-exec" 2026-09-04) - label e slug batem aqui,
+    # sem divergencia (diferente do llm-gateway acima). rev/rev-2/scout com
+    # os defaults padrao (REV_EFFORT/rev2_kind claude/scout Codex sem
+    # override) - nao foi pedido nada mais caro pra este space.
+    ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "claude", []),
+        ("llm-bench-scout", "codex", [])),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
