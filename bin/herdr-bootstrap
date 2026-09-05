@@ -45,6 +45,15 @@ REV_OVERRIDES = {
         "rev_extra_args": ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max"],
         "rev2_extra_args": ["--model", "opus", "--effort", "max"],
     },
+    # Pedido explicito 2026-09-05: rev-2 aqui e' so "--model opus" (sem
+    # effort explicito, ao contrario do "llm" acima) porque o usuario nao
+    # pediu nenhum - extra_args_for_rev2("claude") ja daria exatamente isso
+    # por default, mas mantido aqui por completude/legibilidade lado a lado
+    # com o rev_extra_args customizado.
+    "homehub": {
+        "rev_extra_args": ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"],
+        "rev2_extra_args": ["--model", "opus"],
+    },
 }
 
 # label -> (cwd, exec_agent_or_None, scout)
@@ -111,6 +120,11 @@ SPACES = [
     # override) - nao foi pedido nada mais caro pra este space.
     ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "claude", []),
         ("llm-bench-scout", "codex", [])),
+    # HomeHub: workspace e exec ja existiam na mao (homehub-exec ja com o
+    # nome certo, slug=label.lower() sem divergencia). rev/rev-2 com custo
+    # customizado (ver REV_OVERRIDES) - pedido explicito do usuario
+    # 2026-09-05. Sem scout - decisao explicita do usuario, nao esquecimento.
+    ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "claude", []), None),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
