@@ -244,6 +244,34 @@ Use `--format ansi` when colors and terminal styling are evidence. Otherwise use
 
 After that failed read, ask the agent to write its complete response as Markdown in a temporary directory and reply only with the file path, then read the file directly. Use this only as a fallback; do not request file output in the initial prompt.
 
+## `interactive_ready` ausente sozinho num agent Codex não é motivo pra bloquear
+
+Achado 2026-09-06 (relato cruzado do `mfc-exec`, investigado ao vivo contra
+16 agents Codex reais em 8 spaces do mesh): `interactive_ready` some
+permanentemente de `herdr agent get`/`herdr agent list` pra um agent
+`codex` assim que ele passa por uma SEGUNDA rodada real de trabalho — o
+campo só vem preenchido (`true`) enquanto o agent ainda está no estado
+`revision==2` (logo após o primeiro `agent.prompt` assentar, tipicamente só
+o reforço de papel inicial). Medido: 16/16 agents Codex vivos bateram esse
+padrão sem exceção, incluindo sessões com `agent_session` perfeitamente
+estável e que continuavam produzindo trabalho real normalmente
+(`herdr agent explain` também não diferencia os dois casos — mostra o
+mesmo `rule: none / fallback_reason: default_known_agent_idle_fallback`
+quando idle, com ou sem `interactive_ready`). Não se repete assim no kind
+`claude` — é um gap específico do detector do Herdr pra Codex, não uma
+posição/identidade genuinamente incerta.
+
+Se você é (ou está verificando) um agent Codex e `interactive_ready` vier
+ausente/None com **todo o resto coerente** (`agent_session`, `pane_id`,
+`cwd`/`foreground_cwd`, `agent_status`), trate como confirmado e prossiga —
+não é motivo pra registrar inconsistência nem travar attestation por causa
+disso sozinho. Não existe hoje um comando pra forçar/atualizar esse campo
+numa pane já rodando; a única forma de recuperá-lo é recriar o agent do
+zero (`herdr agent start --kind <kind> --pane <pane-em-branco>`), o que
+exige uma pane disponível/vazia e perde qualquer trabalho em andamento —
+não use isso como reparo ao vivo de uma sessão ativa só por causa deste
+campo.
+
 ## Safety and coordination rules
 
 - Use `--no-focus` for background work unless the user asked to switch context.

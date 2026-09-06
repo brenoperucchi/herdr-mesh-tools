@@ -241,6 +241,24 @@ nunca inferida do treinamento do modelo:
    Se o comando de confirmação não estiver disponível, registre a posição
    como desconhecida — não a complete por suposição.
 
+   Exceção confirmada 2026-09-06 (relato cruzado mfc-exec, investigado
+   contra 16 agents Codex reais em 8 spaces): `interactive_ready` ausente
+   SOZINHO em `herdr agent get`/`herdr agent list` — com `agent_session`,
+   `pane_id`, `cwd`, `foreground_cwd` e `agent_status` todos coerentes — é
+   um FALSO NEGATIVO conhecido do Herdr pra família Codex, não confusão de
+   identidade. Padrão medido: 16/16 agents Codex vivos tinham
+   `interactive_ready=true` exatamente quando `revision==2` (o estado logo
+   após o primeiro `agent.prompt` assentar, tipicamente só o reforço de
+   papel) e `None` em TODOS os que já tinham passado por uma segunda rodada
+   real (`revision>2`) — sem exceção, incluindo casos com `agent_session`
+   perfeitamente estável e sessões que seguiam produzindo trabalho real
+   (vereditos, pareceres) normalmente. Não se repete assim no Claude (kind
+   `claude`), então é específico do detector do Herdr pra Codex, não um
+   problema geral de posição. Se `interactive_ready` for o ÚNICO campo
+   ausente/inconsistente, NÃO trate como motivo de bloqueio — trate como
+   confirmado e prossiga; só pare de verdade se `agent_session`, `pane_id`,
+   `cwd`/`foreground_cwd` ou `agent_status` também divergirem.
+
 Regra que não muda entre CLI (Claude ou Codex) nem entre troca de kind: TODA
 revisão, consulta de design ou "segunda opinião" passa pelas skills
 `herdr-review`/`herdr-ask`, que despacham pros panes acima. NUNCA use o
