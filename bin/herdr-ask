@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """herdr-ask <slug> — dispara uma consulta de design cega e paralela pros dois
-revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr. Mesma mecânica do
+revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr. Mesma mecânica do
 herdr-review-dispatch (isolamento por diretório, congelamento de contexto,
 `agent prompt --wait` concorrente), formato de resposta diferente: não é bug
 hunt, não tem achado atômico P0-P3 nem APPROVE — é uma pergunta de design

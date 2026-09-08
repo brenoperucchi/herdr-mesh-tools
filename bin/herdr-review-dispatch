@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """herdr-review-dispatch <slug> — despacha uma rodada de revisão cega e paralela
-pros dois revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr.
+pros dois revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr.
 
 Congela o diff atual em .herdr/review/<slug>-<N>/, escreve o request.md (protocolo
 + .herdr/reviewer.md do projeto + descrição), manda o MESMO texto pros dois
@@ -214,7 +214,7 @@ def load_prior_verdict(prev_round_dir, reviewer_name):
     """Contrato de leitura histórica: tenta reviewer_name; se for o papel
     'rev' (-rev ou -rev-1), cai pro nome irmão histórico quando o atual não
     existir na rodada antiga — sem isso, uma rodada dispatchada como
-    '<slug>-rev' antes da migração nunca é encontrada por um --verify que
+    '<slug>-rev-1' antes da migração nunca é encontrada por um --verify que
     resolve o nome atual como '<slug>-rev-1'."""
     path = migration.resolve_historical_artifact(prev_round_dir, reviewer_name, "verdict.md")
     with open(path) as f:
