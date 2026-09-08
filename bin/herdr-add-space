@@ -152,7 +152,9 @@ def main():
     # A label that already exists as a workspace but not in the table is the
     # normal case for spaces created by hand: register it, do not recreate it.
     out = run("herdr", "workspace", "list")
-    if out.returncode == 0 and f'"label": "{label}"' in out.stdout.replace("'", '"'):
+    workspace_exists = (out.returncode == 0
+                        and f'"label": "{label}"' in out.stdout.replace("'", '"'))
+    if workspace_exists:
         print(f"herdr-add-space: workspace '{label}' ja existe — registrando na "
               f"tabela para o bootstrap saber recria-lo (ele nao vai duplicar)")
 
@@ -198,6 +200,31 @@ def main():
 
     if existing_labels(new_source).count(label) != 1:
         die("a entrada nao apareceu exatamente uma vez; nada foi escrito")
+
+    # Um space NOVO nunca teve um "<slug>-rev" para migrar, entao ele nasce ja
+    # no nome novo. Sem isto o default legacy (certo para os spaces antigos,
+    # que de fato tem "-rev") faria o bootstrap criar "<slug>-rev" enquanto
+    # tudo mais fala "-rev-1" -- foi o que aconteceu com o omasession, cujos
+    # agents foram criados a mao como "-rev-1" enquanto o estado dizia legacy.
+    # So para space realmente novo: marcar um space existente como migrated
+    # renomearia o revisor dele por baixo dos panos.
+    if not workspace_exists:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+            import _herdr_migration as migration
+            import _herdr_dispatch as core
+            root = core.project_root(cwd)
+            if migration.read_migration_state(root)["phase"] == "legacy":
+                migration.write_migration_state_atomic(root, {
+                    "phase": "migrated",
+                    "note": f"space criado por herdr-add-space; nasceu com "
+                            f"{slug}-rev-1, nunca existiu {slug}-rev.",
+                })
+                print(f"herdr-add-space: {root}/.herdr/migration-state.json "
+                      f"marcado migrated (space novo nasce com -rev-1)", flush=True)
+        except Exception as exc:
+            print(f"herdr-add-space: nao consegui marcar migration-state ({exc}); "
+                  f"o revisor pode subir como '{slug}-rev'", file=sys.stderr)
 
     with open(BOOTSTRAP, "w", encoding="utf-8") as fh:
         fh.write(new_source)
