@@ -125,6 +125,15 @@ SPACES = [
     # customizado (ver REV_OVERRIDES) - pedido explicito do usuario
     # 2026-09-05. Sem scout - decisao explicita do usuario, nao esquecimento.
     ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "claude", []), None),
+    # omasession: plugin Omarchy de restauracao de sessao grafica (janelas e
+    # workspaces de volta apos reboot/queda). Workspace wS e os 4 agents foram
+    # criados na mao em 2026-09-08 antes desta entrada existir - registrado
+    # aqui pra que o bootstrap saiba recria-los, nao pra criar de novo (ele so
+    # age em pane vazio). Layout e kinds no default de todo mundo:
+    # exec Claude, rev-1 Codex (REV_EFFORT), rev-2 Claude, scout Codex; nao
+    # foi pedido nada mais caro. slug=label, sem divergencia.
+    ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "claude", []),
+        ("omasession-scout", "codex", [])),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
