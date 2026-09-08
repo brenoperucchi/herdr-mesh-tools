@@ -1,6 +1,6 @@
 ---
 name: herdr-ask
-description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev, <slug>-rev-2) de um space do Herdr, pra uma pergunta de design ABERTA — não uma revisão de código. Use quando precisar de uma segunda (e terceira) opinião independente antes de decidir uma arquitetura, um trade-off, ou qualquer questão sem resposta óbvia — antes de construir, não depois. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev e <slug>-rev-2 vivos no mesmo space."
+description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, pra uma pergunta de design ABERTA — não uma revisão de código. Use quando precisar de uma segunda (e terceira) opinião independente antes de decidir uma arquitetura, um trade-off, ou qualquer questão sem resposta óbvia — antes de construir, não depois. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev-1 e <slug>-rev-2 vivos no mesmo space."
 ---
 
 # herdr-ask
@@ -68,7 +68,7 @@ Isso cria `.herdr/ask/<slug>-<n>/` (namespace **separado** de
 `.herdr/review/` — não compartilha numeração de rodada), uma pasta por
 consultor dentro dela, escreve o `request.md` de cada um (protocolo de
 consulta + `.herdr/reviewer.md` do projeto, se existir, + sua pergunta),
-dispara `<slug>-rev` e `<slug>-rev-2` em paralelo, cegos um do outro, espera
+dispara `<slug>-rev-1` e `<slug>-rev-2` em paralelo, cegos um do outro, espera
 os dois assentarem.
 
 Precisa que os dois leiam material além da pergunta em si (código real,
@@ -85,7 +85,7 @@ não vazia.
 
 ## Ler e reconciliar
 
-Leia os `answer.md` de cada consultor (`<round_dir>/<slug>-rev/answer.md`,
+Leia os `answer.md` de cada consultor (`<round_dir>/<slug>-rev-1/answer.md`,
 `<round_dir>/<slug>-rev-2/answer.md`) — cada resposta tem: a decisão numa
 frase, as premissas explícitas que a sustentam, e o argumento.
 

@@ -1,6 +1,6 @@
 ---
 name: herdr-review
-description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev e <slug>-rev-2 vivos no mesmo space."
+description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev-1 e <slug>-rev-2 vivos no mesmo space."
 ---
 
 # herdr-review
@@ -54,9 +54,9 @@ herdr-review-dispatch "$slug" --description "o que foi feito, por que, e o que �
 
 Isso congela o diff atual (`git diff` contra `HEAD`, incluindo untracked) em
 `.herdr/review/<slug>-<n>/`, cria uma **pasta por revisor** dentro dela
-(`<slug>-<n>/<slug>-rev/`, `<slug>-<n>/<slug>-rev-2/`), escreve o `request.md`
+(`<slug>-<n>/<slug>-rev-1/`, `<slug>-<n>/<slug>-rev-2/`), escreve o `request.md`
 de cada um (protocolo genérico + `.herdr/reviewer.md` do projeto, se existir, +
-sua descrição), dispara `<slug>-rev` e `<slug>-rev-2` em paralelo, cegos um do
+sua descrição), dispara `<slug>-rev-1` e `<slug>-rev-2` em paralelo, cegos um do
 outro, e espera os dois assentarem. Exige os dois `idle` **ou** `done` antes de
 rodar — se algum estiver `working`/`blocked`, o script recusa em vez de
 enfileirar.
@@ -76,7 +76,7 @@ code se for encadear isso em algo automático.
 ## Ler e classificar
 
 Leia os dois `verdict.md` que o comando apontou — cada um dentro da pasta do
-seu próprio revisor (`<round_dir>/<slug>-rev/verdict.md`,
+seu próprio revisor (`<round_dir>/<slug>-rev-1/verdict.md`,
 `<round_dir>/<slug>-rev-2/verdict.md`). Não use `agent read` nos panes dos
 revisores pra isso — é scrape de tela, lossy; os arquivos são a fonte de
 verdade.

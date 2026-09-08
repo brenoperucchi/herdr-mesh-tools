@@ -51,7 +51,7 @@ TODA revisão de código, consulta de design ou "segunda opinião" passa pelas
 skills `herdr-review` (código já pronto, pra revisar) ou `herdr-ask`
 (pergunta de design ABERTA, antes de construir) — nunca uma pela outra, e
 nunca um atalho fora das duas. As duas despacham pros panes reais e vivos
-do mesmo space (`<slug>-rev`, `<slug>-rev-2`); veja o `SKILL.md` de cada uma
+do mesmo space (`<slug>-rev-1`, `<slug>-rev-2`); veja o `SKILL.md` de cada uma
 pro critério exato de quando usar qual.
 
 NUNCA use o sistema nativo de sub-agentes do seu próprio CLI (ex:
