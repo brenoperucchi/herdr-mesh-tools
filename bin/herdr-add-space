@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""herdr-add-space <label> <cwd> — registra um space novo no SPACES do
+herdr-bootstrap e deixa o bootstrap criar tudo.
+
+    herdr-add-space omasession ~/Devs/omasession --note "plugin de restauracao de sessao"
+    herdr-add-space HomeHub ~/Devs/HomeHub --no-scout --note "sem scout: pedido do usuario"
+
+NAO cria workspace/panes/agents por conta propria. Escreve a entrada na tabela
+e chama `herdr-bootstrap`, que ja e' idempotente, ja deriva os revisores do
+slug (REV_EFFORT/REV_OVERRIDES), ja lida com a migracao rev->rev-1 e ja arma o
+notify-watch do exec. Um caminho paralelo criaria spaces que a tabela nao
+conhece - orfaos que ninguem recria depois.
+
+A tabela vale pelos comentarios: e' la que esta escrito por que o llm-gateway
+tem slug "llm", por que o HomeHub nao tem scout, por que o cwd do
+claude-bridge e' o repo e nao o dir de runtime. Por isso --note existe e por
+isso a ausencia dele deixa um TODO visivel em vez de uma entrada muda.
+"""
+import argparse
+import ast
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+# realpath, nao abspath: chamado pelo symlink em ~/.local/bin, abspath
+# aponta para o symlink e a mensagem final mente sobre qual arquivo mudou.
+_DEFAULT_BOOTSTRAP = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
+
+# HERDR_SESSION isola workspaces/panes/agents, mas NAO isola este arquivo: sem
+# isto, testar o script exige escrever no herdr-bootstrap de producao (foi o
+# que aconteceu em 2026-09-08 -- um space de teste entrou na tabela real e teve
+# de ser removido a mao). Aponte para uma copia ao testar:
+#
+#   cp bin/herdr-bootstrap /tmp/bs && \
+#     HERDR_SESSION=testlab HERDR_BOOTSTRAP_PATH=/tmp/bs herdr-add-space ...
+BOOTSTRAP = os.environ.get("HERDR_BOOTSTRAP_PATH") or _DEFAULT_BOOTSTRAP
+BOOTSTRAP = os.path.realpath(os.path.expanduser(BOOTSTRAP))
+HOME = os.path.expanduser("~")
+
+
+def die(msg):
+    print(f"herdr-add-space: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(*argv, check=False):
+    return subprocess.run(argv, capture_output=True, text=True, check=check)
+
+
+def spaces_node(source):
+    """The `SPACES = [...]` assignment, located by parsing rather than regex.
+
+    ast gives us the exact line the list closes on, so the entry goes in
+    without touching a single existing comment.
+    """
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "SPACES":
+                    return node
+    die(f"nao encontrei a lista SPACES em {BOOTSTRAP}")
+
+
+def existing_labels(source):
+    node = spaces_node(source)
+    if not isinstance(node.value, ast.List):
+        die("SPACES nao e' mais uma lista apos a edicao; nada foi escrito")
+    labels = []
+    for elt in node.value.elts:
+        if isinstance(elt, ast.Tuple) and elt.elts:
+            first = elt.elts[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                labels.append(first.value)
+    return labels
+
+
+def render_entry(label, cwd, slug, exec_kind, scout_kind, note):
+    """The tuple as it will read in the file, comment first."""
+    today = datetime.date.today().isoformat()
+    lines = []
+    if note:
+        # Wrap by hand: the file is 79-col prose and reads as a changelog.
+        prefix = f"    # {label}: "
+        words, line = note.split(), prefix
+        for w in words:
+            if len(line) + len(w) + 1 > 76:
+                lines.append(line.rstrip())
+                line = "    # " + w + " "
+            else:
+                line += w + " "
+        lines.append(line.rstrip())
+        lines.append(f"    # Registrado por herdr-add-space em {today}.")
+    else:
+        lines.append(f"    # {label}: TODO por que este space existe (registrado")
+        lines.append(f"    # por herdr-add-space em {today}, sem --note). Uma entrada muda")
+        lines.append(f"    # aqui vira uma decisao que ninguem consegue reconstruir depois.")
+
+    # HOME as an f-string, matching every other row in the table.
+    cwd_expr = f'f"{{HOME}}{cwd[len(HOME):]}"' if cwd.startswith(HOME + "/") else repr(cwd)
+    exec_name = f"{slug}-exec"
+    scout_part = f'("{slug}-scout", "{scout_kind}", [])' if scout_kind else "None"
+    slug_part = f', "{slug}"' if slug != label.lower() else ""
+
+    lines.append(f'    ("{label}", {cwd_expr}, ("{exec_name}", "{exec_kind}", []),')
+    lines.append(f"        {scout_part}{slug_part}),")
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="herdr-add-space",
+        description="Registra um space no SPACES do herdr-bootstrap e roda o bootstrap.")
+    ap.add_argument("label", help="label do workspace (vira prefixo dos agents)")
+    ap.add_argument("cwd", nargs="?", default=None,
+                    help="diretorio do projeto (default: o atual)")
+    ap.add_argument("--slug", default=None,
+                    help="prefixo dos agents, se divergir do label (ex: llm-gateway -> llm)")
+    ap.add_argument("--note", default="",
+                    help="por que este space existe. Sem isso fica um TODO no arquivo.")
+    ap.add_argument("--no-scout", action="store_true", help="space sem scout")
+    ap.add_argument("--exec-kind", default="claude")
+    ap.add_argument("--scout-kind", default="codex")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="mostra a entrada e o dry-run do bootstrap, sem escrever nada")
+    args = ap.parse_args()
+
+    label = args.label
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", label):
+        die("label deve ser alfanumerico com . _ - (vira nome de agent)")
+
+    cwd = os.path.realpath(os.path.expanduser(args.cwd or os.getcwd()))
+    if not os.path.isdir(cwd):
+        die(f"diretorio nao existe: {cwd}  (o bootstrap nao cria pastas)")
+
+    slug = args.slug or label.lower()
+    scout_kind = None if args.no_scout else args.scout_kind
+
+    session = os.environ.get("HERDR_SESSION")
+    if BOOTSTRAP != _DEFAULT_BOOTSTRAP or session:
+        print(f"herdr-add-space: MODO TESTE  session={session or 'default'}  "
+              f"tabela={BOOTSTRAP}", flush=True)
+
+    source = open(BOOTSTRAP, encoding="utf-8").read()
+
+    if label in existing_labels(source):
+        die(f"'{label}' ja esta no SPACES — rode `herdr-bootstrap` (ele e' idempotente)")
+
+    # A label that already exists as a workspace but not in the table is the
+    # normal case for spaces created by hand: register it, do not recreate it.
+    out = run("herdr", "workspace", "list")
+    if out.returncode == 0 and f'"label": "{label}"' in out.stdout.replace("'", '"'):
+        print(f"herdr-add-space: workspace '{label}' ja existe — registrando na "
+              f"tabela para o bootstrap saber recria-lo (ele nao vai duplicar)")
+
+    entry = render_entry(label, cwd, slug, args.exec_kind, scout_kind, args.note)
+    print("herdr-add-space: entrada a inserir\n", flush=True)
+    print(entry, flush=True)
+
+    if args.dry_run:
+        print("herdr-add-space: --dry-run, nada escrito. Bootstrap atual diria:\n")
+        subprocess.run([sys.executable, BOOTSTRAP, "--dry-run"])
+        return 0
+
+    # Insert just before the `]` that closes the list, so no existing comment is
+    # touched. Position by column and not only by line: with `SPACES = []` the
+    # bracket sits on the same line as the assignment, and inserting "before
+    # that line" drops the entry outside the list (unexpected indent). Caught
+    # by the ast guard below during the isolated validation, 2026-09-08.
+    node = spaces_node(source)
+    lines = source.splitlines(keepends=True)
+    close_line = node.value.end_lineno - 1        # 0-based
+    close_col = node.value.end_col_offset - 1     # the `]` itself
+    line = lines[close_line]
+    head, tail = line[:close_col], line[close_col:]
+    if head.strip():
+        # `]` shares its line with code: split there and keep both halves. The
+        # comma matters more than it looks -- `[("a", ...)` followed by
+        # `("novo", ...)` with no comma parses fine and means a CALL, silently
+        # collapsing the table into one bogus element. ast.parse would not
+        # catch that; the label count below would, but by then the file is
+        # already nonsense.
+        head_clean = head.rstrip("\n").rstrip()
+        sep = "" if head_clean.endswith(("[", ",")) else ","
+        lines[close_line] = head_clean + sep + "\n" + entry + tail
+    else:
+        # `]` alone on its line: the entry goes on the line above it.
+        lines.insert(close_line, entry)
+    new_source = "".join(lines)
+
+    try:
+        ast.parse(new_source)
+    except SyntaxError as exc:
+        die(f"a insercao quebraria o herdr-bootstrap ({exc}); nada foi escrito")
+
+    if existing_labels(new_source).count(label) != 1:
+        die("a entrada nao apareceu exatamente uma vez; nada foi escrito")
+
+    with open(BOOTSTRAP, "w", encoding="utf-8") as fh:
+        fh.write(new_source)
+    print(f"herdr-add-space: {BOOTSTRAP} atualizado (nao commitado)\n", flush=True)
+
+    rc = subprocess.run([sys.executable, BOOTSTRAP]).returncode
+    if rc != 0:
+        die(f"herdr-bootstrap saiu com {rc} — a entrada ficou no arquivo, "
+            f"revise e rode `herdr-bootstrap` de novo")
+
+    # Verify against herdr, not against exit codes: `herdr agent start` exits
+    # non-zero when readiness detection times out even though the agent is up.
+    print(f"\nherdr-add-space: agents com cwd em {cwd}\n", flush=True)
+    subprocess.run(["herdr-agents", "--name", os.path.basename(cwd)])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
