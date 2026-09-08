@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# herdr-agents [--name <filtro>] — lista os agents do herdr num formato tabular curto:
+# agent (status) | cwd | model | name | pane_id | tab_id
+#
+# --name <filtro>  só mostra agents cujo cwd contém <filtro> (case-insensitive)
+set -euo pipefail
+
+filter=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)
+      filter="${2:?--name precisa de um valor}"
+      shift 2
+      ;;
+    *)
+      echo "uso: herdr-agents [--name <filtro-de-cwd>]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+herdr agent list | jq -r --arg filter "$filter" '
+  .result.agents[]
+  | select($filter == "" or (.cwd | ascii_downcase | contains($filter | ascii_downcase)))
+  | [.agent_status, .cwd, .agent, .name, .pane_id, .tab_id] | @tsv
+' | sort -t $'\t' -k4 | (echo -e "AGENT\tCWD\tMODEL\tNAME\tPANE_ID\tTAB_ID"; cat) | column -t -s $'\t'
