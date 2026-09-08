@@ -70,6 +70,45 @@ class RoleAttestationTests(unittest.TestCase):
         self.assertIn("attestation", self.review.PROTOCOL.lower())
         self.assertIn("attestation", self.ask.ASK_PROTOCOL.lower())
 
+    def test_interactive_ready_caveat_is_shared_not_duplicated(self):
+        """Achado 2026-09-06: o mesmo texto sobre interactive_ready ausente
+        já existiu copiado a mao em 4 lugares (ROLE_REINFORCEMENT_PROMPT,
+        PROTOCOL, VERIFY_PROTOCOL, ASK_PROTOCOL) antes desta correcao -
+        exatamente a classe de bug (protocolo duplicado divergindo) que ja
+        causou retrabalho nas rodadas herdr-4/5/6. Confere que os 4 lugares
+        referenciam a MESMA constante via placeholder, em vez de cada um
+        ter sua propria copia do texto."""
+        for template_name, raw_template in (
+            ("ROLE_REINFORCEMENT_PROMPT", self.core.ROLE_REINFORCEMENT_PROMPT),
+            ("PROTOCOL", self.review.PROTOCOL),
+            ("VERIFY_PROTOCOL", self.review.VERIFY_PROTOCOL),
+            ("ASK_PROTOCOL", self.ask.ASK_PROTOCOL),
+        ):
+            self.assertIn(
+                "{interactive_ready_caveat}", raw_template,
+                f"{template_name} deveria referenciar core.INTERACTIVE_READY_CAVEAT via placeholder, nao duplicar o texto",
+            )
+
+        # E confere que o texto de fato chega no output formatado final dos
+        # tres pontos de entrada reais (nao so que o placeholder existe no
+        # template cru).
+        reinforcement = self.core.role_reinforcement_prompt(
+            "foo-rev", "foo", "/repo/foo", ["foo-exec", "foo-rev-2"],
+        )
+        self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, reinforcement)
+
+        review_request = self.review.PROTOCOL.format(
+            diff_instruction="x", verdict_dir="/x", sibling_dir="/y",
+            interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
+        )
+        self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, review_request)
+
+        ask_request = self.ask.ASK_PROTOCOL.format(
+            verdict_dir="/x", isolation_note="", context_instruction="",
+            interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
+        )
+        self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, ask_request)
+
 
 if __name__ == "__main__":
     unittest.main()

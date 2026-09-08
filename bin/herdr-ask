@@ -64,7 +64,9 @@ get <seu-nome>` (e `herdr agent list` se necessário) seu nome, pane,
 workspace/space, raiz do projeto, família/kind, estado e `interactive_ready`
 contra o request e a rodada. Registre a confirmação na resposta. Não infira a
 posição por uma hierarquia genérica do modelo; se a CLI ou a metadata não
-permitirem confirmá-la, pare e registre a inconsistência. Breno é a
+permitirem confirmá-la, pare e registre a inconsistência — exceto:
+{interactive_ready_caveat} Se a busca por nome falhar, tente por pane_id
+(`$HERDR_PANE_ID`) antes de declarar inconsistência. Breno é a
 autoridade humana/owner e `<slug>-exec` é o coordenador/mecanismo delegado,
 não autorização para inventar agentes ou canais. Preserve a cegueira e não
 leia o artifact do colega cego.
@@ -112,7 +114,7 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
 
     isolation_note = ISOLATION_NOTE.format(sibling_dir=sibling_dir) if sibling_dir else ""
 
-    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction)}
+    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT)}
 {invariants_section}
 ## Pergunta
 

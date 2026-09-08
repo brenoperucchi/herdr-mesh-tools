@@ -212,6 +212,24 @@ def freeze_files(files, round_dir):
 # spawnado, profundidade zero) sem bater nesse piso.
 CODEX_NO_NATIVE_AGENTS = ["-c", "agents.max_depth=0"]
 
+# Achado 2026-09-06 (relato cruzado mfc-exec + claude-bridge-exec,
+# investigado ao vivo): `interactive_ready` some de `herdr agent get`/`list`
+# em casos confirmados sem relação com identidade genuína — não é motivo
+# de bloqueio sozinho. Ver o parágrafo completo em ROLE_REINFORCEMENT_PROMPT
+# (rule 4) pro achado detalhado; este é o trecho curto, compartilhado pelos
+# protocolos de rodada (PROTOCOL/VERIFY_PROTOCOL/ASK_PROTOCOL) — extraído
+# pra uma constante em vez de duplicado em cada um, depois de já ter existido
+# como texto igual copiado em 4 lugares (ROLE_REINFORCEMENT_PROMPT e os três
+# protocolos abaixo) — exatamente a classe de bug (protocolo duplicado
+# divergindo) que já causou retrabalho nas rodadas herdr-4/5/6.
+INTERACTIVE_READY_CAVEAT = (
+    "`interactive_ready` ausente SOZINHO — com agent_session, pane, "
+    "workspace, cwd e agent_status coerentes — é um falso-negativo "
+    "conhecido do Herdr (achado 2026-09-06, medido em dezenas de agents "
+    "reais em produção); não é motivo pra parar. Só pare se algum desses "
+    "outros campos também divergir."
+)
+
 ROLE_REINFORCEMENT_PROMPT = """Reforço de papel — mandatório a cada início ou troca de agent neste space,
 não é um FYI opcional.
 
@@ -241,23 +259,18 @@ nunca inferida do treinamento do modelo:
    Se o comando de confirmação não estiver disponível, registre a posição
    como desconhecida — não a complete por suposição.
 
-   Exceção confirmada 2026-09-06 (relato cruzado mfc-exec, investigado
-   contra 16 agents Codex reais em 8 spaces): `interactive_ready` ausente
-   SOZINHO em `herdr agent get`/`herdr agent list` — com `agent_session`,
-   `pane_id`, `cwd`, `foreground_cwd` e `agent_status` todos coerentes — é
-   um FALSO NEGATIVO conhecido do Herdr pra família Codex, não confusão de
-   identidade. Padrão medido: 16/16 agents Codex vivos tinham
-   `interactive_ready=true` exatamente quando `revision==2` (o estado logo
-   após o primeiro `agent.prompt` assentar, tipicamente só o reforço de
-   papel) e `None` em TODOS os que já tinham passado por uma segunda rodada
-   real (`revision>2`) — sem exceção, incluindo casos com `agent_session`
-   perfeitamente estável e sessões que seguiam produzindo trabalho real
-   (vereditos, pareceres) normalmente. Não se repete assim no Claude (kind
-   `claude`), então é específico do detector do Herdr pra Codex, não um
-   problema geral de posição. Se `interactive_ready` for o ÚNICO campo
-   ausente/inconsistente, NÃO trate como motivo de bloqueio — trate como
-   confirmado e prossiga; só pare de verdade se `agent_session`, `pane_id`,
-   `cwd`/`foreground_cwd` ou `agent_status` também divergirem.
+   Exceção confirmada 2026-09-06 (relato cruzado mfc-exec e
+   claude-bridge-exec, investigado ao vivo): {interactive_ready_caveat}
+   Achado ampliado no mesmo dia: um reset do daemon/registro do Herdr (não
+   um bug por-agent) também apaga o campo `name` de panes não tocados
+   desde o reset — `herdr agent get <seu-próprio-nome-esperado>` pode
+   devolver `agent_not_found` mesmo você rodando de verdade naquele pane.
+   Isso SE REPARA sem perder nada: `herdr agent rename <seu-pane-id>
+   <nome-esperado>` restaura o nome instantaneamente, é metadado puro, não
+   toca no processo nem reinicia nada (verificado ao vivo, sessão e
+   contexto intactos). Se `herdr agent get <seu-nome>` falhar, tente isso
+   antes de declarar inconsistência — pane_id sempre resolve mesmo sem
+   nome.
 
 Regra que não muda entre CLI (Claude ou Codex) nem entre troca de kind: TODA
 revisão, consulta de design ou "segunda opinião" passa pelas skills
@@ -329,6 +342,7 @@ def role_reinforcement_prompt(name, slug, cwd, siblings):
         cwd=cwd,
         siblings=sib_text,
         role=_infer_role(name) or "não determinado",
+        interactive_ready_caveat=INTERACTIVE_READY_CAVEAT,
     )
     if _infer_role(name) == "scout":
         exec_name = f"{slug}-exec"
