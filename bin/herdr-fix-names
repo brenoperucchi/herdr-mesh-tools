@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""herdr-fix-names [--dry-run] [--space <label>] — repara o `name` dos agents
+que o Herdr perdeu, casando cada pane vivo com o papel esperado no SPACES.
+
+POR QUE ISTO EXISTE (achado 2026-09-09, medido em 41 agents, sem excecao):
+`name` e `interactive_ready` sao gravados JUNTOS, pelo caminho DURAVEL do
+`herdr agent start`. Na medicao: 20/20 dos agents com nome tinham
+`interactive_ready=True`; 21/21 dos sem nome tinham o campo ausente.
+
+Consequencia pratica: `herdr agent rename` grava o nome num lugar VOLATIL.
+Ele repara a mesh AGORA (a mesh volta a ficar legivel e despachavel), mas o
+nome some no proximo reset do registro. Confirmado duas vezes no mesmo dia:
+15 nomes reparados com rename se desfizeram sozinhos em horas, e continuaram
+ausentes depois de um reboot.
+
+Entao este script e' PALIATIVO por desenho, e assume isso explicitamente:
+- Para revisor/scout, o reparo certo e' `herdr agent start` (mata o processo e
+  registra durave1). Este script AVISA quando encontra um desses sem registro
+  duravel, em vez de fingir que o rename resolveu.
+- Para `-exec` nao existe alternativa: reiniciar mata a sessao que tem um
+  humano atras dela (mesmo motivo pelo qual o SPACES nao bootstrapa exec).
+  Para eles, rename e' o unico caminho, e reaplicar a cada reset e' o custo.
+
+Uso:
+  herdr-fix-names --dry-run          # mostra o que faria, nao toca em nada
+  herdr-fix-names                    # aplica
+  herdr-fix-names --space MFC        # so um space
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+
+def _load_bootstrap():
+    """herdr-bootstrap nao tem extensao .py, entao import normal nao pega.
+    Mesmo padrao que os testes do repo usam (SourceFileLoader)."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr-bootstrap")
+    loader = SourceFileLoader("herdr_bootstrap_fix_names", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+bootstrap = _load_bootstrap()
+
+api = core.api
+
+
+def role_by_position(panes_da_tab1, pane):
+    """exec = coluna esquerda (x==0); rev-1 = direita em cima; rev-2 = direita
+    embaixo. Layout fixado pelo herdr-bootstrap (split right, depois down) e
+    confirmado identico nos 11 spaces vivos em 2026-09-09."""
+    r = pane["rect"]
+    if r["x"] == 0:
+        return "exec"
+    return "rev-1" if r["y"] == 0 else "rev-2"
+
+
+def build_expected(entry):
+    """(papel -> nome) esperado deste space, lendo a mesma fonte que o
+    bootstrap usa - inclusive migration-state.json, que decide se o primeiro
+    revisor se chama `-rev` ou `-rev-1`."""
+    label, cwd, exec_agent, scout = entry[:4]
+    slug = entry[4] if len(entry) > 4 else label.lower()
+    revs = bootstrap.build_rev_agents(slug, core.project_root(cwd))
+    esperado = {}
+    if exec_agent:
+        esperado["exec"] = (exec_agent[0], exec_agent[1])
+    else:
+        # exec=None significa "o bootstrap nao cria este exec" (o do space
+        # "herdr" e' a sessao interativa com humano atras), NAO "este exec nao
+        # tem nome". O nome e' previsivel, e reparar o nome nao reinicia nada -
+        # que e' justamente o que este script faz. kind None = aceita o que
+        # estiver vivo, ja que aqui nao ha kind especificado pra conferir.
+        esperado["exec"] = (f"{slug}-exec", None)
+    for nome, kind, _args in revs:
+        esperado["rev-1" if not nome.endswith("-rev-2") else "rev-2"] = (nome, kind)
+    if scout:
+        esperado["scout"] = (scout[0], scout[1])
+    return label, cwd, esperado
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--space", default=None, help="so este label de workspace")
+    args = ap.parse_args()
+
+    workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
+    agents = api("agent", "list")["agents"]
+    por_pane = {a["pane_id"]: a for a in agents}
+    nomes_vivos = {a["name"]: a["pane_id"] for a in agents if a.get("name")}
+
+    reparos, avisos, volateis = [], [], []
+
+    for entry in bootstrap.SPACES:
+        label, cwd, esperado = build_expected(entry)
+        if args.space and label != args.space:
+            continue
+        ws = workspaces.get(label)
+        if ws is None:
+            avisos.append(f"{label}: workspace nao existe — pulando")
+            continue
+        ws_id = ws["workspace_id"]
+
+        panes = [p for p in api("pane", "list", "--workspace", ws_id)["panes"]]
+        tab1 = sorted(
+            [p for p in panes if p["tab_id"] == f"{ws_id}:t1"],
+            key=lambda p: (p["rect"]["x"], p["rect"]["y"]),
+        ) if all("rect" in p for p in panes) else []
+        # `pane list` nao traz rect; o layout traz. Pega pelo layout da tab 1.
+        if panes:
+            layout = api("pane", "layout", "--pane", panes[0]["pane_id"])["layout"]
+            rects = {p["pane_id"]: p["rect"] for p in layout["panes"]}
+        else:
+            rects = {}
+
+        for p in panes:
+            pane_id = p["pane_id"]
+            ag = por_pane.get(pane_id)
+            if ag is None:
+                continue  # pane sem agent: e' trabalho do bootstrap, nao deste script
+            if p["tab_id"] == f"{ws_id}:t1":
+                if pane_id not in rects:
+                    avisos.append(f"{label}/{pane_id}: sem rect no layout — nao da pra inferir papel")
+                    continue
+                papel = role_by_position(None, {"rect": rects[pane_id]})
+            else:
+                papel = "scout"
+
+            alvo = esperado.get(papel)
+            if alvo is None:
+                avisos.append(f"{label}/{pane_id}: papel '{papel}' nao existe neste space — deixando quieto")
+                continue
+            nome, kind_esperado = alvo
+
+            if ag.get("name") == nome:
+                # ja certo. Mas registra se o registro e' volatil: rename nao
+                # sobrevive ao proximo reset, e para rev/scout ha caminho melhor.
+                if ag.get("interactive_ready") is not True and papel != "exec":
+                    volateis.append(f"{nome} ({pane_id}): nome ok, mas SEM registro duravel — "
+                                    f"o reparo real e' `herdr agent start {nome} "
+                                    f"--kind {kind_esperado or ag['agent']} --pane <id>`")
+                continue
+
+            if kind_esperado is not None and ag["agent"] != kind_esperado:
+                avisos.append(f"{label}/{pane_id}: kind '{ag['agent']}' != esperado '{kind_esperado}' "
+                              f"para {nome} — NAO renomeei (pode ser swap deliberado)")
+                continue
+
+            dono = nomes_vivos.get(nome)
+            if dono and dono != pane_id:
+                avisos.append(f"{label}: '{nome}' ja pertence a {dono} — NAO renomeei {pane_id} (fail-closed)")
+                continue
+
+            # cwd diverge nao bloqueia: precedente real (claude-bridge-exec roda
+            # em ~/.claude-bridge, o dir de runtime, e nao no repo do SPACES).
+            if core.project_root(ag["cwd"]) != core.project_root(cwd):
+                avisos.append(f"{label}/{nome}: cwd do agent ({ag['cwd']}) diverge do SPACES ({cwd}) — reparei mesmo assim")
+
+            reparos.append((pane_id, nome, ag.get("name"), kind_esperado, papel))
+
+    for pane_id, nome, antigo, kind, papel in reparos:
+        de = f"'{antigo}'" if antigo else "(sem nome)"
+        if args.dry_run:
+            print(f"  [dry-run] herdr agent rename {pane_id} {nome}   # {papel}, era {de}")
+        else:
+            try:
+                api("agent", "rename", pane_id, nome)
+                print(f"  {pane_id} -> {nome}   ({papel}, era {de})")
+            except RuntimeError as exc:
+                avisos.append(f"{nome}: rename falhou — {exc}")
+
+    print(f"\n{len(reparos)} nome(s) {'a reparar' if args.dry_run else 'reparado(s)'}")
+    for a in avisos:
+        print(f"  aviso: {a}")
+    if volateis:
+        print("\n  Registro volatil (o nome esta certo agora, mas some no proximo reset):")
+        for v in volateis:
+            print(f"    {v}")
+
+
+if __name__ == "__main__":
+    main()

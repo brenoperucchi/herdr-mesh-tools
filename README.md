@@ -88,6 +88,20 @@ exception, and the comment next to it explains why.
   `phase=migrating` marker, and a re-check under the lock. All spaces have
   already been through it — it stays for a space restored from an old backup.
 
+- **`herdr-fix-names [--dry-run] [--space <label>]`** — repairs the `name` of
+  agents Herdr has lost, matching each live pane to its expected role by
+  position (exec is the left column, `rev-1` top-right, `rev-2` bottom-right,
+  scout its own tab). Deliberately a stopgap: `name` and `interactive_ready`
+  are written together by the *durable* path, which is `herdr agent start` —
+  `herdr agent rename` writes the name somewhere volatile, so a repaired name
+  disappears at the next registry reset. Measured 2026-09-09 across 41 agents
+  with no exception: 20/20 named agents had `interactive_ready=True`, 21/21
+  unnamed ones had the field absent, and 15 names repaired by hand undid
+  themselves within hours. So the script *says so*: it warns when a
+  reviewer/scout lacks the durable registration (there the real fix is
+  `agent start`), and only for `-exec` is rename the sole option — restarting
+  one would kill a session with a human behind it.
+
 ### Shared modules (not CLIs)
 
 - **`_herdr_dispatch.py`** — mechanics behind `herdr-review-dispatch`,

@@ -157,7 +157,12 @@ SPACES = [
     # script, entao nao entra no SPACES pra nao arriscar o script tentar
     # reiniciar/trocar uma sessao com humano atras dela. So os revisores sao
     # geridos por aqui.
-    ("herdr", HOME, None, None),
+    # scout registrado aqui em 2026-09-09 (antes existia vivo mas fora da
+    # tabela, criado a mao - o herdr-fix-names reclamava de "papel scout nao
+    # existe neste space" justamente por isso). O exec continua None DE
+    # PROPOSITO: e' a sessao interativa com humano atras, nao um agent
+    # bootstrapado.
+    ("herdr", HOME, None, ("herdr-scout", "codex", SCOUT_ARGS)),
 ]
 
 
