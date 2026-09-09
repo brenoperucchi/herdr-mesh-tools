@@ -501,5 +501,13 @@ def extra_args_for_rev2(kind):
     valor de `kind` por `rev2_kind` sem isto produz `--kind grok -- --model
     opus`, um flag de Claude num agent Grok)."""
     if kind == "claude":
-        return ["--model", "opus"]
+        # --effort explicito (2026-09-09, consulta herdr-8): sem ele o rev-2
+        # herdava modelSettings.claude-opus-5.effortLevel do settings.json, que
+        # o /model interativo reescreve. O comentario de 2026-08-26 no
+        # herdr-bootstrap chama o rev-2 de "a lente cara" - mas com effort
+        # herdado em medium ele era caro no modelo e barato no raciocinio, sem
+        # ninguem ter decidido isso. "high", nao "max": max fica por override de
+        # space (o "llm" ja faz), porque o span de ~10x entre os extremos torna
+        # max universal uma decisao de orcamento que os benchmarks nao sustentam.
+        return ["--model", "opus", "--effort", "high"]
     return []

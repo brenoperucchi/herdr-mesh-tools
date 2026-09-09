@@ -29,7 +29,23 @@ DRY = "--dry-run" in sys.argv
 # "max", mantendo "-rev-2" (Opus, ja deliberadamente --model opus) como a
 # lente cara. Sem dado suficiente ainda pra ir mais longe que isso (ver
 # metrics.json / artifact "Ciclo de Revisao").
-REV_EFFORT = ["-c", "model_reasoning_effort=high"]
+REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"]
+
+# Achado 2026-09-09 (consulta herdr-8, os dois revisores + pesquisa de preco):
+# "nao pinar" nunca foi neutro - todo papel sem --model/--effort explicito
+# herdava ~/.claude/settings.json ou ~/.codex/config.toml, e esses arquivos sao
+# REESCRITOS pelo /model interativo. Um /model num pane qualquer mudava o effort
+# de todos os rev-2 do mesh, e foi assim que dois revisores acordaram em Fable
+# 5.1 (o modelo MAIS caro do catalogo, $10/$50 - o dobro do Opus pretendido).
+# Dai a regra: model E effort explicitos em TODO papel, sempre.
+EXEC_ARGS = ["--model", "sonnet", "--effort", "high"]
+
+# scout: Terra @ max (decisao do usuario 2026-09-09). Terra e' 5x mais barato
+# que Astra na entrada e ~4x na saida, e o scout rodava Astra herdado - o item
+# mais caro da config pro trabalho mais barato. O max aqui e' deliberado: torna
+# o scout o papel de MAIOR esforco do mesh, contra a orientacao generica pra
+# exploracao, porque este scout faz exploracao pesada, nao so busca.
+SCOUT_ARGS = ["--model", "gpt-5.6-terra", "-c", "model_reasoning_effort=max"]
 
 # Override pontual de model/effort dos revisores, por slug - a maioria dos
 # spaces usa REV_EFFORT/rev2_kind (default "claude", sem effort explicito) e
@@ -71,17 +87,17 @@ REV_OVERRIDES = {
 # "-rev-1", e o "-rev-2" sempre subindo hardcoded como Claude/Opus mesmo com
 # a policy viva sendo Grok (rev2_kind por space).
 SPACES = [
-    ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "claude", []),
-        ("omabackup-scout", "codex", [])),
-    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "claude", []),
-        ("mfc-scout", "codex", [])),
-    ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", []),
+    ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "claude", EXEC_ARGS),
+        ("omabackup-scout", "codex", SCOUT_ARGS)),
+    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "claude", EXEC_ARGS),
+        ("mfc-scout", "codex", SCOUT_ARGS)),
+    ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", EXEC_ARGS),
         None),
     # DRE: analise financeira (Demonstrativo de Resultado), nao um repo git -
     # herdr-bootstrap nao exige git, so migration.read_migration_state()
     # cai no fallback "phase=legacy" de sempre.
-    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", []),
-        ("dre-scout", "codex", [])),
+    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", EXEC_ARGS),
+        ("dre-scout", "codex", SCOUT_ARGS)),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
     # broker.sqlite/tokens.json) - achado 2026-08-29: claude-bridge-exec
@@ -94,8 +110,8 @@ SPACES = [
     # da troca - herdr-bootstrap so age em pane vazio, entao nao teria
     # revertido o swap sozinho, mas recriar o agent do zero um dia teria).
     # scout continua Codex (nao fez parte daquele swap, confirmado ao vivo).
-    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "claude", []),
-        ("claude-bridge-scout", "codex", [])),
+    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "claude", EXEC_ARGS),
+        ("claude-bridge-scout", "codex", SCOUT_ARGS)),
     # exec trocado pra Claude no mesmo batch-swap de 2026-08-31 (ver
     # claude-bridge acima) - mesma correcao de tabela stale.
     # Workspace e todos os agents foram renomeados de
@@ -103,14 +119,14 @@ SPACES = [
     # "cic"/"cic-*" fora desta sessao - achado 2026-09-04 (dry-run ia criar
     # um workspace DUPLICADO porque o label aqui nao batia mais com o real).
     ("cic", f"{HOME}/Devs/content-insights-collector",
-        ("cic-exec", "claude", []), None),
+        ("cic-exec", "claude", EXEC_ARGS), None),
     # llm-gateway: label do workspace que o usuario ja tinha criado na mao
     # (llm-exec ja vivo la antes deste script rodar) - slug "llm" (5o
     # elemento) porque foi assim que o usuario nomeou os revisores
     # pedidos (llm-rev/llm-rev-2/llm-scout, nao llm-gateway-rev). rev/rev-2
     # mais caros que o default (ver REV_OVERRIDES) e scout customizado (Sol
     # xhigh) - pedido explicito do usuario 2026-09-02.
-    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "claude", []),
+    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "claude", EXEC_ARGS),
         ("llm-scout", "codex", ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=xhigh"]),
         "llm"),
     # llm-bench: workspace e exec ja existiam na mao (pane sem nome, so
@@ -118,13 +134,13 @@ SPACES = [
     # sem divergencia (diferente do llm-gateway acima). rev/rev-2/scout com
     # os defaults padrao (REV_EFFORT/rev2_kind claude/scout Codex sem
     # override) - nao foi pedido nada mais caro pra este space.
-    ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "claude", []),
-        ("llm-bench-scout", "codex", [])),
+    ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "claude", EXEC_ARGS),
+        ("llm-bench-scout", "codex", SCOUT_ARGS)),
     # HomeHub: workspace e exec ja existiam na mao (homehub-exec ja com o
     # nome certo, slug=label.lower() sem divergencia). rev/rev-2 com custo
     # customizado (ver REV_OVERRIDES) - pedido explicito do usuario
     # 2026-09-05. Sem scout - decisao explicita do usuario, nao esquecimento.
-    ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "claude", []), None),
+    ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "claude", EXEC_ARGS), None),
     # omasession: plugin Omarchy de restauracao de sessao grafica (janelas e
     # workspaces de volta apos reboot/queda). Workspace wS e os 4 agents foram
     # criados na mao em 2026-09-08 antes desta entrada existir - registrado
@@ -132,8 +148,8 @@ SPACES = [
     # age em pane vazio). Layout e kinds no default de todo mundo:
     # exec Claude, rev-1 Codex (REV_EFFORT), rev-2 Claude, scout Codex; nao
     # foi pedido nada mais caro. slug=label, sem divergencia.
-    ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "claude", []),
-        ("omasession-scout", "codex", [])),
+    ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "claude", EXEC_ARGS),
+        ("omasession-scout", "codex", SCOUT_ARGS)),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra

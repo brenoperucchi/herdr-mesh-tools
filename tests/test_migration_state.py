@@ -424,10 +424,59 @@ class MigrationStateTests(unittest.TestCase):
     # --- acoplamento kind -> extra_args (rev-2) --------------------------
 
     def test_extra_args_for_rev2_claude_gets_opus_flag(self):
-        self.assertEqual(self.migration.extra_args_for_rev2("claude"), ["--model", "opus"])
+        # --effort explicito (2026-09-09): sem ele o rev-2 herda o effortLevel
+        # do settings.json, que o /model interativo reescreve - ver o comentario
+        # em extra_args_for_rev2. O teste fixa os DOIS flags de proposito: um
+        # rev-2 sem effort pinado e' o bug, nao o default.
+        self.assertEqual(
+            self.migration.extra_args_for_rev2("claude"),
+            ["--model", "opus", "--effort", "high"],
+        )
 
     def test_extra_args_for_rev2_grok_gets_no_flags(self):
         self.assertEqual(self.migration.extra_args_for_rev2("grok"), [])
+
+
+class ExplicitModelEffortTests(unittest.TestCase):
+    """Achado 2026-09-09 (consulta herdr-8): "nao pinar" nunca foi neutro.
+    Todo papel sem --model/--effort herdava ~/.claude/settings.json ou
+    ~/.codex/config.toml, e esses arquivos sao reescritos pelo /model
+    interativo - um /model num pane qualquer mudava o effort de todos os
+    rev-2 do mesh. Foi assim que dois revisores acordaram rodando Fable 5.1,
+    o modelo mais caro do catalogo. Este teste trava a regra: todo perfil de
+    papel pina modelo E esforco, explicitamente."""
+
+    def setUp(self):
+        self.bootstrap = _load("herdr-bootstrap", "herdr_bootstrap_explicit_args")
+
+    def test_every_role_profile_pins_model_and_effort(self):
+        perfis = {
+            "EXEC_ARGS": self.bootstrap.EXEC_ARGS,
+            "SCOUT_ARGS": self.bootstrap.SCOUT_ARGS,
+            "REV_EFFORT": self.bootstrap.REV_EFFORT,
+        }
+        for nome, args in perfis.items():
+            with self.subTest(perfil=nome):
+                self.assertIn("--model", args, f"{nome} nao pina modelo")
+                # Claude usa --effort, Codex usa -c model_reasoning_effort=
+                tem_effort = "--effort" in args or any(
+                    a.startswith("model_reasoning_effort=") for a in args
+                )
+                self.assertTrue(tem_effort, f"{nome} nao pina esforco")
+
+    def test_no_space_leaves_exec_or_scout_with_empty_args(self):
+        """Tupla com [] volta a herdar do config global - o bug que este
+        conjunto de mudancas existe pra fechar."""
+        for entry in self.bootstrap.SPACES:
+            label, _cwd, exec_agent, scout = entry[:4]
+            for papel, tupla in (("exec", exec_agent), ("scout", scout)):
+                if tupla is None:
+                    continue
+                with self.subTest(space=label, papel=papel):
+                    self.assertTrue(
+                        tupla[2],
+                        f"{label}/{papel} ({tupla[0]}) tem extra_args vazio - herdaria o default global",
+                    )
 
 
 class BootstrapRevAgentsTests(unittest.TestCase):
@@ -466,7 +515,7 @@ class BootstrapRevAgentsTests(unittest.TestCase):
         agents = self.bootstrap.build_rev_agents("foo", self.cwd)
         rev2 = next(a for a in agents if a[0] == "foo-rev-2")
         self.assertEqual(rev2[1], "claude")
-        self.assertEqual(rev2[2], ["--model", "opus"])
+        self.assertEqual(rev2[2], ["--model", "opus", "--effort", "high"])
 
 
 class MigrateRevGiveUpTests(unittest.TestCase):
