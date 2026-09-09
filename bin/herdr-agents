@@ -1,26 +1,134 @@
-#!/usr/bin/env bash
-# herdr-agents [--name <filtro>] — lista os agents do herdr num formato tabular curto:
-# agent (status) | cwd | model | name | pane_id | tab_id
-#
-# --name <filtro>  só mostra agents cujo cwd contém <filtro> (case-insensitive)
-set -euo pipefail
+#!/usr/bin/env python3
+"""herdr-agents [--name <filtro-de-cwd>] — uma linha por agent do Herdr:
+status | cwd | kind | model | effort | name | pane_id | tab_id
 
-filter=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --name)
-      filter="${2:?--name precisa de um valor}"
-      shift 2
-      ;;
-    *)
-      echo "uso: herdr-agents [--name <filtro-de-cwd>]" >&2
-      exit 1
-      ;;
-  esac
-done
+MODEL/EFFORT saem do argv REAL do processo (`herdr pane process-info`), nao da
+config esperada — o ponto e' justamente enxergar divergencia.
 
-herdr agent list | jq -r --arg filter "$filter" '
-  .result.agents[]
-  | select($filter == "" or (.cwd | ascii_downcase | contains($filter | ascii_downcase)))
-  | [.agent_status, .cwd, .agent, .name, .pane_id, .tab_id] | @tsv
-' | sort -t $'\t' -k4 | (echo -e "AGENT\tCWD\tMODEL\tNAME\tPANE_ID\tTAB_ID"; cat) | column -t -s $'\t'
+Valor entre (parenteses) = HERDADO, nao pinado no lancamento: o processo subiu
+sem `--model`/`--effort`, entao esta usando o default de ~/.codex/config.toml ou
+~/.claude/settings.json. Isso importa porque esses arquivos sao REESCRITOS pelo
+`/model` interativo: um `/model` num pane qualquer muda o default de todos os
+agents herdados. Foi assim que dois revisores acordaram em Fable 5.1, o modelo
+mais caro do catalogo, sem ninguem ter decidido (achado 2026-09-09).
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+CLI_TIMEOUT_S = 20
+
+
+def api(*args):
+    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    if out.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
+    return json.loads(out.stdout)["result"]
+
+
+def defaults_codex():
+    """model / model_reasoning_effort de ~/.codex/config.toml."""
+    model = effort = None
+    path = os.path.join(HOME, ".codex", "config.toml")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("model ") or line.startswith("model="):
+                    model = line.split("=", 1)[1].strip().strip('"\'')
+                elif line.startswith("model_reasoning_effort"):
+                    effort = line.split("=", 1)[1].strip().strip('"\'')
+    except OSError:
+        pass
+    return model, effort
+
+
+def defaults_claude():
+    """model + effortLevel daquele model, de ~/.claude/settings.json."""
+    try:
+        with open(os.path.join(HOME, ".claude", "settings.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None, None
+    model = d.get("model")
+    effort = None
+    if model:
+        # "opus[1m]" -> a chave em modelSettings e' o id canonico
+        # ("claude-opus-5"). Match exato primeiro; substring so como fallback,
+        # porque "opus" casaria com qualquer chave que contenha a palavra e a
+        # ordem do dict decidiria em silencio qual effort vence.
+        base = model.split("[")[0]
+        ms = d.get("modelSettings") or {}
+        alvo = ms.get(base) or ms.get(f"claude-{base}") or ms.get(f"claude-{base}-5")
+        if alvo is None:
+            candidatos = [v for k, v in ms.items() if base in k]
+            alvo = candidatos[0] if len(candidatos) == 1 else None
+        effort = (alvo or {}).get("effortLevel")
+    return model, effort
+
+
+def from_argv(argv):
+    """Extrai (model, effort) do argv, ou (None, None) se nao veio pinado."""
+    model = effort = None
+    for i, a in enumerate(argv):
+        if a == "--model" and i + 1 < len(argv):
+            model = argv[i + 1]
+        elif a == "--effort" and i + 1 < len(argv):
+            effort = argv[i + 1]
+        elif a.startswith("model_reasoning_effort="):
+            effort = a.split("=", 1)[1]
+    return model, effort
+
+
+def resolve(agent):
+    """(model, effort) do pane. Parenteses = herdado do config global."""
+    kind = agent.get("agent")
+    try:
+        pi = api("pane", "process-info", "--pane", agent["pane_id"])["process_info"]
+        fg = pi.get("foreground_processes") or []
+        argv = fg[0].get("argv", []) if fg else []
+    except (RuntimeError, subprocess.TimeoutExpired, KeyError, IndexError):
+        argv = []
+
+    model, effort = from_argv(argv)
+    dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
+    if model is None and dm:
+        model = f"({dm})"
+    if effort is None and de:
+        effort = f"({de})"
+    return model or "?", effort or "?"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", default="", help="so agents cujo cwd contem este texto")
+    args = ap.parse_args()
+
+    agents = api("agent", "list")["agents"]
+    if args.name:
+        f = args.name.lower()
+        agents = [a for a in agents if f in a.get("cwd", "").lower()]
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        modelos = list(ex.map(resolve, agents))
+
+    linhas = []
+    for a, (model, effort) in zip(agents, modelos):
+        linhas.append([
+            a.get("agent_status", "?"), a.get("cwd", "?"), a.get("agent", "?"),
+            model, effort, a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
+        ])
+    linhas.sort(key=lambda r: (r[5] == "", r[5], r[6]))  # sem nome por ultimo
+
+    head = ["AGENT", "CWD", "KIND", "MODEL", "EFFORT", "NAME", "PANE_ID", "TAB_ID"]
+    larguras = [max(len(str(r[i])) for r in [head] + linhas) for i in range(len(head))]
+    for r in [head] + linhas:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, larguras)).rstrip())
+
+
+if __name__ == "__main__":
+    main()

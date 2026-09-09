@@ -52,11 +52,16 @@ exception, and the comment next to it explains why.
   anywhere: it reads absolute paths from its own table, not the cwd.
   `--dry-run` first — it has already caught an entry gone stale after a
   workspace was renamed by hand, which would have created a duplicate.
-- **`herdr-agents [--name <cwd-filter>]`** — one tabular line per agent Herdr
-  knows about: status, cwd, kind, name, pane, tab. The quickest answer to
-  "what is actually running right now", and the way to verify a bootstrap:
-  `herdr agent start` exits non-zero when readiness detection times out even
-  though the agent did start, so exit codes lie and this does not.
+- **`herdr-agents [--name <cwd-filter>]`** — one tabular line per agent: status,
+  cwd, kind, **model**, **effort**, name, pane, tab. Model and effort come from
+  the process's real `argv` (`herdr pane process-info`), not from the expected
+  config — the point is to see divergence. A value in **(parentheses) means
+  inherited**, not pinned at launch: the process came up without
+  `--model`/`--effort` and is following `~/.codex/config.toml` or
+  `~/.claude/settings.json`. That distinction matters because the interactive
+  `/model` command rewrites those files, so one `/model` in any pane silently
+  changes every inherited agent — which is how two reviewers ended up on Fable
+  5.1, the priciest model in the catalogue, with nobody having decided it.
 
 ### Running the cycle
 
