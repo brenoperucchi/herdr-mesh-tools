@@ -53,15 +53,19 @@ exception, and the comment next to it explains why.
   `--dry-run` first — it has already caught an entry gone stale after a
   workspace was renamed by hand, which would have created a duplicate.
 - **`herdr-agents [--name <cwd-filter>]`** — one tabular line per agent: status,
-  cwd, kind, **model**, **effort**, name, pane, tab. Model and effort come from
-  the process's real `argv` (`herdr pane process-info`), not from the expected
-  config — the point is to see divergence. A value in **(parentheses) means
-  inherited**, not pinned at launch: the process came up without
-  `--model`/`--effort` and is following `~/.codex/config.toml` or
-  `~/.claude/settings.json`. That distinction matters because the interactive
-  `/model` command rewrites those files, so one `/model` in any pane silently
-  changes every inherited agent — which is how two reviewers ended up on Fable
-  5.1, the priciest model in the catalogue, with nobody having decided it.
+  cwd, kind, **model**, **effort**, **src**, name, pane, tab. The `src` column
+  says where the model/effort actually came from, because the three sources
+  disagree in practice:
+  - `argv` — pinned at launch. The only one an operator chose.
+  - `thread` — the process came up as `codex resume <uuid>`, so the values are
+    the session's *final* state, read from its rollout. Measured 2026-09-10:
+    resume restores this faithfully — `llm-bench-scout` runs `gpt-5.6-luna max`
+    while the global default is `gpt-6-astra`, which would be impossible if it
+    fell back to the default. Read the *last* record, not the first: a Codex
+    `thread_settings_applied` event was seen demoting `high` to `medium`
+    mid-session.
+  - `global` — the `config.toml`/`settings.json` default, which the interactive
+    `/model` rewrites, silently changing every agent that inherits it.
 
 ### Running the cycle
 

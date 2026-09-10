@@ -15,6 +15,7 @@ mais caro do catalogo, sem ninguem ter decidido (achado 2026-09-09).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -89,8 +90,53 @@ def from_argv(argv):
     return model, effort
 
 
+def from_codex_rollout(uuid):
+    """(model, effort) do ULTIMO registro do rollout daquela sessao Codex.
+
+    Achado 2026-09-10, medido: um processo restaurado com `codex resume <uuid>`
+    NAO cai no default global -- ele restaura fielmente o estado final da
+    thread. Prova: llm-bench-scout roda `gpt-5.6-luna max` enquanto o default
+    global e' `gpt-6-astra`; se caisse no default, seria impossivel.
+
+    Por isso o ultimo registro, e nao o primeiro: o effort pode mudar no meio
+    da sessao (visto um evento `thread_settings_applied` do Codex rebaixando
+    high -> medium), e o que vale e' o estado com que a thread terminou."""
+    import glob
+    achados = glob.glob(os.path.join(HOME, ".codex", "sessions", "**", f"*{uuid}*.jsonl"),
+                        recursive=True)
+    if not achados:
+        return None, None
+    model = effort = None
+    try:
+        with open(achados[0]) as f:
+            for linha in f:
+                m = re.search(r'"model"\s*:\s*"([^"]+)"', linha)
+                if m:
+                    model = m.group(1)
+                e = re.search(r'"(?:reasoning_)?effort"\s*:\s*"(\w+)"', linha)
+                if e:
+                    effort = e.group(1)
+    except OSError:
+        return None, None
+    return model, effort
+
+
+def resume_uuid(argv):
+    """UUID quando o processo subiu via `codex resume <uuid>`."""
+    for i, a in enumerate(argv):
+        if a == "resume" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
 def resolve(agent):
-    """(model, effort) do pane. Parenteses = herdado do config global."""
+    """(model, effort, origem) do pane.
+
+    origem diz DE ONDE veio o valor, porque as tres fontes divergem na pratica:
+      argv   -- pinado no lancamento (a unica que o operador escolheu)
+      thread -- restaurado de `codex resume`, e' o estado final da sessao
+      global -- default de config.toml/settings.json, que o /model reescreve
+    """
     kind = agent.get("agent")
     try:
         pi = api("pane", "process-info", "--pane", agent["pane_id"])["process_info"]
@@ -100,12 +146,17 @@ def resolve(agent):
         argv = []
 
     model, effort = from_argv(argv)
+    if model or effort:
+        return model or "?", effort or "?", "argv"
+
+    uuid = resume_uuid(argv)
+    if uuid and kind == "codex":
+        rm, re_ = from_codex_rollout(uuid)
+        if rm or re_:
+            return rm or "?", re_ or "?", "thread"
+
     dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
-    if model is None and dm:
-        model = f"({dm})"
-    if effort is None and de:
-        effort = f"({de})"
-    return model or "?", effort or "?"
+    return dm or "?", de or "?", "global"
 
 
 def main():
@@ -122,14 +173,14 @@ def main():
         modelos = list(ex.map(resolve, agents))
 
     linhas = []
-    for a, (model, effort) in zip(agents, modelos):
+    for a, (model, effort, origem) in zip(agents, modelos):
         linhas.append([
             a.get("agent_status", "?"), a.get("cwd", "?"), a.get("agent", "?"),
-            model, effort, a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
+            model, effort, origem, a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
         ])
-    linhas.sort(key=lambda r: (r[5] == "", r[5], r[6]))  # sem nome por ultimo
+    linhas.sort(key=lambda r: (r[6] == "", r[6], r[7]))  # sem nome por ultimo
 
-    head = ["AGENT", "CWD", "KIND", "MODEL", "EFFORT", "NAME", "PANE_ID", "TAB_ID"]
+    head = ["AGENT", "CWD", "KIND", "MODEL", "EFFORT", "SRC", "NAME", "PANE_ID", "TAB_ID"]
     larguras = [max(len(str(r[i])) for r in [head] + linhas) for i in range(len(head))]
     for r in [head] + linhas:
         print("  ".join(str(c).ljust(w) for c, w in zip(r, larguras)).rstrip())
