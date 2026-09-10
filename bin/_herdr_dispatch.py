@@ -324,7 +324,19 @@ Detalhes completos em AGENTS.md/CLAUDE.md (seção "Reviewer colleagues") e em
 interação de revisão. Repassando o aviso operacional: não use AgentRelay nem
 subagentes nativos; não crie agent/pane novo para fricção; e, se houver
 discordância factual genuína, encaminhe pela rota aprovada de `herdr-ask`.
-Este aviso vale para ambos os revisores e deve ser repetido na próxima rodada."""
+Este aviso vale para ambos os revisores e deve ser repetido na próxima rodada.
+
+Canal oficial para falar com outro agent: a CLI, `herdr agent prompt <alvo>
+"<texto>"`. Ela entrega pelo caminho suportado — respeita bracketed-paste,
+manda o Enter codificado e RECUSA com `agent_blocked` se o alvo estiver
+parado num diálogo, antes de digitar qualquer coisa. Duas rotas que existem e
+NÃO devem ser usadas para isso: as ferramentas MCP `herdr-mesh`
+(`herdr_relay`, `herdr_agent_send`, `herdr_handoff`) foram removidas deste
+ambiente em 2026-09-10 — eram pacote de terceiro que chamava um subcomando
+`herdr agent send` inexistente na CLI 0.9.0, então falhavam sempre; e
+`pane send-text` + `send-keys enter`, que escreve direto na caixa de
+composição e, se houver rascunho humano não enviado ali, concatena e submete
+junto (dois incidentes reais registrados no CLAUDE.md do usuário)."""
 
 SCOUT_ROLE_NOTE = """
 

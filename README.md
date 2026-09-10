@@ -199,6 +199,27 @@ for them:
   to, that an agent's role is attested rather than inferred, and that the
   skills refuse to run outside a Herdr pane.
 
+## Talking to another agent
+
+`herdr agent prompt <target> "<text>"` — the CLI, nothing else. It delivers
+through the supported path: it honours bracketed paste, sends an encoded Enter,
+and refuses with `agent_blocked` when the target sits at a dialog, *before*
+typing anything.
+
+Two alternatives exist and are wrong for this:
+
+- **The `herdr-mesh` MCP tools** (`herdr_relay`, `herdr_agent_send`,
+  `herdr_handoff`) — a third-party package (`runchr-works/herdr-mesh`, no
+  relation to this repo despite the name) that shells out to `herdr agent
+  send`, a subcommand the 0.9.0 CLI does not have. Every call failed. Removed
+  from this machine's Claude and Codex configs on 2026-09-10; nothing here ever
+  used it, and all eleven binaries call the CLI directly.
+- **`pane send-text` + `send-keys enter`** — types into the compose box. If a
+  human has unsent text there, yours concatenates onto it and submits both. Two
+  real incidents are recorded in the user's `CLAUDE.md`; `pane read` first
+  narrows the window but does not close it, since someone can type between the
+  read and the send.
+
 ## Testing against a throwaway environment
 
 Herdr supports **named sessions**, each with its own socket and state, so

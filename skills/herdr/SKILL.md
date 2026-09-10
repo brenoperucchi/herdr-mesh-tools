@@ -185,6 +185,8 @@ Submit work through the agent surface:
 herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
 ```
 
+**`agent prompt` is the official channel for talking to another agent — use it, not the alternatives.** Two other routes exist and are wrong for this. The `herdr-mesh` MCP tools (`herdr_relay`, `herdr_agent_send`, `herdr_handoff`) were removed from this environment on 2026-09-10: a third-party package that shelled out to `herdr agent send`, a subcommand the 0.9.0 CLI does not have, so every call failed. And `pane send-text` + `send-keys enter` types straight into the compose box — if a human has unsent text sitting there, yours concatenates onto it and submits the pair (two real incidents, recorded in the user's `CLAUDE.md`). `agent prompt` avoids both: it delivers through the supported path and refuses outright when the target is blocked.
+
 `agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending any input. Inspect the blocked UI and ask the user before answering it. For normal agent work, `--wait` is enough: it waits for the first settled `idle`, `done`, or `blocked` state. Do not repeat those defaults with `--until`.
 
 A prompt sent from a non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
