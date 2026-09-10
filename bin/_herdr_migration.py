@@ -509,5 +509,8 @@ def extra_args_for_rev2(kind):
         # ninguem ter decidido isso. "high", nao "max": max fica por override de
         # space (o "llm" ja faz), porque o span de ~10x entre os extremos torna
         # max universal uma decisao de orcamento que os benchmarks nao sustentam.
-        return ["--model", "opus", "--effort", "high"]
+        # xhigh (decisao 2026-09-10): o rev-2 e' a "lente cara" do par cego, e
+        # so era cara no modelo -- o effort vinha herdado. Com o rev-1 em
+        # medium, a assimetria do achado de 2026-08-26 volta a existir de fato.
+        return ["--model", "opus", "--effort", "xhigh"]
     return []

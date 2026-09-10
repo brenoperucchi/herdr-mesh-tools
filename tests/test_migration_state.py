@@ -428,9 +428,12 @@ class MigrationStateTests(unittest.TestCase):
         # do settings.json, que o /model interativo reescreve - ver o comentario
         # em extra_args_for_rev2. O teste fixa os DOIS flags de proposito: um
         # rev-2 sem effort pinado e' o bug, nao o default.
+        # xhigh desde 2026-09-10: com o rev-1 em medium, o par cego volta a ser
+        # assimetrico (rede larga barata + lente cara), como o achado de
+        # 2026-08-26 pedia.
         self.assertEqual(
             self.migration.extra_args_for_rev2("claude"),
-            ["--model", "opus", "--effort", "high"],
+            ["--model", "opus", "--effort", "xhigh"],
         )
 
     def test_extra_args_for_rev2_grok_gets_no_flags(self):
@@ -515,7 +518,7 @@ class BootstrapRevAgentsTests(unittest.TestCase):
         agents = self.bootstrap.build_rev_agents("foo", self.cwd)
         rev2 = next(a for a in agents if a[0] == "foo-rev-2")
         self.assertEqual(rev2[1], "claude")
-        self.assertEqual(rev2[2], ["--model", "opus", "--effort", "high"])
+        self.assertEqual(rev2[2], ["--model", "opus", "--effort", "xhigh"])
 
 
 class MigrateRevGiveUpTests(unittest.TestCase):

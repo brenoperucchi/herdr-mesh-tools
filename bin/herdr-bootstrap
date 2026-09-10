@@ -29,7 +29,13 @@ DRY = "--dry-run" in sys.argv
 # "max", mantendo "-rev-2" (Opus, ja deliberadamente --model opus) como a
 # lente cara. Sem dado suficiente ainda pra ir mais longe que isso (ver
 # metrics.json / artifact "Ciclo de Revisao").
-REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"]
+# Decisao do usuario 2026-09-10: rev-1 em medium, rev-2 em xhigh. Isso RESTAURA
+# a assimetria que o achado de 2026-08-26 pedia ("dois revisores no teto e'
+# redundancia cara") e que tinha se perdido quando os dois foram pinados em
+# high: agora o rev-1 e' a rede larga barata e o rev-2 a lente cara de verdade,
+# cara no modelo E no raciocinio -- que era a intencao registrada no comentario
+# original, nunca a configuracao real.
+REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"]
 
 # Achado 2026-09-09 (consulta herdr-8, os dois revisores + pesquisa de preco):
 # "nao pinar" nunca foi neutro - todo papel sem --model/--effort explicito
@@ -40,12 +46,13 @@ REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"]
 # Dai a regra: model E effort explicitos em TODO papel, sempre.
 EXEC_ARGS = ["--model", "sonnet", "--effort", "high"]
 
-# scout: Terra @ max (decisao do usuario 2026-09-09). Terra e' 5x mais barato
-# que Astra na entrada e ~4x na saida, e o scout rodava Astra herdado - o item
-# mais caro da config pro trabalho mais barato. O max aqui e' deliberado: torna
-# o scout o papel de MAIOR esforco do mesh, contra a orientacao generica pra
-# exploracao, porque este scout faz exploracao pesada, nao so busca.
-SCOUT_ARGS = ["--model", "gpt-5.6-terra", "-c", "model_reasoning_effort=max"]
+# scout: Astra @ max (decisao do usuario 2026-09-10, revisando o Terra que
+# tinha sido escolhido no dia anterior). E' a combinacao mais cara do catalogo
+# ($10/$50 de entrada/saida, contra $2/$12 do Terra) somada ao maior effort --
+# escolha deliberada de quem paga a conta, porque o scout aqui faz exploracao
+# pesada e nao so busca. Fica registrado o custo pra que a decisao seja
+# revisitavel, nao para contesta-la.
+SCOUT_ARGS = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=max"]
 
 # Override pontual de model/effort dos revisores, por slug - a maioria dos
 # spaces usa REV_EFFORT/rev2_kind (default "claude", sem effort explicito) e
