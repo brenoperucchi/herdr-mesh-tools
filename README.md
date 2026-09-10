@@ -65,8 +65,9 @@ exception, and the comment next to it explains why.
     fell back to the default. Read the *last* record, not the first: a Codex
     `thread_settings_applied` event was seen demoting `high` to `medium`
     mid-session.
-  - `thread?` — a Claude agent under `--resume`. The model prints as
-    `(indeterminado)`, because there is no reliable off-screen source for one:
+  - `thread?` — a Claude agent under `--resume` that has **not answered since
+    the last `/model`**, so the log cannot be trusted. The model prints as
+    `(indeterminado)`:
     the session file is a *log* that a live `/model` does not update until the
     next message, and `settings.json` is global. `herdr pane read <pane>`
     settles it. The guessed name is deliberately **not** printed anywhere,
@@ -75,6 +76,14 @@ exception, and the comment next to it explains why.
     `herdr-agents | grep -i fable` sent the user chasing a ghost twice. In a
     field people use to hunt cost, a stale guess is worse than an admitted
     unknown — and keeping it in any column just moves the false positive.
+
+    A Claude agent that *has* answered since that change reads as plain
+    `thread` and does print its model. The test is the timestamp of the last
+    log entry carrying a `model` field, compared against the mtime of
+    `settings.json` (which `/model` rewrites). File mtime alone does not work:
+    measured, `acervo-exec`'s log was written three minutes *after* the switch
+    and still held the old model, because that write was a `system` entry with
+    no model in it. `model` only appears on assistant replies.
   - `global` — the `config.toml`/`settings.json` default, which the interactive
     `/model` rewrites, silently changing every agent that inherits it.
 
