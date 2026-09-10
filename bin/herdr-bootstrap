@@ -157,6 +157,19 @@ SPACES = [
     # foi pedido nada mais caro. slug=label, sem divergencia.
     ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "claude", EXEC_ARGS),
         ("omasession-scout", "codex", SCOUT_ARGS)),
+    # omaspotlight: fork nosso do io.github.maajix.spotlight
+    # (github.com/brenoperucchi/omarchy-spotlight, upstream maajix/omarchy-spotlight).
+    # Forkado em 2026-09-10 depois que o mantenedor aceitou as issues #1 e #2 em
+    # poucas horas: o fork nao e' divergencia, e' a bancada onde as melhorias
+    # sao escritas e testadas antes de virarem PR pro upstream -- e o que ele
+    # nao quiser fica valendo so pra nos. Layout e kinds no default: exec
+    # Claude, rev-1 Codex (REV_EFFORT), rev-2 Claude, scout Codex.
+    # slug=label, sem divergencia; cwd e' o clone do fork, nao o plugin
+    # instalado em ~/.config/omarchy/plugins (aquele e' git-managed pelo
+    # `omarchy plugin update` e seria sobrescrito).
+    ("omaspotlight", f"{HOME}/Devs/omarchy-spotlight",
+        ("omaspotlight-exec", "claude", EXEC_ARGS),
+        ("omaspotlight-scout", "codex", SCOUT_ARGS)),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
     # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
     # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
@@ -295,9 +308,24 @@ def main():
         if gate_msg is not None:
             print(f"space {label}: {gate_msg} — pulando esta rodada")
             continue
+        ws = workspaces.get(label)
+        # Space que nasce agora nasce ja migrado. build_rev_agents() abaixo le
+        # a fase pra decidir entre "<slug>-rev" e "<slug>-rev-1", e a ausencia
+        # do migration-state.json significa "legacy" -- entao sem isto todo
+        # space novo nasce com o nome ANTIGO e precisa de um
+        # herdr-migrate-rev logo em seguida (foi o que aconteceu com
+        # omaspotlight em 2026-09-10). Nao ha nada pra migrar num space que
+        # ainda nao tem agent nenhum: a fase legacy so existe pra proteger os
+        # spaces que ja tinham um "-rev" vivo quando a migracao comecou.
+        # Condicionado a `ws is None` de proposito -- um space existente em
+        # legacy continua exigindo o herdr-migrate-rev, que renomeia o agent
+        # vivo com flock e marcador de proveniencia.
+        if ws is None and not DRY:
+            if migration.read_migration_state(migration_cwd)["phase"] == "legacy":
+                migration.write_migration_state_atomic(migration_cwd, {"phase": "migrated"})
+
         tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, migration_cwd)
 
-        ws = workspaces.get(label)
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")
             res = run("workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")
