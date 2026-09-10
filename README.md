@@ -169,13 +169,27 @@ for them:
 ## Testing against a throwaway environment
 
 Herdr supports **named sessions**, each with its own socket and state, so
-nothing here has to be tried against the working environment:
+nothing here has to be tried against the working mesh:
 
 ```bash
 herdr --session testlab server &          # headless server for that session
-HERDR_SESSION=testlab herdr workspace list
+HERDR_SESSION=testlab herdr-agents        # this repo's scripts, isolated
 herdr session delete testlab              # discard everything
 ```
+
+**`HERDR_SESSION` is this repo's variable, not Herdr's.** `herdr --help`
+documents only `HERDR_CONFIG_PATH`; the Herdr CLI isolates via the
+`--session <name>` flag and ignores the environment entirely. Measured
+2026-09-10: `HERDR_SESSION=testlab herdr agent list` returned the 41
+**production** agents, while `herdr --session testlab agent list` returned 0.
+
+So the variable only works for the scripts in this repo, which translate it
+into the flag (`herdr_argv()` in `_herdr_dispatch.py`, one place every script
+goes through). Calling the `herdr` CLI directly with the variable and no flag
+runs against the real mesh — which is exactly how this bug hid: the README
+used to teach the variable as isolation, and `herdr-add-space` printed
+`MODO TESTE session=testlab` on seeing it, so an "isolated" add-space would
+have created a workspace in the live mesh.
 
 `HERDR_SESSION` isolates workspaces, panes and agents — but **not this repo's
 files**. `herdr-add-space` would still write to the real `herdr-bootstrap`, so

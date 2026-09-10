@@ -28,9 +28,31 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def herdr_argv(*args):
+    """[HERDR, ...args], com `--session <nome>` na frente quando HERDR_SESSION
+    estiver setada.
+
+    Achado 2026-09-10, medido: `HERDR_SESSION` NAO e' uma variavel do Herdr --
+    `herdr --help` documenta apenas HERDR_CONFIG_PATH. Exportar HERDR_SESSION
+    nao isola nada: `HERDR_SESSION=testlab herdr agent list` devolveu os 41
+    agents de PRODUCAO, enquanto `herdr --session testlab agent list` devolveu 0.
+
+    Isso era perigoso porque o README deste repo ensinava a var como forma de
+    testar isolado, e o herdr-add-space ainda imprimia "MODO TESTE
+    session=testlab" ao ve-la -- dando confianca de isolamento enquanto todo
+    comando ia para a mesh real. Um add-space "em modo teste" criaria workspace
+    de verdade.
+
+    A correcao e' traduzir a var para a flag que o Herdr de fato entende, num
+    unico ponto: todo script do repo passa por aqui."""
+    sessao = os.environ.get("HERDR_SESSION")
+    prefixo = ["--session", sessao] if sessao else []
+    return [HERDR, *prefixo, *args]
+
+
 def api(*args):
     try:
-        out = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+        out = subprocess.run(herdr_argv(*args), capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{' '.join(args)}: sem resposta em {CLI_TIMEOUT_S}s (server do Herdr travado?)")
     if out.returncode != 0:
@@ -369,7 +391,7 @@ def pane_looks_busy_with_human_input(pane_id, lines=12):
     trata como suspeito (falha segura, não silenciosa)."""
     try:
         out = subprocess.run(
-            [HERDR, "pane", "read", pane_id, "--source", "detection", "--lines", str(lines)],
+            herdr_argv("pane", "read", pane_id, "--source", "detection", "--lines", str(lines)),
             capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
@@ -411,9 +433,9 @@ def dispatch_and_wait_all(prompts, timeout_s):
     deadline = time.time() + timeout_s
     procs = {
         name: subprocess.Popen(
-            [HERDR, "agent", "prompt", name, text,
-             "--wait", "--until", "idle", "--until", "done",
-             "--timeout", str(timeout_s * 1000)],
+            herdr_argv("agent", "prompt", name, text,
+                       "--wait", "--until", "idle", "--until", "done",
+                       "--timeout", str(timeout_s * 1000)),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         for name, text in prompts.items()

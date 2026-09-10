@@ -220,7 +220,7 @@ def main():
         # responder, nao aprova as cegas.
         try:
             pane_text = subprocess.run(
-                [HERDR, "pane", "read", new_pane_id, "--source", "visible", "--lines", "30"],
+                core.herdr_argv("pane", "read", new_pane_id, "--source", "visible", "--lines", "30"),
                 capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
             ).stdout
             trust_markers = ("Do you trust", "confia", "trust the contents", "Yes, I trust")

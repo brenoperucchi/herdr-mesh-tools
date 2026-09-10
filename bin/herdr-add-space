@@ -151,7 +151,10 @@ def main():
 
     # A label that already exists as a workspace but not in the table is the
     # normal case for spaces created by hand: register it, do not recreate it.
-    out = run("herdr", "workspace", "list")
+    # --session vem antes do subcomando: HERDR_SESSION sozinha nao isola nada
+    # (nao e' variavel do Herdr - ver herdr_argv em _herdr_dispatch.py).
+    _sess = os.environ.get("HERDR_SESSION")
+    out = run("herdr", *(["--session", _sess] if _sess else []), "workspace", "list")
     workspace_exists = (out.returncode == 0
                         and f'"label": "{label}"' in out.stdout.replace("'", '"'))
     if workspace_exists:

@@ -89,3 +89,33 @@ class DispatchProjectBindingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionIsolationTests(unittest.TestCase):
+    """Achado 2026-09-10: `HERDR_SESSION` NAO e' variavel do Herdr -- `herdr
+    --help` documenta so HERDR_CONFIG_PATH. Exportar a var nao isolava nada:
+    medido, `HERDR_SESSION=testlab herdr agent list` devolveu os 41 agents de
+    PRODUCAO enquanto `herdr --session testlab agent list` devolveu 0.
+
+    Era perigoso porque o README ensinava a var como forma de testar isolado e
+    o herdr-add-space imprimia "MODO TESTE session=..." ao ve-la -- confianca
+    de isolamento com os comandos indo pra mesh real. Estes testes travam a
+    traducao var -> flag."""
+
+    def setUp(self):
+        self.core = _load("_herdr_dispatch.py")
+
+    def test_no_env_means_no_session_flag(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERDR_SESSION", None)
+            argv = self.core.herdr_argv("agent", "list")
+        self.assertNotIn("--session", argv)
+        self.assertEqual(argv[1:], ["agent", "list"])
+
+    def test_env_becomes_session_flag_before_subcommand(self):
+        """A flag tem que vir ANTES do subcomando: `herdr --session x agent
+        list`. Depois do subcomando o Herdr a trata como argumento e ignora o
+        isolamento."""
+        with mock.patch.dict(os.environ, {"HERDR_SESSION": "testlab"}):
+            argv = self.core.herdr_argv("agent", "list")
+        self.assertEqual(argv[1:], ["--session", "testlab", "agent", "list"])

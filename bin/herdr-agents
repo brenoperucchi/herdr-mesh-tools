@@ -24,7 +24,12 @@ CLI_TIMEOUT_S = 20
 
 
 def api(*args):
-    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    # --session antes do subcomando quando HERDR_SESSION estiver setada: a var
+    # sozinha nao isola nada (nao e' variavel do Herdr, so --session e'; medido
+    # 2026-09-10 -- ver herdr_argv em _herdr_dispatch.py).
+    sessao = os.environ.get("HERDR_SESSION")
+    prefixo = ["--session", sessao] if sessao else []
+    out = subprocess.run(["herdr", *prefixo, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
     if out.returncode != 0:
         raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
     return json.loads(out.stdout)["result"]
