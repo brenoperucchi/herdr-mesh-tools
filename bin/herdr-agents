@@ -204,7 +204,16 @@ def resolve(agent):
             # arquivo atrasa, o settings.json e' global. Entao marca a duvida
             # em vez de afirmar -- `herdr pane read <pane>` e' quem decide.
             _dm, de = defaults_claude()
-            return f"~{cm}", f"({de})" if de else "?", "thread?"
+            # NAO imprime o nome do modelo lido do log. Ele desatualiza, e um
+            # nome errado num campo que as pessoas usam pra CACAR CUSTO produz
+            # falso positivo: `herdr-agents | grep -i fable` acusou duas vezes
+            # um agente que ja tinha sido trocado pra Sonnet 5 a mao, e mandou
+            # o usuario atras de um fantasma. Melhor admitir que nao sabe.
+            # O nome lido do log NAO aparece em coluna nenhuma: tentei
+            # deixa-lo no SRC como pista e o `grep -i fable` voltou a acusar
+            # os mesmos quatro. Qualquer coluna serve pro grep -- entao a
+            # unica saida honesta e' nao imprimir o palpite.
+            return "(indeterminado)", f"({de})" if de else "?", "thread?"
 
     dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
     return dm or "?", de or "?", "global"

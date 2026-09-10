@@ -65,14 +65,16 @@ exception, and the comment next to it explains why.
     fell back to the default. Read the *last* record, not the first: a Codex
     `thread_settings_applied` event was seen demoting `high` to `medium`
     mid-session.
-  - `thread?` — a Claude agent under `--resume`. **Indicative only**, and the
-    model is printed with a leading `~`. A Claude session file is a *log*: a
-    `/model` issued in the live session changes the model without writing a new
-    record until the next message, so this can be stale. Measured the hard way
-    on 2026-09-10 — four agents this read as `claude-fable-5-1` had already
-    been switched by hand to Sonnet 5 and Opus 5. There is no reliable source
-    off-screen for a restored Claude agent: the log lags, `settings.json` is
-    global. `herdr pane read <pane>` settles it.
+  - `thread?` — a Claude agent under `--resume`. The model prints as
+    `(indeterminado)`, because there is no reliable off-screen source for one:
+    the session file is a *log* that a live `/model` does not update until the
+    next message, and `settings.json` is global. `herdr pane read <pane>`
+    settles it. The guessed name is deliberately **not** printed anywhere,
+    including `SRC`: on 2026-09-10 this column read `claude-fable-5-1` for four
+    agents already switched by hand to Sonnet 5 and Opus 5, and
+    `herdr-agents | grep -i fable` sent the user chasing a ghost twice. In a
+    field people use to hunt cost, a stale guess is worse than an admitted
+    unknown — and keeping it in any column just moves the false positive.
   - `global` — the `config.toml`/`settings.json` default, which the interactive
     `/model` rewrites, silently changing every agent that inherits it.
 
