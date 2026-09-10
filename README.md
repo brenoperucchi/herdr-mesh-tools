@@ -96,15 +96,24 @@ exception, and the comment next to it explains why.
 - **`herdr-fix-names [--dry-run] [--space <label>]`** — repairs the `name` of
   agents Herdr has lost, matching each live pane to its expected role by
   position (exec is the left column, `rev-1` top-right, `rev-2` bottom-right,
-  scout its own tab). Deliberately a stopgap: `name` and `interactive_ready`
-  are written together by the *durable* path, which is `herdr agent start` —
-  `herdr agent rename` writes the name somewhere volatile, so a repaired name
-  disappears at the next registry reset. Measured 2026-09-09 across 41 agents
+  scout its own tab). Treat it as a stopgap: names repaired this way have been
+  observed disappearing on their own. Measured 2026-09-09 across 41 agents,
   with no exception: 20/20 named agents had `interactive_ready=True`, 21/21
   unnamed ones had the field absent, and 15 names repaired by hand undid
-  themselves within hours. So the script *says so*: it warns when a
-  reviewer/scout lacks the durable registration (there the real fix is
-  `agent start`), and only for `-exec` is rename the sole option — restarting
+  themselves within hours — only the ones created via `herdr agent start`
+  survived.
+
+  **Why that happens is not established.** An earlier version of this file
+  claimed `herdr agent rename` "writes the name somewhere volatile"; that was
+  **wrong**, and is corrected here. `~/.config/herdr/session.json` stores
+  `agent_name` per pane, and names set by `rename` are in it — persistence is
+  not the difference. The current hypothesis, untested, is that the binding is
+  to the agent *session* rather than to the pane, so replacing the process
+  (a `mise` auto-update was observed mid-session) drops it. Until that is
+  reproduced, the script reports what is measurable and does not explain it:
+  it warns when a reviewer/scout lacks `interactive_ready` (there the sturdier
+  fix is `agent start`, which has empirically survived both a registry reset
+  and a reboot), and for `-exec` rename is the only option anyway — restarting
   one would kill a session with a human behind it.
 
 ### Shared modules (not CLIs)

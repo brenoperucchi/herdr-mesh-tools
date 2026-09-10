@@ -1,11 +1,14 @@
 """Testes do herdr-fix-names.
 
-O script existe por causa do achado de 2026-09-09: `name` e `interactive_ready`
-sao gravados juntos pelo caminho duravel do `agent start`, e o `rename` grava o
-nome num lugar volatil. Reparar a mesh na mao (15 renames) se desfez sozinho em
-horas. Estes testes travam o que o reparo automatico NAO pode fazer errado --
-renomear o pane errado e' pior que deixar sem nome, porque um despacho de
-revisao passa a acertar o alvo errado em silencio.
+O script existe por causa do medido em 2026-09-09: os 15 nomes reparados a mao
+com `rename` se desfizeram sozinhos em horas, enquanto os criados via
+`agent start` sobreviveram (e depois aguentaram um reboot). A explicacao que
+este arquivo dava antes -- "rename grava num lugar volatil" -- estava ERRADA:
+o session.json guarda `agent_name` e os nomes do rename estao la. O mecanismo
+segue desconhecido; o que estes testes travam e' o que o reparo automatico NAO
+pode fazer errado, independente da causa -- renomear o pane errado e' pior que
+deixar sem nome, porque um despacho de revisao passa a acertar o alvo errado
+em silencio.
 """
 import importlib.util
 import os

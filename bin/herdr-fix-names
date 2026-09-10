@@ -2,24 +2,31 @@
 """herdr-fix-names [--dry-run] [--space <label>] — repara o `name` dos agents
 que o Herdr perdeu, casando cada pane vivo com o papel esperado no SPACES.
 
-POR QUE ISTO EXISTE (achado 2026-09-09, medido em 41 agents, sem excecao):
-`name` e `interactive_ready` sao gravados JUNTOS, pelo caminho DURAVEL do
-`herdr agent start`. Na medicao: 20/20 dos agents com nome tinham
-`interactive_ready=True`; 21/21 dos sem nome tinham o campo ausente.
+POR QUE ISTO EXISTE (medido 2026-09-09 em 41 agents, sem excecao):
+20/20 dos agents COM nome tinham `interactive_ready=True`; 21/21 dos SEM nome
+tinham o campo ausente. E dos 15 nomes que reparei a mao com `rename`, todos
+se desfizeram sozinhos em horas -- sobreviveram so os criados via
+`herdr agent start`, que depois aguentaram tambem um reboot.
 
-Consequencia pratica: `herdr agent rename` grava o nome num lugar VOLATIL.
-Ele repara a mesh AGORA (a mesh volta a ficar legivel e despachavel), mas o
-nome some no proximo reset do registro. Confirmado duas vezes no mesmo dia:
-15 nomes reparados com rename se desfizeram sozinhos em horas, e continuaram
-ausentes depois de um reboot.
+CUIDADO COM A EXPLICACAO. Uma versao anterior deste arquivo afirmava que
+"`rename` grava o nome num lugar VOLATIL". Isso estava ERRADO e fica
+registrado aqui como correcao: `~/.config/herdr/session.json` guarda
+`agent_name` por pane, e os nomes postos por `rename` estao la. Persistencia
+em disco nao e' a diferenca entre os dois caminhos.
 
-Entao este script e' PALIATIVO por desenho, e assume isso explicitamente:
-- Para revisor/scout, o reparo certo e' `herdr agent start` (mata o processo e
-  registra durave1). Este script AVISA quando encontra um desses sem registro
-  duravel, em vez de fingir que o rename resolveu.
+O mecanismo real segue DESCONHECIDO. Hipotese atual, nao reproduzida: o
+vinculo nome<->pane e' com a *sessao* do agent, nao com o pane, entao
+substituir o processo (houve auto-update do `mise` no meio da sessao) desfaz
+a associacao. Enquanto isso nao for reproduzido em ambiente controlado, este
+script reporta o que da pra medir e nao explica o que nao sabe.
+
+Na pratica, entao:
+- Para revisor/scout, `herdr agent start` e' o caminho que empiricamente
+  aguentou reset de registro E reboot. Este script AVISA quando encontra um
+  desses sem `interactive_ready`, em vez de fingir que o rename resolveu.
 - Para `-exec` nao existe alternativa: reiniciar mata a sessao que tem um
   humano atras dela (mesmo motivo pelo qual o SPACES nao bootstrapa exec).
-  Para eles, rename e' o unico caminho, e reaplicar a cada reset e' o custo.
+  Para eles, rename e' o unico caminho, e reaplicar quando sumir e' o custo.
 
 Uso:
   herdr-fix-names --dry-run          # mostra o que faria, nao toca em nada
@@ -142,8 +149,9 @@ def main():
             nome, kind_esperado = alvo
 
             if ag.get("name") == nome:
-                # ja certo. Mas registra se o registro e' volatil: rename nao
-                # sobrevive ao proximo reset, e para rev/scout ha caminho melhor.
+                # ja certo. Mas registra quando falta `interactive_ready`:
+                # empiricamente esses nomes somem, e para rev/scout ha um
+                # caminho que aguentou reset e reboot (`agent start`).
                 if ag.get("interactive_ready") is not True and papel != "exec":
                     volateis.append(f"{nome} ({pane_id}): nome ok, mas SEM registro duravel — "
                                     f"o reparo real e' `herdr agent start {nome} "
@@ -182,7 +190,7 @@ def main():
     for a in avisos:
         print(f"  aviso: {a}")
     if volateis:
-        print("\n  Registro volatil (o nome esta certo agora, mas some no proximo reset):")
+        print("\n  Sem interactive_ready (nome certo agora, mas historicamente some sozinho):")
         for v in volateis:
             print(f"    {v}")
 
