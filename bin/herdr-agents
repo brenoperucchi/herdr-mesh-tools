@@ -121,10 +121,38 @@ def from_codex_rollout(uuid):
     return model, effort
 
 
+def from_claude_session(uuid):
+    """Modelo do ULTIMO registro da sessao Claude daquele uuid.
+
+    Mesma logica do rollout do Codex, e pelo mesmo motivo: `claude --resume
+    <uuid>` restaura o modelo gravado na sessao, nao o default global. Faltava
+    este lado ate 2026-09-10, e a omissao escondia o caso mais caro -- quatro
+    agentes rodando `claude-fable-5-1` ($10/$50, o dobro do Opus) apareciam
+    aqui como `(opus[1m])` porque o script so sabia consultar o settings.json.
+    A ferramenta que existe pra achar drift de modelo estava cega no pior
+    drift. O effort nao e' gravado na sessao, entao segue vindo do global."""
+    import glob
+    achados = glob.glob(os.path.join(HOME, ".claude", "projects", "**", f"*{uuid}*"),
+                        recursive=True)
+    if not achados:
+        return None
+    modelo = None
+    try:
+        with open(achados[0], errors="ignore") as f:
+            for linha in f:
+                for m in re.finditer(r'"model"\s*:\s*"([^"]+)"', linha):
+                    modelo = m.group(1)
+    except OSError:
+        return None
+    return modelo
+
+
 def resume_uuid(argv):
-    """UUID quando o processo subiu via `codex resume <uuid>`."""
+    """UUID quando o processo subiu via `codex resume <uuid>` ou
+    `claude --resume <uuid>` -- as duas familias restauram sessao, cada uma
+    com sua sintaxe."""
     for i, a in enumerate(argv):
-        if a == "resume" and i + 1 < len(argv):
+        if a in ("resume", "--resume") and i + 1 < len(argv):
             return argv[i + 1]
     return None
 
@@ -154,6 +182,13 @@ def resolve(agent):
         rm, re_ = from_codex_rollout(uuid)
         if rm or re_:
             return rm or "?", re_ or "?", "thread"
+    if uuid and kind == "claude":
+        cm = from_claude_session(uuid)
+        if cm:
+            # a sessao Claude grava o modelo, nao o effort: o effort continua
+            # herdado, entao a origem mista e' marcada como "thread*"
+            _dm, de = defaults_claude()
+            return cm, f"({de})" if de else "?", "thread*"
 
     dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
     return dm or "?", de or "?", "global"

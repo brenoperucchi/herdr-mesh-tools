@@ -57,8 +57,11 @@ exception, and the comment next to it explains why.
   says where the model/effort actually came from, because the three sources
   disagree in practice:
   - `argv` — pinned at launch. The only one an operator chose.
-  - `thread` — the process came up as `codex resume <uuid>`, so the values are
-    the session's *final* state, read from its rollout. Measured 2026-09-10:
+  - `thread` / `thread*` — the process came up as `codex resume <uuid>` or
+    `claude --resume <uuid>`, so the values are the session's *final* state,
+    read from its rollout. The star means partial: a Claude session records the
+    model but not the effort, so only the model is authoritative there.
+    Measured 2026-09-10:
     resume restores this faithfully — `llm-bench-scout` runs `gpt-5.6-luna max`
     while the global default is `gpt-6-astra`, which would be impossible if it
     fell back to the default. Read the *last* record, not the first: a Codex
