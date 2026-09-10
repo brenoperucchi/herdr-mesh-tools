@@ -5,6 +5,14 @@ status | cwd | kind | model | effort | name | pane_id | tab_id
 MODEL/EFFORT saem do argv REAL do processo (`herdr pane process-info`), nao da
 config esperada — o ponto e' justamente enxergar divergencia.
 
+Confiabilidade por origem (coluna SRC):
+  argv     autoritativo — pinado no lancamento
+  thread   autoritativo — rollout do Codex reflete o estado final da sessao
+  thread?  INDICATIVO   — sessao Claude e' historico; um `/model` ao vivo nao
+                          aparece ali ate a proxima mensagem, e o modelo vem
+                          prefixado com `~`. So `herdr pane read` decide.
+  global   frouxo       — default de config, que o /model reescreve
+
 Valor entre (parenteses) = HERDADO, nao pinado no lancamento: o processo subiu
 sem `--model`/`--effort`, entao esta usando o default de ~/.codex/config.toml ou
 ~/.claude/settings.json. Isso importa porque esses arquivos sao REESCRITOS pelo
@@ -185,10 +193,18 @@ def resolve(agent):
     if uuid and kind == "claude":
         cm = from_claude_session(uuid)
         if cm:
-            # a sessao Claude grava o modelo, nao o effort: o effort continua
-            # herdado, entao a origem mista e' marcada como "thread*"
+            # `~` = INDICATIVO, nao autoritativo. O arquivo de sessao e'
+            # historico: um `/model` na sessao viva troca o modelo SEM gravar
+            # registro novo enquanto nao houver mensagem depois. Medido
+            # 2026-09-10, com o usuario apontando o erro: quatro agentes que o
+            # arquivo dava como `claude-fable-5-1` ja tinham sido trocados a
+            # mao pra Sonnet 5 / Opus 5, e a tela do pane provava.
+            #
+            # Nao ha fonte confiavel fora da tela pra um Claude restaurado: o
+            # arquivo atrasa, o settings.json e' global. Entao marca a duvida
+            # em vez de afirmar -- `herdr pane read <pane>` e' quem decide.
             _dm, de = defaults_claude()
-            return cm, f"({de})" if de else "?", "thread*"
+            return f"~{cm}", f"({de})" if de else "?", "thread?"
 
     dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
     return dm or "?", de or "?", "global"

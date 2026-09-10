@@ -57,16 +57,22 @@ exception, and the comment next to it explains why.
   says where the model/effort actually came from, because the three sources
   disagree in practice:
   - `argv` — pinned at launch. The only one an operator chose.
-  - `thread` / `thread*` — the process came up as `codex resume <uuid>` or
-    `claude --resume <uuid>`, so the values are the session's *final* state,
-    read from its rollout. The star means partial: a Claude session records the
-    model but not the effort, so only the model is authoritative there.
+  - `thread` — the process came up as `codex resume <uuid>`; the values are the
+    session's final state, read from its rollout, and are authoritative.
     Measured 2026-09-10:
     resume restores this faithfully — `llm-bench-scout` runs `gpt-5.6-luna max`
     while the global default is `gpt-6-astra`, which would be impossible if it
     fell back to the default. Read the *last* record, not the first: a Codex
     `thread_settings_applied` event was seen demoting `high` to `medium`
     mid-session.
+  - `thread?` — a Claude agent under `--resume`. **Indicative only**, and the
+    model is printed with a leading `~`. A Claude session file is a *log*: a
+    `/model` issued in the live session changes the model without writing a new
+    record until the next message, so this can be stale. Measured the hard way
+    on 2026-09-10 — four agents this read as `claude-fable-5-1` had already
+    been switched by hand to Sonnet 5 and Opus 5. There is no reliable source
+    off-screen for a restored Claude agent: the log lags, `settings.json` is
+    global. `herdr pane read <pane>` settles it.
   - `global` — the `config.toml`/`settings.json` default, which the interactive
     `/model` rewrites, silently changing every agent that inherits it.
 
