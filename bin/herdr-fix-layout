@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""herdr-fix-layout [--dry-run] [--space <slug>] — restaura o layout canonico da
+tab 1 de cada space:
+
+    exec | rev-1
+         | rev-2
+
+POR QUE EXISTE: todo restart de agent fecha o pane e splita outro, e `pane
+split` so sabe colocar o novo a DIREITA ou ABAIXO do alvo -- nunca reconstroi a
+coluna. Depois de uma leva de restarts o resultado tipico e' tudo empilhado
+numa coluna so, ou o rev-2 acima do rev-1. Quebrou tres vezes em 2026-09-10, as
+tres por restarts meus, e as tres vezes quem notou foi o usuario.
+
+Isso nao e' so estetica: o herdr-fix-names infere o PAPEL de cada pane pela
+posicao (exec e' a coluna esquerda, rev-1 topo-direita, rev-2 baixo-direita).
+Layout quebrado faz o reparo de nomes mirar no alvo errado.
+
+A receita, que e' o unico jeito que funciona: estacionar os dois revisores numa
+tab temporaria e devolve-los na ordem certa. Nao da pra fazer no lugar porque
+`--split right|down` posiciona o pane MOVIDO depois do alvo, entao pro exec
+terminar a esquerda ele precisa ser sempre o alvo, nunca o movido.
+
+Idempotente: um space ja correto e' reportado como `ok` sem ser tocado.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+PAPEIS = ("-rev-1", "-rev-2", "-scout", "-exec")
+
+
+def slug_de(nome):
+    for s in PAPEIS:
+        if nome.endswith(s):
+            return nome[: -len(s)]
+    return nome
+
+
+def esta_correto(lay, ex, r1, r2):
+    rects = {p["pane_id"]: p["rect"] for p in lay["panes"]}
+    if not lay.get("splits") or lay["splits"][0]["direction"] != "right":
+        return False
+    for a in (ex, r1, r2):
+        if a["pane_id"] not in rects:
+            return False
+    return (rects[ex["pane_id"]]["x"] == 0
+            and rects[r1["pane_id"]]["x"] > 0
+            and rects[r2["pane_id"]]["x"] > 0
+            and rects[r1["pane_id"]]["y"] < rects[r2["pane_id"]]["y"])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--space", default=None, help="so este slug")
+    args = ap.parse_args()
+
+    ags = {a["name"]: a for a in core.api("agent", "list")["agents"] if a.get("name")}
+    corrigidos = ok = pulados = 0
+
+    for slug in sorted({slug_de(n) for n in ags}):
+        if args.space and slug != args.space:
+            continue
+        ex, r1, r2 = ags.get(f"{slug}-exec"), ags.get(f"{slug}-rev-1"), ags.get(f"{slug}-rev-2")
+        if not (ex and r1 and r2):
+            pulados += 1
+            print(f"  pulado {slug}: trio exec/rev-1/rev-2 incompleto")
+            continue
+        tab, ws = ex["tab_id"], ex["workspace_id"]
+        if not (r1["tab_id"] == tab and r2["tab_id"] == tab):
+            pulados += 1
+            print(f"  pulado {slug}: revisores nao estao na tab do exec")
+            continue
+
+        lay = core.api("pane", "layout", "--pane", ex["pane_id"])["layout"]
+        if esta_correto(lay, ex, r1, r2):
+            ok += 1
+            print(f"  ok     {slug}")
+            continue
+
+        if args.dry_run:
+            corrigidos += 1
+            print(f"  [dry-run] {slug}: reposicionaria {r1['name']} e {r2['name']}")
+            continue
+
+        try:
+            tmp = core.api("pane", "move", r2["pane_id"], "--new-tab",
+                           "--workspace", ws, "--no-focus")
+            tmp_tab = tmp["move_result"]["pane"]["tab_id"]
+            core.api("pane", "move", r1["pane_id"], "--tab", tmp_tab, "--split", "down",
+                     "--target-pane", r2["pane_id"], "--no-focus")
+            core.api("pane", "move", r1["pane_id"], "--tab", tab, "--split", "right",
+                     "--target-pane", ex["pane_id"], "--no-focus")
+            core.api("pane", "move", r2["pane_id"], "--tab", tab, "--split", "down",
+                     "--target-pane", r1["pane_id"], "--no-focus")
+            corrigidos += 1
+            print(f"  FIX    {slug}")
+        except RuntimeError as exc:
+            pulados += 1
+            print(f"  ERRO   {slug}: {exc}")
+
+    verbo = "a corrigir" if args.dry_run else "corrigido(s)"
+    print(f"\n{corrigidos} {verbo}, {ok} ja ok, {pulados} pulado(s)")
+
+
+if __name__ == "__main__":
+    main()

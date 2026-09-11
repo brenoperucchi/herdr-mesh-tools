@@ -221,6 +221,16 @@ def resume_uuid(argv):
     return None
 
 
+def sem_prefixo_do_kind(modelo, kind):
+    """Tira o prefixo redundante com a coluna KIND: `claude-sonnet-5` vira
+    `sonnet-5`, porque a linha ja diz `claude` do lado. Os ids do Codex nao
+    carregam prefixo (`gpt-6-astra`), entao passam intactos."""
+    if not modelo:
+        return modelo
+    pref = f"{kind}-"
+    return modelo[len(pref):] if modelo.startswith(pref) else modelo
+
+
 def resolve(agent):
     """(model, effort, origem) do pane.
 
@@ -294,9 +304,11 @@ def main():
 
     linhas = []
     for a, (model, effort, origem) in zip(agents, modelos):
+        kind = a.get("agent", "?")
         linhas.append([
-            a.get("agent_status", "?"), a.get("cwd", "?"), a.get("agent", "?"),
-            model, effort, origem, a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
+            a.get("agent_status", "?"), a.get("cwd", "?"), kind,
+            sem_prefixo_do_kind(model, kind), effort, origem,
+            a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
         ])
     linhas.sort(key=lambda r: (r[6] == "", r[6], r[7]))  # sem nome por ultimo
 

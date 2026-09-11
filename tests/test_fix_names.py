@@ -82,3 +82,31 @@ class BuildExpectedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NuncaRebaixaTests(unittest.TestCase):
+    """2026-09-10: o script renomeou `omaspotlight-rev-1` -> `omaspotlight-rev`,
+    destruindo um nome certo. Causa: migration-state.json ausente na raiz
+    daquele space (o slug diverge do diretorio -- "omaspotlight" vive em
+    ~/Devs/omarchy-spotlight), entao read_migration_state caiu no default
+    `legacy` e o nome esperado virou o da convencao antiga.
+
+    O reparo de nome nunca deve ANDAR PARA TRAS: `-rev-1` e' a convencao viva
+    dos 12 spaces, e rebaixar e' sempre regressao, qualquer que seja o motivo."""
+
+    def setUp(self):
+        self.fix = _load("herdr-fix-names", "fix_names_rebaixa")
+
+    def test_rev1_vivo_nunca_vira_rev(self):
+        """A condicao exata do guard: nome vivo == esperado + '-1'."""
+        vivo, esperado = "omaspotlight-rev-1", "omaspotlight-rev"
+        self.assertEqual(vivo, f"{esperado}-1",
+                         "o guard compara nome vivo com esperado+'-1'; se esta "
+                         "igualdade mudar de forma, a protecao para de valer")
+
+    def test_guard_esta_no_codigo(self):
+        """Trava textual: o guard e' curto e some facil num refactor."""
+        import os
+        fonte = open(os.path.join(BIN_DIR, "herdr-fix-names")).read()
+        self.assertIn('if ag.get("name") == f"{nome}-1":', fonte)
+        self.assertIn("RECUSADO", fonte)

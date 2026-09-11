@@ -163,6 +163,23 @@ def main():
                               f"para {nome} — NAO renomeei (pode ser swap deliberado)")
                 continue
 
+            # NUNCA rebaixar `-rev-1` de volta para `-rev`. Isso so acontece
+            # quando migration-state.json esta ausente/errado, e o efeito e'
+            # destruir um nome CERTO -- aconteceu em 2026-09-10 com o
+            # omaspotlight-rev-1, cujo estado estava faltando porque o slug
+            # diverge do diretorio (space "omaspotlight", cwd
+            # ~/Devs/omarchy-spotlight) e o arquivo tinha sido escrito no lugar
+            # errado. O script mirou no alvo certo e escreveu o nome de uma
+            # convencao que nenhum space usa mais.
+            if ag.get("name") == f"{nome}-1":
+                avisos.append(
+                    f"{label}: '{ag['name']}' ja esta na convencao nova e este "
+                    f"script quis rebaixar para '{nome}' — RECUSADO. Sinal de "
+                    f"migration-state.json ausente ou em cwd errado; confira "
+                    f"`read_migration_state` da raiz deste space."
+                )
+                continue
+
             dono = nomes_vivos.get(nome)
             if dono and dono != pane_id:
                 avisos.append(f"{label}: '{nome}' ja pertence a {dono} — NAO renomeei {pane_id} (fail-closed)")

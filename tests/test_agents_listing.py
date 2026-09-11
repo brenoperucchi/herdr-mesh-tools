@@ -91,3 +91,27 @@ class ClaudeDefaultsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrefixoDoKindTests(unittest.TestCase):
+    """A coluna KIND ja diz `claude`, entao `claude-sonnet-5` em MODEL repete a
+    informacao e rouba largura da linha. Pedido do usuario 2026-09-10."""
+
+    def setUp(self):
+        self.m = _load()
+
+    def test_claude_prefix_is_dropped(self):
+        self.assertEqual(self.m.sem_prefixo_do_kind("claude-sonnet-5", "claude"), "sonnet-5")
+        self.assertEqual(self.m.sem_prefixo_do_kind("claude-fable-5-1", "claude"), "fable-5-1")
+
+    def test_codex_ids_pass_through(self):
+        """gpt-6-astra nao comeca com `codex-`, entao nada a tirar."""
+        self.assertEqual(self.m.sem_prefixo_do_kind("gpt-6-astra", "codex"), "gpt-6-astra")
+
+    def test_alias_from_argv_is_untouched(self):
+        """`--model opus` ja vem curto; nao vira string vazia nem perde letra."""
+        self.assertEqual(self.m.sem_prefixo_do_kind("opus", "claude"), "opus")
+
+    def test_no_model_survives(self):
+        self.assertEqual(self.m.sem_prefixo_do_kind("(indeterminado)", "claude"), "(indeterminado)")
+        self.assertIsNone(self.m.sem_prefixo_do_kind(None, "claude"))

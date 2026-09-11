@@ -117,6 +117,19 @@ exception, and the comment next to it explains why.
   `phase=migrating` marker, and a re-check under the lock. All spaces have
   already been through it — it stays for a space restored from an old backup.
 
+- **`herdr-fix-layout [--dry-run] [--space <slug>]`** — restores tab 1 to
+  `exec | rev-1 / rev-2`. Every agent restart closes a pane and splits another,
+  and `pane split` can only place the new pane to the *right of* or *below* its
+  target — it never rebuilds the column, so a batch of restarts typically ends
+  with everything stacked in one column, or `rev-2` above `rev-1`. This broke
+  three times on 2026-09-10, every time from restarts, every time spotted by the
+  user rather than by tooling. It is not cosmetic: `herdr-fix-names` infers each
+  pane's *role* from its position, so a broken layout makes the name repair aim
+  at the wrong pane. The fix parks both reviewers in a temporary tab and brings
+  them back in order — it cannot be done in place, because the moved pane always
+  lands after the target, so the exec has to be the target and never the moved
+  one. Idempotent: a correct space is reported `ok` and left alone.
+
 - **`herdr-fix-names [--dry-run] [--space <label>]`** — repairs the `name` of
   agents Herdr has lost, matching each live pane to its expected role by
   position (exec is the left column, `rev-1` top-right, `rev-2` bottom-right,
