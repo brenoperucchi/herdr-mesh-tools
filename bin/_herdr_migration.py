@@ -509,8 +509,16 @@ def extra_args_for_rev2(kind):
         # ninguem ter decidido isso. "high", nao "max": max fica por override de
         # space (o "llm" ja faz), porque o span de ~10x entre os extremos torna
         # max universal uma decisao de orcamento que os benchmarks nao sustentam.
-        # xhigh (decisao 2026-09-10): o rev-2 e' a "lente cara" do par cego, e
-        # so era cara no modelo -- o effort vinha herdado. Com o rev-1 em
-        # medium, a assimetria do achado de 2026-08-26 volta a existir de fato.
-        return ["--model", "opus", "--effort", "xhigh"]
+        # low (decisao 2026-09-11, revisando o xhigh do dia anterior): o limite
+        # semanal da Anthropic estava em 60% com 4 dias e meio pra reset, e o
+        # raciocinio do rev-2 e' o maior consumo controlavel do mesh -- 12
+        # agentes em Opus, o modelo caro, no maior effort.
+        #
+        # O par cego deixa de ser "rede larga barata + lente cara" e passa a ser
+        # duas lentes baratas com FAMILIAS diferentes (Codex no rev-1, Claude no
+        # rev-2). A diversidade de familia, que sempre foi o ponto principal do
+        # par, continua intacta; o que se perde e' profundidade de raciocinio no
+        # segundo revisor. Decisao de custo consciente, revisitavel quando o
+        # limite resetar.
+        return ["--model", "opus", "--effort", "low"]
     return []
