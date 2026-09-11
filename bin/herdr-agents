@@ -294,6 +294,15 @@ def main():
     ap.add_argument("--name", default="", help="so agents cujo cwd contem este texto")
     args = ap.parse_args()
 
+    # ordem dos workspaces como o Herdr numera (a mesma da sidebar): MFC e' o
+    # 1 e `herdr` o ultimo, entao ordenar por nome do agent punha o MFC no meio
+    # e nao batia com o que o usuario ve na tela.
+    try:
+        ordem_ws = {w["workspace_id"]: w.get("number", 999)
+                    for w in api("workspace", "list")["workspaces"]}
+    except RuntimeError:
+        ordem_ws = {}
+
     agents = api("agent", "list")["agents"]
     if args.name:
         f = args.name.lower()
@@ -309,13 +318,26 @@ def main():
             a.get("agent_status", "?"), a.get("cwd", "?"), kind,
             sem_prefixo_do_kind(model, kind), effort, origem,
             a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
+            a.get("workspace_id", ""),   # so pra ordenar; nao e' impressa
         ])
-    linhas.sort(key=lambda r: (r[6] == "", r[6], r[7]))  # sem nome por ultimo
+    # workspace na ordem do Herdr; dentro dele, papel na ordem do layout
+    # (exec, rev-1, rev-2, scout) em vez de alfabetica -- `-exec` vem depois de
+    # `-rev-1` no alfabeto, o que inverteria a leitura natural de cada space.
+    PAPEL = {"-exec": 0, "-rev-1": 1, "-rev-2": 2, "-scout": 3}
+
+    def peso_papel(nome):
+        for suf, i in PAPEL.items():
+            if nome.endswith(suf):
+                return i
+        return 9
+
+    linhas.sort(key=lambda r: (r[6] == "", ordem_ws.get(r[9], 999),
+                               peso_papel(r[6]), r[6]))
 
     head = ["AGENT", "CWD", "KIND", "MODEL", "EFFORT", "SRC", "NAME", "PANE_ID", "TAB_ID"]
     larguras = [max(len(str(r[i])) for r in [head] + linhas) for i in range(len(head))]
     for r in [head] + linhas:
-        print("  ".join(str(c).ljust(w) for c, w in zip(r, larguras)).rstrip())
+        print("  ".join(str(c).ljust(w) for c, w in zip(r[:len(head)], larguras)).rstrip())
 
 
 if __name__ == "__main__":

@@ -115,3 +115,32 @@ class PrefixoDoKindTests(unittest.TestCase):
     def test_no_model_survives(self):
         self.assertEqual(self.m.sem_prefixo_do_kind("(unknown)", "claude"), "(unknown)")
         self.assertIsNone(self.m.sem_prefixo_do_kind(None, "claude"))
+
+
+class OrdemDaListagemTests(unittest.TestCase):
+    """A tabela deve sair na MESMA ordem que o usuario ve na sidebar do Herdr.
+    Ordenar por nome do agent punha o MFC (workspace numero 1) no meio da lista,
+    entre llm-* e omabackup-*, e o usuario reportou como se o space estivesse
+    faltando -- 2026-09-11."""
+
+    def setUp(self):
+        self.m = _load()
+
+    def test_exec_vem_antes_dos_revisores(self):
+        """Alfabeticamente `-exec` cai DEPOIS de `-rev-1`; a ordem do layout
+        (exec, rev-1, rev-2, scout) e' a que se le naturalmente."""
+        import re
+        fonte = open(os.path.join(BIN_DIR, "herdr-agents")).read()
+        m = re.search(r'PAPEL\s*=\s*\{([^}]*)\}', fonte)
+        self.assertIsNotNone(m, "o mapa de peso por papel sumiu")
+        pesos = m.group(1)
+        self.assertLess(pesos.index('"-exec"'), pesos.index('"-rev-1"'))
+        self.assertLess(pesos.index('"-rev-1"'), pesos.index('"-rev-2"'))
+        self.assertLess(pesos.index('"-rev-2"'), pesos.index('"-scout"'))
+
+    def test_ordena_por_numero_de_workspace(self):
+        """A chave de ordenacao precisa consultar a numeracao do Herdr, nao o
+        nome. Sem isso a tabela volta a divergir da sidebar."""
+        fonte = open(os.path.join(BIN_DIR, "herdr-agents")).read()
+        self.assertIn('api("workspace", "list")', fonte)
+        self.assertIn("ordem_ws.get(", fonte)
