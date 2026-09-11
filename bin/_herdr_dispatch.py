@@ -456,6 +456,31 @@ def dispatch_and_wait_all(prompts, timeout_s):
     info = {}
     settle_ts = {}
     blocked_since = dict.fromkeys(procs)
+    reenviados = set()   # ping-pong: quem ja teve UMA segunda tentativa
+
+    def prompt_chegou(name, texto):
+        """O prompt aparece no pane? Usa o caminho do diretorio de veredito como
+        marcador -- ele e' unico por rodada e por revisor, entao nao casa com
+        entrega de rodada anterior.
+
+        Existe porque `agent_prompt_stalled` e' AMBIGUO: o Herdr so diz que
+        aceitou a submissao e nao viu mudanca de estado em 5s, o que cobre tanto
+        "nao chegou" quanto "chegou e o agent demorou a comecar". Ate 2026-09-11
+        o dispatcher tratava os dois como falha e desistia; um Codex lento virava
+        rodada perdida em silencio (achado do mfc-exec na rodada mfc-34, onde
+        mfc-rev-1 ficou parado e mfc-rev-2 respondeu normalmente)."""
+        marcador = next((t for t in texto.split() if "/.herdr/" in t), None)
+        if not marcador:
+            return None          # sem marcador confiavel: nao afirma nada
+        try:
+            out = subprocess.run(
+                herdr_argv("agent", "read", name, "--source", "recent-unwrapped",
+                           "--lines", "60"),
+                capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return marcador.rstrip(".,;:") in out.stdout
 
     def finish(name, status, detail):
         result[name] = status
@@ -487,7 +512,31 @@ def dispatch_and_wait_all(prompts, timeout_s):
                 elif code == "timeout":
                     finish(name, "timeout", message)
                 elif code == "agent_prompt_stalled":
-                    finish(name, "stalled", message)
+                    # Antes de desistir, confere se o prompt chegou. Se nao
+                    # chegou, uma segunda tentativa -- e so uma, pra nao entrar
+                    # em laco nem duplicar prompt num agent que so estava lento.
+                    chegou = prompt_chegou(name, prompts[name])
+                    if chegou is False and name not in reenviados:
+                        reenviados.add(name)
+                        procs[name] = subprocess.Popen(
+                            herdr_argv("agent", "prompt", name, prompts[name],
+                                       "--wait", "--until", "idle", "--until", "done",
+                                       "--timeout", str(timeout_s * 1000)),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                        continue
+                    if chegou is True:
+                        # chegou: o `stalled` era falso negativo (agent lento).
+                        # Segue esperando o assentamento pelo caminho normal.
+                        procs[name] = subprocess.Popen(
+                            herdr_argv("agent", "wait", name,
+                                       "--until", "idle", "--until", "done",
+                                       "--timeout", str(timeout_s * 1000)),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                        continue
+                    sufixo = " (reenviado uma vez, sem sucesso)" if name in reenviados else ""
+                    finish(name, "stalled", (message or "") + sufixo)
                 else:
                     finish(name, "error", message or f"exit {ret}")
                 continue

@@ -119,3 +119,49 @@ class SessionIsolationTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HERDR_SESSION": "testlab"}):
             argv = self.core.herdr_argv("agent", "list")
         self.assertEqual(argv[1:], ["--session", "testlab", "agent", "list"])
+
+
+class ConfirmacaoDeEntregaTests(unittest.TestCase):
+    """Achado do mfc-exec na rodada mfc-34 (2026-09-11): o request.md foi
+    escrito identico pros dois revisores, mas so o mfc-rev-2 comecou a
+    trabalhar. O mfc-rev-1 (Codex) ficou parado, e o metrics registrou
+    `status: stalled` com settle_ts 6s apos o dispatch.
+
+    Causa: `agent_prompt_stalled` e' AMBIGUO -- o Herdr so afirma que aceitou a
+    submissao e nao observou mudanca de estado em 5s, o que cobre tanto "nao
+    chegou" quanto "chegou e o agent demorou a comecar". O dispatcher tratava os
+    dois como falha e desistia, entao um Codex lento virava rodada perdida sem
+    ninguem notar ate alguem ler o pane a mao."""
+
+    def setUp(self):
+        self.core = _load("_herdr_dispatch.py")
+
+    def test_marcador_de_entrega_e_o_diretorio_da_rodada(self):
+        """O marcador precisa ser unico POR RODADA: usar so o nome do agent
+        casaria com a entrega de uma rodada anterior ainda visivel no pane."""
+        texto = ("Você foi chamado pelo dispatcher como `mfc-rev-1`. Leia "
+                 "/home/x/.herdr/ask/mfc-34/mfc-rev-1/request.md e siga o protocolo.")
+        marcador = next((t for t in texto.split() if "/.herdr/" in t), None)
+        self.assertIsNotNone(marcador)
+        self.assertIn("mfc-34", marcador, "sem o numero da rodada o marcador nao discrimina")
+
+    def test_reenvia_no_maximo_uma_vez(self):
+        """Uma segunda tentativa resolve agent lento; um laco de tentativas
+        duplicaria o prompt e poderia disparar a revisao duas vezes."""
+        fonte = open(os.path.join(BIN_DIR, "_herdr_dispatch.py")).read()
+        self.assertIn("reenviados = set()", fonte)
+        self.assertIn("name not in reenviados", fonte)
+        self.assertIn("reenviados.add(name)", fonte)
+
+    def test_chegou_true_continua_esperando_em_vez_de_reenviar(self):
+        """Se o prompt chegou, reenviar seria duplicar. O caminho certo e'
+        seguir aguardando o assentamento."""
+        fonte = open(os.path.join(BIN_DIR, "_herdr_dispatch.py")).read()
+        self.assertIn("if chegou is True:", fonte)
+        self.assertIn('"agent", "wait", name', fonte)
+
+    def test_none_nao_e_tratado_como_falha(self):
+        """Sem marcador ou com falha de leitura, `prompt_chegou` devolve None --
+        e None nao pode acionar reenvio nem ser lido como entrega confirmada."""
+        fonte = open(os.path.join(BIN_DIR, "_herdr_dispatch.py")).read()
+        self.assertIn("chegou is False and name not in reenviados", fonte)
