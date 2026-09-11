@@ -167,7 +167,7 @@ SPACES = [
     # slug=label, sem divergencia; cwd e' o clone do fork, nao o plugin
     # instalado em ~/.config/omarchy/plugins (aquele e' git-managed pelo
     # `omarchy plugin update` e seria sobrescrito).
-    ("omaspotlight", f"{HOME}/Devs/omarchy-spotlight",
+    ("omaspotlight", f"{HOME}/Devs/GitHub/omarchy-spotlight",
         ("omaspotlight-exec", "claude", EXEC_ARGS),
         ("omaspotlight-scout", "codex", SCOUT_ARGS)),
     # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
