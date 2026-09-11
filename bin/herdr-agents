@@ -283,7 +283,7 @@ def resolve(agent):
             # deixa-lo no SRC como pista e o `grep -i fable` voltou a acusar
             # os mesmos quatro. Qualquer coluna serve pro grep -- entao a
             # unica saida honesta e' nao imprimir o palpite.
-            return "(indeterminado)", f"({de})" if de else "?", "thread?"
+            return "(unknown)", f"({de})" if de else "?", "thread?"
 
     dm, de = (defaults_codex() if kind == "codex" else defaults_claude())
     return dm or "?", de or "?", "global"

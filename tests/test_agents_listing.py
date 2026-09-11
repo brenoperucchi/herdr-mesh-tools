@@ -113,5 +113,5 @@ class PrefixoDoKindTests(unittest.TestCase):
         self.assertEqual(self.m.sem_prefixo_do_kind("opus", "claude"), "opus")
 
     def test_no_model_survives(self):
-        self.assertEqual(self.m.sem_prefixo_do_kind("(indeterminado)", "claude"), "(indeterminado)")
+        self.assertEqual(self.m.sem_prefixo_do_kind("(unknown)", "claude"), "(unknown)")
         self.assertIsNone(self.m.sem_prefixo_do_kind(None, "claude"))

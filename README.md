@@ -67,7 +67,7 @@ exception, and the comment next to it explains why.
     mid-session.
   - `thread?` — a Claude agent under `--resume` that has **not answered since
     the last `/model`**, so the log cannot be trusted. The model prints as
-    `(indeterminado)`:
+    `(unknown)`:
     the session file is a *log* that a live `/model` does not update until the
     next message, and `settings.json` is global. `herdr pane read <pane>`
     settles it. The guessed name is deliberately **not** printed anywhere,
