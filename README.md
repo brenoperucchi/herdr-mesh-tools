@@ -107,10 +107,14 @@ exception, and the comment next to it explains why.
 
 ### Changing a space
 
-- **`herdr-swap <slug> <role> <kind>`** — swaps the kind
+- **`herdr-swap <slug> <role> <kind> [--dry-run]`** — swaps the kind
   (`claude`/`codex`/`grok`/etc) of a workspace's agent (`exec`, `rev-1`,
   `rev-2`, `scout`, ...), preserving context via a handoff file written by the
   outgoing agent. Everything stays reversible until the old pane is closed.
+  `--dry-run` runs the real checks — agent state, migration gate, and the
+  human-composition heuristic on the pane — then prints the plan and stops
+  without touching anything. Worth running first: on 2026-09-12 it refused three
+  of eleven execs because they had unsent human text sitting in the compose box.
 - **`herdr-migrate-rev <slug>`** — renames a space's first reviewer from
   `<slug>-rev` to `<slug>-rev-1`. Not a swap: the kind, process, pane and cwd
   all stay: it is a `herdr agent rename` behind a lock, a durable

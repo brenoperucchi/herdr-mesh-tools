@@ -83,6 +83,8 @@ def main():
     ap.add_argument("kind")
     ap.add_argument("extra_args", nargs="*", help="passados pro novo agent depois de --")
     ap.add_argument("--timeout", type=int, default=180, help="segundos pra esperar o handoff ser escrito")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="percorre as checagens reais e imprime o plano; nao toca em nada")
     args = ap.parse_args()
 
     # Achado 2026-09-01: $HERDR_ENV vazio nao e mais suficiente pra recusar
@@ -131,6 +133,41 @@ def main():
     handoff_path = os.path.join(
         handoff_dir, f"{args.slug}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.md"
     )
+
+    if args.dry_run:
+        # Tudo acima ja rodou de verdade: agent get, checagem de estado, gate de
+        # migracao, e a heuristica de composicao humana no pane. O que segue e'
+        # so a narrativa do que aconteceria -- nenhuma escrita, nenhum prompt.
+        extras = " ".join(args.extra_args) or "(nenhum)"
+        print(f"[dry-run] plano de swap: {name}  {old_kind} -> {args.kind}")
+        print(f"  pane atual:   {pane_id}  (cwd {cwd})")
+        print(f"  raiz p/ gate: {migration_cwd}")
+        print(f"  args do novo: {extras}")
+        print()
+        print("  checagens que JA passaram (feitas de verdade agora):")
+        print(f"    - '{name}' existe e esta '{info['agent_status']}' (exige idle/done)")
+        print(f"    - nenhuma migracao em andamento neste space")
+        print(f"    - {pane_id} nao aparenta composicao humana nem dialogo pendente")
+        print()
+        print("  passos que SERIAM executados, em ordem:")
+        print(f"    1. pedir handoff ao {old_kind} atual, escrito em")
+        print(f"       {handoff_path}")
+        print(f"       (aborta se nao assentar em {args.timeout}s, ficar blocked, ou sair vazio")
+        print(f"        -- nos tres casos o processo antigo continua vivo e intacto)")
+        print(f"    2. dividir um pane novo ao lado de {pane_id}")
+        print(f"    3. subir '{args.kind}' nesse pane sob nome PROVISORIO")
+        print(f"       (se nao subir: fecha so o pane provisorio; '{name}' segue vivo)")
+        print(f"    4. confirmar que o novo respondeu")
+        print(f"    5. PONTO DE NAO RETORNO: fechar {pane_id} (mata o {old_kind})")
+        print(f"    6. renomear o provisorio para '{name}'")
+        print(f"    7. mandar o novo ler o handoff")
+        print()
+        print("  o que se perde de verdade: a conversa acumulada do agent atual.")
+        print("  o handoff e' um RESUMO escrito por ele, nao o historico -- e' lossy")
+        print("  por desenho, porque mandar scrollback bruto entre CLIs diferentes e'")
+        print("  pior. Para um -exec com sessao humana, isso significa que voce")
+        print("  recomeca a conversa a partir do resumo.")
+        return
 
     print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
     status, wait_info = dispatch_and_wait(name, HANDOFF_PROMPT.format(path=handoff_path), args.timeout)
