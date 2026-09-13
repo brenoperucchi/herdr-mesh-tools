@@ -155,6 +155,18 @@ def main():
                          "Fica entre o padrao (exige o LLM responder) e --sem-handoff (nao "
                          "resume nada). Aborta se o prompt truncar -- handoff truncado sai "
                          "fluente com identificadores inventados, que e' pior que nao ter.")
+    ap.add_argument("--em-tab-novo", action="store_true",
+                    help="sobe o substituto num TAB NOVO e PARA antes de fechar o antigo. "
+                         "Os dois ficam vivos ate voce rodar --finalizar. Para quando o "
+                         "agent trocado e' aquele com quem voce esta falando, ou quando o "
+                         "split no tab atual estragaria o layout.")
+    ap.add_argument("--handoff-pronto", metavar="ARQUIVO",
+                    help="usa um handoff JA ESCRITO em vez de pedir um ao agent que sai. "
+                         "Obrigatorio no auto-swap: o agent nao consegue responder a um "
+                         "prompt enquanto esta bloqueado rodando este comando.")
+    ap.add_argument("--finalizar", action="store_true",
+                    help="segunda fase de --em-tab-novo: fecha o antigo, promove o nome do "
+                         "provisorio, traz o pane pro tab original e fecha o tab temporario.")
     ap.add_argument("--no-verify", action="store_true",
                     help="pula o teste de verificacao pos-swap (por padrao ele roda)")
     ap.add_argument("--dry-run", action="store_true",
@@ -174,12 +186,20 @@ def main():
         print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
         sys.exit(1)
 
-    if info["agent_status"] not in ("idle", "done"):
-        print(f"erro: '{name}' está '{info['agent_status']}' — não troco em cima de trabalho em andamento (working/blocked)", file=sys.stderr)
-        sys.exit(1)
-
     old_kind = info["agent"]
     pane_id = info["pane_id"]
+
+    # Auto-swap: o alvo e' o agent DESTE pane. Muda o que os guards significam.
+    auto = bool(os.environ.get("HERDR_PANE_ID")) and os.environ["HERDR_PANE_ID"] == pane_id
+
+    # 'working' normalmente quer dizer "tem trabalho em andamento, nao mexe".
+    # No auto-swap quer dizer "esta rodando ESTE comando" -- recusar por isso
+    # recusaria o caso inteiro. 'blocked' continua barrando nos dois casos: e'
+    # dialogo pendente de verdade, nao artefato da propria chamada.
+    aceitos = ("idle", "done", "working") if auto else ("idle", "done")
+    if info["agent_status"] not in aceitos:
+        print(f"erro: '{name}' está '{info['agent_status']}' — não troco em cima de trabalho em andamento (working/blocked)", file=sys.stderr)
+        sys.exit(1)
     cwd = info["cwd"]
     # project_root(), não o cwd cru do agent — achado P2-2 herdr-7: um cwd
     # registrado num subdiretório ou path vizinho ao repo (ex:
@@ -194,16 +214,35 @@ def main():
         print(f"erro: {gate_msg} (não troco kind durante isso)", file=sys.stderr)
         sys.exit(1)
 
+    if auto:
+        print(f"auto-swap detectado: {name} e' o agent deste pane ({pane_id}).")
+        if not args.handoff_pronto:
+            print(f"erro: auto-swap exige --handoff-pronto <arquivo>. Nao da pra pedir "
+                  f"handoff a si mesmo: o `agent prompt --wait` esperaria uma resposta "
+                  f"que so sairia depois deste processo terminar.", file=sys.stderr)
+            sys.exit(1)
+        if not args.em_tab_novo:
+            print(f"erro: auto-swap exige --em-tab-novo. Sem isso o swap fecharia este "
+                  f"pane no meio da execucao, matando o proprio processo que esta "
+                  f"fazendo a troca.", file=sys.stderr)
+            sys.exit(1)
+
     if args.kind == old_kind:
         print(f"aviso: '{name}' já é '{old_kind}' — trocando mesmo assim (contexto zera igual)", file=sys.stderr)
 
     busy, why = core.pane_looks_busy_with_human_input(pane_id)
-    if busy:
+    if busy and not auto:
         print(f"erro: {pane_id} parece ter composição humana ou diálogo pendente ({why}) — abortando antes de mandar qualquer coisa. Confira o pane na mão.", file=sys.stderr)
         sys.exit(1)
 
     handoff_dir = os.path.join(cwd, ".herdr", "handoff")
     os.makedirs(handoff_dir, exist_ok=True)
+
+    if args.finalizar:
+        # Segunda fase: nao pede handoff nem sobe nada, so consuma o que a
+        # primeira deixou pendente.
+        finalizar(args, name, handoff_dir)
+        return
     # Localizado AGORA, enquanto o agent antigo ainda vive: depois do close o
     # `agent get` nao devolve mais a sessao dele, e o caminho do log se perde.
     historico_anterior = sessao_anterior_path(info)
@@ -250,7 +289,21 @@ def main():
         print("  recomeca a conversa a partir do resumo.")
         return
 
-    if args.local:
+    if args.handoff_pronto:
+        if not os.path.isfile(args.handoff_pronto) or os.path.getsize(args.handoff_pronto) == 0:
+            print(f"erro: {args.handoff_pronto} nao existe ou esta vazio.", file=sys.stderr)
+            sys.exit(1)
+        handoff_path = os.path.abspath(args.handoff_pronto)
+        v = os.path.splitext(handoff_path)[0] + ".verificacao.md"
+        if os.path.isfile(v):
+            verif_path = v
+            print(f"handoff pronto: {handoff_path} ({os.path.getsize(handoff_path)} bytes)")
+            print(f"  verificacao:   {verif_path}")
+        else:
+            print(f"handoff pronto: {handoff_path} ({os.path.getsize(handoff_path)} bytes)")
+            print(f"  sem arquivo de verificacao ao lado — o teste pos-swap sera pulado.")
+            args.no_verify = True
+    elif args.local:
         # Terceiro caminho: o agent nao responde, mas o log dele esta no disco e
         # uma LLM local pode resumi-lo sem custo de conta. Nao pede nada ao
         # agent que sai -- entao serve exatamente quando o padrao falha.
@@ -337,13 +390,32 @@ def main():
     # provisório.
     temp_name = "tmp" + hashlib.sha1(f"{name}{time.time()}".encode()).hexdigest()[:10]
 
+    tab_temp = None
     try:
-        print(f"dividindo pane novo ao lado de {pane_id}...")
-        split = api("pane", "split", pane_id, "--direction", "right", "--no-focus")
-        new_pane_id = split["pane"]["pane_id"]
+        if args.em_tab_novo:
+            # Tab novo em vez de split: nao encosta no layout do tab atual, e o
+            # antigo continua inteiro na tela pra voce comparar os dois.
+            print(f"criando tab novo no workspace {info['workspace_id']}...")
+            t = api("tab", "create", "--workspace", info["workspace_id"],
+                    "--cwd", cwd, "--label", f"swap {name}")
+            tab_temp = t["tab"]["tab_id"]
+            panes = api("pane", "list", "--tab", tab_temp)["panes"]
+            if not panes:
+                raise RuntimeError(f"tab {tab_temp} nasceu sem pane")
+            new_pane_id = panes[0]["pane_id"]
+            print(f"  tab {tab_temp}, pane {new_pane_id}")
+        else:
+            print(f"dividindo pane novo ao lado de {pane_id}...")
+            split = api("pane", "split", pane_id, "--direction", "right", "--no-focus")
+            new_pane_id = split["pane"]["pane_id"]
     except RuntimeError as exc:
-        print(f"erro dividindo pane: {exc}", file=sys.stderr)
+        print(f"erro criando o pane do substituto: {exc}", file=sys.stderr)
         print(f"processo antigo em {pane_id} não foi tocado. Handoff salvo em {handoff_path}.", file=sys.stderr)
+        if tab_temp:
+            try:
+                api("tab", "close", tab_temp)
+            except RuntimeError:
+                pass
         sys.exit(1)
 
     full_extra = list(args.extra_args)
@@ -416,6 +488,45 @@ def main():
             print(f"pane provisório {new_pane_id} ficou pra trás sem fechar ({exc2}) — feche na mão se quiser. O antigo continua sendo o '{name}' válido.", file=sys.stderr)
         sys.exit(1)
 
+    if args.em_tab_novo:
+        # PARA AQUI. O antigo continua vivo, o substituto ja leu o handoff, e os
+        # dois estao na tela. O que falta e' destrutivo, entao vira um comando
+        # separado que uma pessoa dispara depois de olhar -- e' esse o ponto de
+        # ter duas fases.
+        try:
+            api("agent", "prompt", temp_name,
+                RESUME_PROMPT.format(
+                    path=handoff_path,
+                    historico=(HISTORICO_NOTA.format(path=historico_anterior)
+                               if historico_anterior else "")),
+                "--wait", "--until", "idle", "--until", "done",
+                "--timeout", str(args.timeout * 1000))
+        except RuntimeError as exc:
+            print(f"aviso: nao consegui mandar o handoff pro provisorio ({exc}) — "
+                  f"mande na mao: herdr agent prompt {temp_name} 'Leia {handoff_path}'",
+                  file=sys.stderr)
+        grava_swap_state(swap_state_path(handoff_dir, name), {
+            "name": name, "temp_name": temp_name,
+            "old_pane_id": pane_id, "new_pane_id": new_pane_id,
+            "tab_original": info["tab_id"], "tab_temp": tab_temp,
+            "handoff": handoff_path, "verificacao": verif_path,
+            "criado_em": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        print()
+        print(f"PAROU ANTES DE FECHAR. Os dois estao vivos:")
+        print(f"  antigo  {name:24s} {pane_id}  ({old_kind})")
+        print(f"  novo    {temp_name:24s} {new_pane_id}  ({args.kind}, tab {tab_temp})")
+        print()
+        print(f"O novo ja leu {handoff_path}.")
+        print(f"Converse com ele, compare, e quando estiver satisfeito:")
+        print()
+        print(f"  herdr-swap {args.slug} {args.role} {args.kind} --finalizar")
+        print()
+        print(f"Isso fecha o antigo, promove o nome e traz o pane pro tab {info['tab_id']}.")
+        print(f"Pra desistir: herdr pane close {new_pane_id} && herdr tab close {tab_temp}")
+        print(f"  (e apague {swap_state_path(handoff_dir, name)})")
+        return
+
     # Ponto de não-retorno de verdade: só a partir daqui o antigo é encerrado.
     # Tudo antes disso era reversível.
     print(f"'{temp_name}' subiu e respondeu — fechando o antigo ({pane_id}, {old_kind}) e promovendo o nome...")
@@ -456,6 +567,103 @@ def main():
         return
 
     rodar_verificacao(name, verif_path, handoff_path, args.timeout, historico_anterior)
+
+
+# --- swap em duas fases (--em-tab-novo / --finalizar) ---------------------
+#
+# O swap normal fecha o agent antigo assim que o novo responde. Isso e' certo
+# quando ninguem esta conversando com o antigo: o handoff ja esta em disco e
+# manter dois vivos com o mesmo papel so confunde.
+#
+# Existe um caso em que e' errado, e foi o usuario que apontou: quando o agent
+# trocado e' justamente aquele com quem ele esta falando. Ai o "ponto de nao
+# retorno" cai no meio de uma conversa viva, e nao ha como conferir se o
+# substituto realmente pegou o contexto ANTES de perder o original.
+#
+# Segundo motivo, menor mas real: o split acontece no tab atual. Nos spaces com
+# layout canonico (exec | rev-1 / rev-2) isso adiciona e remove um pane no
+# mesmo tab, e ja quebrou o layout tres vezes nesta maquina.
+#
+# As duas fases resolvem os dois: o substituto nasce num TAB NOVO (nao encosta
+# no layout) e o antigo so morre num comando separado, depois de voce ver os
+# dois lado a lado.
+
+def swap_state_path(handoff_dir, name):
+    return os.path.join(handoff_dir, f".swap-pendente-{name}.json")
+
+
+def grava_swap_state(path, dados):
+    import json as _json
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump(dados, fh, indent=2, sort_keys=True)
+
+
+def le_swap_state(path):
+    import json as _json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return _json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def finalizar(args, name, handoff_dir):
+    """Segunda fase: mata o antigo, promove o nome, arruma o layout."""
+    st_path = swap_state_path(handoff_dir, name)
+    st = le_swap_state(st_path)
+    if not st:
+        print(f"erro: nao ha swap pendente para '{name}' (procurei em {st_path}).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    temp_name = st["temp_name"]
+    old_pane = st["old_pane_id"]
+    novo_pane = st["new_pane_id"]
+    tab_alvo = st["tab_original"]
+    tab_temp = st["tab_temp"]
+
+    try:
+        prov = get_agent(temp_name)
+    except RuntimeError:
+        print(f"erro: o provisorio '{temp_name}' nao existe mais. O antigo segue vivo; "
+              f"apague {st_path} e recomece.", file=sys.stderr)
+        sys.exit(1)
+    if prov.get("agent_status") == "blocked":
+        print(f"erro: '{temp_name}' esta 'blocked' — resolva antes de finalizar.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Ultima leitura do pane antigo antes de matar. Nao prova que esta seguro
+    # (o humano pode digitar entre a leitura e o close), mas pular isso foi
+    # exatamente como um dos dois incidentes de 2026-08 aconteceu.
+    if core.pane_looks_busy_with_human_input(old_pane):
+        print(f"erro: {old_pane} aparenta ter texto humano nao enviado ou dialogo "
+              f"pendente. Nao vou fechar. Resolva no pane e rode --finalizar de novo.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    print(f"fechando o antigo ({old_pane}) e promovendo '{temp_name}' -> '{name}'...")
+    api("pane", "close", old_pane)
+    time.sleep(1)
+    api("agent", "rename", temp_name, name)
+
+    # Traz o pane de volta pro tab original. Se falhar, NAO e' fatal: o agent
+    # ja e' o certo, com o nome certo -- so esta no tab errado, e
+    # `herdr-fix-layout` resolve isso depois.
+    try:
+        print(f"trazendo {novo_pane} de volta pro tab {tab_alvo}...")
+        api("pane", "move", novo_pane, "--tab", tab_alvo)
+        api("tab", "close", tab_temp)
+    except RuntimeError as exc:
+        print(f"aviso: nao consegui mover o pane de volta ({exc}). O agent esta certo e "
+              f"vivo em {novo_pane}, tab {tab_temp} — rode bin/herdr-fix-layout.",
+              file=sys.stderr)
+
+    try:
+        os.unlink(st_path)
+    except OSError:
+        pass
+    print(f"'{name}' finalizado. Layout: bin/herdr-fix-layout confere.")
 
 
 def dica_sem_handoff(historico):
