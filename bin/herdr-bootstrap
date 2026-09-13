@@ -46,6 +46,16 @@ REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"]
 # Dai a regra: model E effort explicitos em TODO papel, sempre.
 EXEC_ARGS = ["--model", "sonnet", "--effort", "high"]
 
+# Execs migrados pra Codex (2026-09-12). Motivo declarado pelo usuario: limite
+# semanal da Anthropic em 87% contra 99% LIVRE na OpenAI -- e' realocacao de
+# orcamento entre contas, nao julgamento de qualidade dos modelos.
+#
+# Esta constante existe porque os swaps foram feitos AO VIVO com herdr-swap e o
+# arquivo de policy ficou pra tras: por ~1h o bootstrap teria recriado os cinco
+# em Claude/Sonnet, desfazendo a migracao em silencio. Quem trocar um exec
+# adiante tem que mexer AQUI tambem, senao o proximo bootstrap reverte.
+EXEC_ARGS_CODEX = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"]
+
 # scout: Astra @ max (decisao do usuario 2026-09-10, revisando o Terra que
 # tinha sido escolhido no dia anterior). E' a combinacao mais cara do catalogo
 # ($10/$50 de entrada/saida, contra $2/$12 do Terra) somada ao maior effort --
@@ -96,14 +106,14 @@ REV_OVERRIDES = {
 SPACES = [
     ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "claude", EXEC_ARGS),
         ("omabackup-scout", "codex", SCOUT_ARGS)),
-    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "claude", EXEC_ARGS),
+    ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "codex", EXEC_ARGS_CODEX),
         ("mfc-scout", "codex", SCOUT_ARGS)),
     ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", EXEC_ARGS),
         None),
     # DRE: analise financeira (Demonstrativo de Resultado), nao um repo git -
     # herdr-bootstrap nao exige git, so migration.read_migration_state()
     # cai no fallback "phase=legacy" de sempre.
-    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", EXEC_ARGS),
+    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "codex", EXEC_ARGS_CODEX),
         ("dre-scout", "codex", SCOUT_ARGS)),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
@@ -133,7 +143,7 @@ SPACES = [
     # pedidos (llm-rev/llm-rev-2/llm-scout, nao llm-gateway-rev). rev/rev-2
     # mais caros que o default (ver REV_OVERRIDES) e scout customizado (Sol
     # xhigh) - pedido explicito do usuario 2026-09-02.
-    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "claude", EXEC_ARGS),
+    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "codex", EXEC_ARGS_CODEX),
         ("llm-scout", "codex", ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=xhigh"]),
         "llm"),
     # llm-bench: workspace e exec ja existiam na mao (pane sem nome, so
@@ -141,7 +151,7 @@ SPACES = [
     # sem divergencia (diferente do llm-gateway acima). rev/rev-2/scout com
     # os defaults padrao (REV_EFFORT/rev2_kind claude/scout Codex sem
     # override) - nao foi pedido nada mais caro pra este space.
-    ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "claude", EXEC_ARGS),
+    ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "codex", EXEC_ARGS_CODEX),
         ("llm-bench-scout", "codex", SCOUT_ARGS)),
     # HomeHub: workspace e exec ja existiam na mao (homehub-exec ja com o
     # nome certo, slug=label.lower() sem divergencia). rev/rev-2 com custo
@@ -155,7 +165,7 @@ SPACES = [
     # age em pane vazio). Layout e kinds no default de todo mundo:
     # exec Claude, rev-1 Codex (REV_EFFORT), rev-2 Claude, scout Codex; nao
     # foi pedido nada mais caro. slug=label, sem divergencia.
-    ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "claude", EXEC_ARGS),
+    ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "codex", EXEC_ARGS_CODEX),
         ("omasession-scout", "codex", SCOUT_ARGS)),
     # omaspotlight: fork nosso do io.github.maajix.spotlight
     # (github.com/brenoperucchi/omarchy-spotlight, upstream maajix/omarchy-spotlight).
