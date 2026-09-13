@@ -39,6 +39,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
 import _herdr_migration as migration
+import _herdr_local_handoff as local
 
 HERDR = core.HERDR
 CLI_TIMEOUT_S = core.CLI_TIMEOUT_S
@@ -148,6 +149,12 @@ def main():
                          "dele como unica fonte. Para quando ele NAO CONSEGUE responder -- "
                          "limite de uso esgotado, travado, sem credito. Perde o resumo; "
                          "o historico completo continua disponivel.")
+    ap.add_argument("--local", action="store_true",
+                    help="quando o agent que sai nao consegue escrever o handoff, gera o "
+                         "resumo com uma LLM local (Ollama) a partir do log da sessao dele. "
+                         "Fica entre o padrao (exige o LLM responder) e --sem-handoff (nao "
+                         "resume nada). Aborta se o prompt truncar -- handoff truncado sai "
+                         "fluente com identificadores inventados, que e' pior que nao ter.")
     ap.add_argument("--no-verify", action="store_true",
                     help="pula o teste de verificacao pos-swap (por padrao ele roda)")
     ap.add_argument("--dry-run", action="store_true",
@@ -243,7 +250,38 @@ def main():
         print("  recomeca a conversa a partir do resumo.")
         return
 
-    if args.sem_handoff:
+    if args.local:
+        # Terceiro caminho: o agent nao responde, mas o log dele esta no disco e
+        # uma LLM local pode resumi-lo sem custo de conta. Nao pede nada ao
+        # agent que sai -- entao serve exatamente quando o padrao falha.
+        if not historico_anterior:
+            print(f"erro: --local le o log da sessao anterior, e nao consegui localiza-lo "
+                  f"para {name} — abortando.", file=sys.stderr)
+            sys.exit(1)
+        print(f"--local: gerando handoff com {local.MODELO} a partir de {historico_anterior}")
+        try:
+            texto, met = local.gerar(historico_anterior, args.slug)
+        except local.Truncou as exc:
+            print(f"erro: {exc}", file=sys.stderr)
+            print(f"  processo antigo mantido vivo. Alternativa: --sem-handoff "
+                  f"(entrega o log cru ao sucessor, sem resumo).", file=sys.stderr)
+            sys.exit(1)
+        except local.LocalIndisponivel as exc:
+            print(f"erro: LLM local indisponivel ({exc}) — processo antigo mantido vivo.",
+                  file=sys.stderr)
+            sys.exit(1)
+        cabecalho = local.AVISO_CABECALHO.format(modelo=local.MODELO, log=historico_anterior)
+        with open(handoff_path, "w", encoding="utf-8") as fh:
+            fh.write(cabecalho + texto + "\n")
+        print(f"  {met['msgs_usadas']}/{met['msgs_no_log']} msgs do log, "
+              f"{met['prompt_eval_count']:,} tokens avaliados (teto {local.TETO_POR_REQUISICAO:,}), "
+              f"{met['segundos']}s")
+        print(f"handoff local escrito ({os.path.getsize(handoff_path)} bytes).")
+        # Sem arquivo de verificacao: so quem viveu a sessao sabe o que deixou de
+        # fora, e esse e' justamente quem nao esta disponivel. Fabricar negativas
+        # a partir do log testaria o log, nao a transferencia.
+        args.no_verify = True
+    elif args.sem_handoff:
         # O swap existe pra aliviar limite de uso, mas pedir handoff DEPENDE do
         # agent no limite conseguir responder -- se a conta dele zerou, ele nao
         # escreve nada e o swap aborta justamente quando e' mais necessario.
