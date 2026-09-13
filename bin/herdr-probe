@@ -1,100 +1,76 @@
 #!/usr/bin/env python3
-"""Le model/effort de cada agent ao vivo e guarda no cache.
+"""Amostra model/effort de cada agent e guarda no cache do herdr-agents.
 
-Feito pra rodar por timer. Tudo aqui e' PASSIVO: `herdr agent read` le o buffer
-do pane, nao escreve nada nele. Nunca manda `/status` nem prompt nenhum -- alem
-de custar tokens, escrever na caixa de composicao de um pane que pode ter texto
-humano nao enviado ja causou dois incidentes reais neste mesh.
+Feito pra rodar por timer (systemd/herdr-probe.timer). Tudo aqui e' PASSIVO:
+le o buffer do pane, nunca escreve nele.
+
+A amostragem em si mora no herdr-agents (amostra_um/amostra_todos), nao aqui --
+o caminho do Claude precisa das funcoes de log daquele modulo, e o `--force` do
+listing usa exatamente a mesma funcao. Duas definicoes do que e' "o valor de
+agora" seria uma a mais.
 
 Uso:
-    herdr-probe                # amostra todos, atualiza o cache
-    herdr-probe --mostrar      # so imprime o cache atual, sem amostrar
-    herdr-probe --deriva       # amostra e sai != 0 se algo divergir do argv
+    herdr-probe               # amostra todos e grava
+    herdr-probe --mostrar     # so imprime o cache, sem amostrar
+    herdr-probe --deriva      # amostra e sai != 0 se o pane divergir do argv
 """
 
 import argparse
+import importlib.util
 import os
-import re
-import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BIN)
 
-import _herdr_dispatch as core
 import _herdr_probe_cache as cache
 
-CLI_TIMEOUT_S = 25
 
-# Rodape do Codex: "  gpt-6-astra medium · ~/Devs/x · titulo". O TUI tambem
-# escreve "Model changed to gpt-6-astra medium" na conversa quando muda, mas o
-# rodape ja reflete o estado atual, entao basta ele.
-RODAPE_CODEX = re.compile(
-    r"\b(?P<model>(?:gpt|o)[-a-z0-9.]*[0-9a-z])\s+"
-    r"(?P<effort>minimal|low|medium|high|xhigh|max)\b", re.I)
-
-
-def le_pane(nome, linhas=6):
-    try:
-        r = subprocess.run(
-            core.herdr_argv("agent", "read", nome, "--source", "recent-unwrapped",
-                            "--lines", str(linhas)),
-            capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout or ""
+def _carrega_agents():
+    """herdr-agents nao tem .py no nome, entao vai por SourceFileLoader."""
+    loader = SourceFileLoader("herdr_agents", os.path.join(BIN, "herdr-agents"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
-def do_rodape(texto):
-    """(model, effort) do rodape do Codex, ou (None, None).
+def imprime(c):
+    for nome in sorted(c):
+        e = c[nome]
+        idade = cache.idade_min(e)
+        sufixo = f"ha {idade}min" if idade is not None else "(sem timestamp)"
+        print(f"  {nome:22s} {e.get('model','?'):16s} {e.get('effort','?'):8s} "
+              f"{e.get('origem','?'):18s} {sufixo}")
 
-    Pega o ULTIMO match: o rodape e' a ultima coisa desenhada, e a conversa
-    acima pode conter nomes de modelo citados em prosa.
+
+def divergencias(ha, agents, c):
+    """Onde o pane (fato) discorda do argv (intencao do lancamento).
+
+    Nao e' erro por si so -- trocar modelo na mao e' legitimo. E' informacao:
+    diz onde o mesh saiu do que foi pinado, que e' o que o bootstrap recriaria
+    diferente.
     """
-    ms = list(RODAPE_CODEX.finditer(texto))
-    if not ms:
-        return None, None
-    m = ms[-1]
-    return m.group("model").lower(), m.group("effort").lower()
-
-
-def amostra(agents, c):
-    lidos = 0
+    fora = []
     for a in agents:
-        nome, kind = a.get("name"), a.get("agent")
-        if not nome:
+        nome = a.get("name")
+        e = c.get(nome or "")
+        if not e or e.get("origem") != "pane":
             continue
-        if kind == "codex":
-            model, effort = do_rodape(le_pane(nome))
-            if model:
-                cache.atualiza(c, nome, model, effort, "pane", kind)
-                lidos += 1
-        # Claude nao imprime modelo na tela. A unica fonte passiva e' o log da
-        # sessao, que so vira confiavel quando o agent responde DEPOIS da troca
-        # -- ver herdr-agents.claude_model_confiavel(). Cada passagem da sonda
-        # e' uma nova chance de pegar essa janela; quando pegar, fica gravado.
-        elif kind == "claude":
-            import importlib.util
-            from importlib.machinery import SourceFileLoader
-            l = SourceFileLoader("ha", os.path.join(os.path.dirname(
-                os.path.abspath(__file__)), "herdr-agents"))
-            sp = importlib.util.spec_from_loader("ha", l)
-            ha = importlib.util.module_from_spec(sp)
-            l.exec_module(ha)
-            try:
-                pi = ha.api("pane", "process-info", "--pane", a["pane_id"])["process_info"]
-                fg = pi.get("foreground_processes") or []
-                argv = fg[0].get("argv", []) if fg else []
-            except Exception:
-                argv = []
-            uuid = ha.resume_uuid(argv)
-            if not uuid:
-                continue
-            model, confiavel = ha.claude_model_confiavel(uuid)
-            if model and confiavel:
-                _dm, de = ha.defaults_claude()
-                cache.atualiza(c, nome, model, de or "?", "thread-confirmado", kind)
-                lidos += 1
-    return lidos
+        try:
+            pi = ha.api("pane", "process-info", "--pane", a["pane_id"])["process_info"]
+            fg = pi.get("foreground_processes") or []
+            argv = fg[0].get("argv", []) if fg else []
+        except Exception:
+            continue
+        am, ae = ha.from_argv(argv)
+        if not (am or ae):
+            continue
+        if (am and am != e.get("model")) or (ae and ae != e.get("effort")):
+            fora.append((nome, f"{am or '?'}/{ae or '?'}",
+                         f"{e.get('model')}/{e.get('effort')}"))
+    return fora
 
 
 def main():
@@ -104,25 +80,29 @@ def main():
                     help="sai != 0 se alguma leitura de pane divergir do argv do processo")
     args = ap.parse_args()
 
-    c = cache.ler()
+    if args.mostrar:
+        imprime(cache.ler())
+        return
 
-    if not args.mostrar:
-        try:
-            agents = core.api("agent", "list")["agents"]
-        except (RuntimeError, KeyError) as exc:
-            print(f"erro: nao consegui listar agents ({exc})", file=sys.stderr)
-            sys.exit(1)
-        n = amostra(agents, c)
-        cache.gravar(c)
-        print(f"{n} leitura(s) gravadas em {cache.CACHE_PATH}")
+    ha = _carrega_agents()
+    try:
+        agents = ha.api("agent", "list")["agents"]
+    except (RuntimeError, KeyError) as exc:
+        print(f"erro: nao consegui listar agents ({exc})", file=sys.stderr)
+        sys.exit(1)
 
-    if args.mostrar or args.deriva:
-        for nome in sorted(c):
-            e = c[nome]
-            idade = cache.idade_min(e)
-            print(f"  {nome:22s} {e.get('model','?'):16s} {e.get('effort','?'):8s} "
-                  f"{e.get('origem','?'):18s} ha {idade}min" if idade is not None
-                  else f"  {nome:22s} {e.get('model','?')}")
+    c = ha.amostra_todos(agents)
+    print(f"{len(c)} leitura(s) no cache ({cache.CACHE_PATH})")
+
+    if args.deriva:
+        fora = divergencias(ha, agents, c)
+        if not fora:
+            print("nenhuma divergencia entre argv e pane.")
+            return
+        print(f"\n{len(fora)} agent(s) rodando diferente do que foi pinado:")
+        for nome, pinado, vivo in fora:
+            print(f"  {nome:22s} argv={pinado:24s} pane={vivo}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

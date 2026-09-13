@@ -226,13 +226,101 @@ try:
 except ImportError:      # pragma: no cover - o listing funciona sem a sonda
     probe_cache = None
 
+# Rodape do Codex: "  gpt-6-astra medium · ~/Devs/x · titulo". O TUI tambem
+# escreve "Model changed to ..." na conversa ao trocar, mas o rodape ja carrega
+# o estado atual, entao ele basta.
+RODAPE_CODEX = re.compile(
+    r"\b(?P<model>(?:gpt|o)[-a-z0-9.]*[0-9a-z])\s+"
+    r"(?P<effort>minimal|low|medium|high|xhigh|max)\b", re.I)
+
+
+def le_pane(nome, linhas=6):
+    """Buffer do pane. PASSIVO -- le, nunca escreve.
+
+    Nao existe versao ativa disto de proposito. Mandar `/status` resolveria o
+    `(unknown)` do Claude na hora, mas escreve na caixa de composicao de um
+    pane que pode ter texto humano nao enviado -- dois incidentes reais neste
+    mesh, documentados no CLAUDE.md.
+    """
+    sessao = os.environ.get("HERDR_SESSION")
+    prefixo = ["--session", sessao] if sessao else []
+    try:
+        r = subprocess.run(
+            ["herdr", *prefixo, "agent", "read", nome,
+             "--source", "recent-unwrapped", "--lines", str(linhas)],
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout or ""
+
+
+def do_rodape(texto):
+    """(model, effort) do rodape do Codex, ou (None, None).
+
+    Pega o ULTIMO match: a conversa acima do rodape pode citar nomes de modelo
+    em prosa, e o rodape e' a ultima coisa desenhada.
+    """
+    ms = list(RODAPE_CODEX.finditer(texto))
+    if not ms:
+        return None, None
+    m = ms[-1]
+    return m.group("model").lower(), m.group("effort").lower()
+
+
+def amostra_um(agent):
+    """Le o valor VIVO de um agent: (nome, model, effort, origem) ou None.
+
+    Mora aqui, e nao no herdr-probe, porque o caminho do Claude precisa de
+    claude_model_confiavel/resume_uuid/defaults_claude -- todos deste modulo. A
+    sonda e' so o laco por cima; o `--force` do listing usa a mesma funcao, pra
+    nao existirem duas definicoes do que e' "o valor de agora".
+    """
+    nome, kind = agent.get("name"), agent.get("agent")
+    if not nome:
+        return None
+    if kind == "codex":
+        model, effort = do_rodape(le_pane(nome))
+        return (nome, model, effort, "pane") if model else None
+    if kind == "claude":
+        # Claude nao imprime modelo na tela; a unica fonte passiva e' o log, e
+        # ele so vale quando o agent respondeu DEPOIS da ultima troca.
+        try:
+            pi = api("pane", "process-info", "--pane", agent["pane_id"])["process_info"]
+            fg = pi.get("foreground_processes") or []
+            argv = fg[0].get("argv", []) if fg else []
+        except (RuntimeError, subprocess.TimeoutExpired, KeyError, IndexError):
+            return None
+        uuid = resume_uuid(argv)
+        if not uuid:
+            return None
+        model, confiavel = claude_model_confiavel(uuid)
+        if model and confiavel:
+            _dm, de = defaults_claude()
+            return nome, model, de or "?", "thread-confirmado"
+    return None
+
+
+def amostra_todos(agents, workers=12):
+    """Amostra em paralelo e devolve o cache atualizado (ja gravado)."""
+    if probe_cache is None:
+        return {}
+    c = probe_cache.ler()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for r in ex.map(amostra_um, agents):
+            if r:
+                nome, model, effort, origem = r
+                probe_cache.atualiza(c, nome, model, effort, origem)
+    probe_cache.gravar(c)
+    return c
+
+
 # Acima de quantos minutos uma leitura de pane deixa de valer sozinha. Nao e'
 # validade real -- e' o ponto em que prefiro admitir a idade a afirmar como se
 # fosse agora. `/model` e' instantaneo e nao avisa ninguem.
 IDADE_MAX_MIN = 90
 
 
-def do_cache(nome, agora_model, agora_effort, agora_origem):
+def do_cache(nome, agora_model, agora_effort, agora_origem, c=None):
     """Deixa a sonda sobrepor o que o listing conseguiu sozinho.
 
     A ordem de preferencia nao e' obvia e vale escrever: uma leitura de PANE
@@ -247,7 +335,7 @@ def do_cache(nome, agora_model, agora_effort, agora_origem):
     """
     if probe_cache is None:
         return agora_model, agora_effort, agora_origem
-    e = (probe_cache.ler() or {}).get(nome)
+    e = ((probe_cache.ler() if c is None else c) or {}).get(nome)
     if not e:
         return agora_model, agora_effort, agora_origem
     idade = probe_cache.idade_min(e)
@@ -333,6 +421,10 @@ def resolve(agent):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="", help="so agents cujo cwd contem este texto")
+    ap.add_argument("--force", "-f", action="store_true",
+                    help="le os panes AGORA em vez de usar o cache da sonda. Mais lento "
+                         "(uma leitura por agent), mas e' o estado do instante -- use "
+                         "depois de trocar modelo na mao, sem esperar os 15min do timer.")
     args = ap.parse_args()
 
     # ordem dos workspaces como o Herdr numera (a mesma da sidebar): MFC e' o
@@ -349,13 +441,20 @@ def main():
         f = args.name.lower()
         agents = [a for a in agents if f in a.get("cwd", "").lower()]
 
+    # --force amostra antes de resolver, entao o cache que o do_cache le ja
+    # esta atualizado. As duas coisas usam a MESMA amostra_um(): forcar nao
+    # pode significar "outro jeito de medir", so "medir agora".
+    cache_atual = amostra_todos(agents) if args.force else (
+        probe_cache.ler() if probe_cache else {})
+
     with ThreadPoolExecutor(max_workers=12) as ex:
         modelos = list(ex.map(resolve, agents))
 
     linhas = []
     for a, (model, effort, origem) in zip(agents, modelos):
         kind = a.get("agent", "?")
-        model, effort, origem = do_cache(a.get("name") or "", model, effort, origem)
+        model, effort, origem = do_cache(a.get("name") or "", model, effort, origem,
+                                         cache_atual)
         linhas.append([
             a.get("agent_status", "?"), a.get("cwd", "?"), kind,
             sem_prefixo_do_kind(model, kind), effort, origem,
