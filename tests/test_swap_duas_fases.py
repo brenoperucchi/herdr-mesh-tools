@@ -105,3 +105,46 @@ class FlagsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardDeComposicaoTests(unittest.TestCase):
+    """`pane_looks_busy_with_human_input` devolve (suspeito, motivo).
+
+    Bug real (2026-09-13): `if core.pane_looks_busy_with_human_input(p):` no
+    --finalizar. Toda tupla de dois elementos e' verdadeira, inclusive
+    (False, None), entao o guard recusava incondicionalmente e o --finalizar
+    nunca conseguiu rodar. Pior: a mensagem culpava o pane por uma condicao
+    que nunca chegou a ser avaliada.
+    """
+
+    def test_a_tupla_negativa_e_truthy(self):
+        """O fato que torna o bug possivel, fixado aqui pra ninguem o repetir."""
+        self.assertTrue(bool((False, None)))
+        self.assertFalse((False, None)[0])
+
+    def test_finalizar_desempacota_em_vez_de_testar_a_tupla(self):
+        fonte = open(os.path.join(BIN_DIR, "herdr-swap"), encoding="utf-8").read()
+        self.assertIn("busy, why = core.pane_looks_busy_with_human_input(old_pane)", fonte)
+        self.assertNotIn("if core.pane_looks_busy_with_human_input(old_pane):", fonte)
+
+    def test_todo_uso_do_guard_desempacota(self):
+        """Vale pros dois chamadores, nao so pro que quebrou."""
+        import re
+        fonte = open(os.path.join(BIN_DIR, "herdr-swap"), encoding="utf-8").read()
+        # So CHAMADAS: o nome seguido de "(". Mencoes em prosa/docstring (entre
+        # crases, por exemplo) nao sao uso e nao devem reprovar o teste.
+        chamada = re.compile(r"pane_looks_busy_with_human_input\s*\(")
+        for linha in fonte.splitlines():
+            t = linha.strip()
+            if not chamada.search(t) or t.startswith("#"):
+                continue
+            with self.subTest(linha=t):
+                self.assertTrue(t.startswith("busy, why ="),
+                                "use `busy, why = ...`, nunca a tupla direto")
+
+    def test_existe_saida_para_falso_positivo(self):
+        """A heuristica erra. Sem valvula, um falso positivo trava o swap pra
+        sempre -- e `pane close` DESCARTA rascunho, nunca o submete."""
+        fonte = open(os.path.join(BIN_DIR, "herdr-swap"), encoding="utf-8").read()
+        self.assertIn('"--forcar-fechamento"', fonte)
+        self.assertIn("args.forcar_fechamento", fonte)

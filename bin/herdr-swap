@@ -164,6 +164,10 @@ def main():
                     help="usa um handoff JA ESCRITO em vez de pedir um ao agent que sai. "
                          "Obrigatorio no auto-swap: o agent nao consegue responder a um "
                          "prompt enquanto esta bloqueado rodando este comando.")
+    ap.add_argument("--forcar-fechamento", action="store_true",
+                    help="no --finalizar, fecha mesmo com a heuristica de composicao "
+                         "humana acusando. Use quando souber que e' falso positivo: "
+                         "`pane close` DESCARTA um rascunho, nunca o submete.")
     ap.add_argument("--finalizar", action="store_true",
                     help="segunda fase de --em-tab-novo: fecha o antigo, promove o nome do "
                          "provisorio, traz o pane pro tab original e fecha o tab temporario.")
@@ -689,11 +693,22 @@ def finalizar(args, name, handoff_dir):
     # Ultima leitura do pane antigo antes de matar. Nao prova que esta seguro
     # (o humano pode digitar entre a leitura e o close), mas pular isso foi
     # exatamente como um dos dois incidentes de 2026-08 aconteceu.
-    if core.pane_looks_busy_with_human_input(old_pane):
+    # DESEMPACOTAR. A funcao devolve (suspeito, motivo) -- uma tupla de dois
+    # elementos e' SEMPRE verdadeira, inclusive (False, None), entao usa-la
+    # direto num `if` recusava todo swap incondicionalmente. O --finalizar nunca
+    # conseguiu rodar ate isto ser corrigido, e o pior e' que a mensagem culpava
+    # o pane por uma condicao que nunca chegou a ser avaliada.
+    busy, why = core.pane_looks_busy_with_human_input(old_pane)
+    if busy and not args.forcar_fechamento:
         print(f"erro: {old_pane} aparenta ter texto humano nao enviado ou dialogo "
-              f"pendente. Nao vou fechar. Resolva no pane e rode --finalizar de novo.",
-              file=sys.stderr)
+              f"pendente: {why}", file=sys.stderr)
+        print(f"  Nao vou fechar. Resolva no pane e rode --finalizar de novo, ou passe "
+              f"--forcar-fechamento se souber que e' falso positivo.", file=sys.stderr)
+        print(f"  (fechar DESCARTA um rascunho nao enviado; nunca o submete -- por isso"
+              f" isto e' um aviso forte e nao uma parede.)", file=sys.stderr)
         sys.exit(1)
+    if busy:
+        print(f"aviso: --forcar-fechamento passado por cima de: {why}")
 
     print(f"fechando o antigo ({old_pane}) e promovendo '{temp_name}' -> '{name}'...")
     api("pane", "close", old_pane)
