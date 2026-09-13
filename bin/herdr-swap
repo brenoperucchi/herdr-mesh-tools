@@ -265,22 +265,70 @@ def main():
         print(f"  args do novo: {extras}")
         print()
         print("  checagens que JA passaram (feitas de verdade agora):")
-        print(f"    - '{name}' existe e esta '{info['agent_status']}' (exige idle/done)")
+        exige = "idle/done/working (auto-swap)" if auto else "idle/done"
+        print(f"    - '{name}' existe e esta '{info['agent_status']}' (exige {exige})")
         print(f"    - nenhuma migracao em andamento neste space")
-        print(f"    - {pane_id} nao aparenta composicao humana nem dialogo pendente")
+        if auto:
+            print(f"    - {pane_id} e' o pane DESTE processo: auto-swap")
+            print(f"      (a heuristica de composicao humana nao se aplica -- o prompt")
+            print(f"       que disparou o swap esta na tela e ela o leria como pendente)")
+        else:
+            print(f"    - {pane_id} nao aparenta composicao humana nem dialogo pendente")
         print()
+
+        # A narrativa precisa refletir as FLAGS, nao o fluxo canonico. Um
+        # dry-run que descreve passos diferentes dos que vao rodar e' pior que
+        # nenhum: ele existe pra ser a ultima conferencia antes de algo
+        # irreversivel, e mentir ali gasta exatamente a confianca que justifica
+        # o comando. (Bug real: com --em-tab-novo e --handoff-pronto ele ainda
+        # anunciava "dividir pane" e "PONTO DE NAO RETORNO".)
         print("  passos que SERIAM executados, em ordem:")
-        print(f"    1. pedir handoff ao {old_kind} atual, escrito em")
-        print(f"       {handoff_path}")
-        print(f"       (aborta se nao assentar em {args.timeout}s, ficar blocked, ou sair vazio")
-        print(f"        -- nos tres casos o processo antigo continua vivo e intacto)")
-        print(f"    2. dividir um pane novo ao lado de {pane_id}")
-        print(f"    3. subir '{args.kind}' nesse pane sob nome PROVISORIO")
+        n = 1
+        if args.handoff_pronto:
+            print(f"    {n}. usar o handoff JA ESCRITO em")
+            print(f"       {os.path.abspath(args.handoff_pronto)}")
+            v = os.path.splitext(os.path.abspath(args.handoff_pronto))[0] + ".verificacao.md"
+            print(f"       verificacao: {v if os.path.isfile(v) else '(nenhuma ao lado — teste pulado)'}")
+            print(f"       (nada e' pedido ao {old_kind}; ele nao e' interrompido)")
+        elif args.local:
+            print(f"    {n}. gerar o handoff com {local.MODELO} a partir do log da sessao")
+            print(f"       (aborta se o prompt truncar; o processo antigo segue vivo)")
+        else:
+            print(f"    {n}. pedir handoff ao {old_kind} atual, escrito em")
+            print(f"       {handoff_path}")
+            print(f"       (aborta se nao assentar em {args.timeout}s, ficar blocked, ou sair vazio")
+            print(f"        -- nos tres casos o processo antigo continua vivo e intacto)")
+        n += 1
+        if args.em_tab_novo:
+            print(f"    {n}. criar um TAB NOVO no workspace {info['workspace_id']}")
+            print(f"       (nao encosta no layout do tab {info['tab_id']})")
+        else:
+            print(f"    {n}. dividir um pane novo ao lado de {pane_id}")
+        n += 1
+        print(f"    {n}. subir '{args.kind}' nesse pane sob nome PROVISORIO")
         print(f"       (se nao subir: fecha so o pane provisorio; '{name}' segue vivo)")
-        print(f"    4. confirmar que o novo respondeu")
-        print(f"    5. PONTO DE NAO RETORNO: fechar {pane_id} (mata o {old_kind})")
-        print(f"    6. renomear o provisorio para '{name}'")
-        print(f"    7. mandar o novo ler o handoff")
+        n += 1
+        print(f"    {n}. confirmar que o novo respondeu")
+        n += 1
+        if args.em_tab_novo:
+            print(f"    {n}. mandar o novo ler o handoff")
+            n += 1
+            print(f"    {n}. PARAR. Nada e' fechado. Os dois ficam vivos ate voce rodar:")
+            print(f"       herdr-swap {args.slug} {args.role} {args.kind} --finalizar")
+            print()
+            print("  NENHUM passo desta fase e' destrutivo. O ponto de nao retorno")
+            print(f"  (fechar {pane_id}) fica todo no --finalizar, que tambem promove o")
+            print(f"  nome e traz o pane de volta pro tab {info['tab_id']}.")
+            if auto:
+                print()
+                print("  Como e' auto-swap: esta conversa continua viva no tab atual ate")
+                print("  o --finalizar. Voce pode comparar os dois antes de decidir.")
+            return
+        print(f"    {n}. PONTO DE NAO RETORNO: fechar {pane_id} (mata o {old_kind})")
+        n += 1
+        print(f"    {n}. renomear o provisorio para '{name}'")
+        n += 1
+        print(f"    {n}. mandar o novo ler o handoff")
         print()
         print("  o que se perde de verdade: a conversa acumulada do agent atual.")
         print("  o handoff e' um RESUMO escrito por ele, nao o historico -- e' lossy")
@@ -399,7 +447,12 @@ def main():
             t = api("tab", "create", "--workspace", info["workspace_id"],
                     "--cwd", cwd, "--label", f"swap {name}")
             tab_temp = t["tab"]["tab_id"]
-            panes = api("pane", "list", "--tab", tab_temp)["panes"]
+            # `pane list` filtra por --workspace, nao por --tab (tentei; devolve
+            # "unknown option"). Cada pane traz o proprio tab_id, entao o filtro
+            # e' nosso.
+            panes = [q for q in api("pane", "list", "--workspace",
+                                    info["workspace_id"])["panes"]
+                     if q.get("tab_id") == tab_temp]
             if not panes:
                 raise RuntimeError(f"tab {tab_temp} nasceu sem pane")
             new_pane_id = panes[0]["pane_id"]
@@ -777,8 +830,19 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
         # O log da sessao antiga sobrevive ao swap, entao o agent pode consultar
         # o que o resumo nao cobriu -- sem depender de alguem perceber depois.
         if admitiu > len(negativas):
-            print("  contagem impossivel (" + str(admitiu) + " > " + str(len(negativas))
-                  + ") - o corte do eco falhou, confira na mao.")
+            # NAO afirmar a causa aqui. Ja aconteceu de eu culpar o corte do eco
+            # e a causa ser outra: o agent recusou uma POSITIVA cuja resposta o
+            # handoff de fato nao trazia -- comportamento certo dele, pergunta
+            # defeituosa minha. Mais recusas que negativas e' um sinal, nao um
+            # diagnostico; listar as hipoteses e mandar olhar e' mais util (e
+            # mais honesto) que escolher uma sem evidencia.
+            print("  contagem impossivel (" + str(admitiu) + " recusas para "
+                  + str(len(negativas)) + " negativas). Duas causas possiveis:")
+            print("    - alguma POSITIVA foi recusada, e talvez com razao: a")
+            print("      resposta pode nao estar mesmo no handoff. Confira ANTES")
+            print("      de culpar o agent -- o gabarito pode ser que esteja errado.")
+            print("    - o corte do eco da instrucao falhou (ver conta_recusas).")
+            print("  Leia as respostas e decida:")
         else:
             print("  " + str(len(negativas) - admitiu) + " resposta(s) podem ser invencao.")
         if historico:
