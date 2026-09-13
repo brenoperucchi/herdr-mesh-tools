@@ -34,6 +34,7 @@ import os
 import subprocess
 import sys
 import time
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
@@ -43,7 +44,9 @@ HERDR = core.HERDR
 CLI_TIMEOUT_S = core.CLI_TIMEOUT_S
 
 HANDOFF_PROMPT = """Vou trocar você por um agent de outro kind neste mesmo pane. Antes disso,
-escreva um resumo de handoff em `{path}` cobrindo:
+escreva DOIS arquivos.
+
+**1. O handoff, em `{path}`**, cobrindo:
 
 - o que você estava fazendo e por quê
 - decisões já tomadas (e o porquê, se não for óbvio)
@@ -51,15 +54,72 @@ escreva um resumo de handoff em `{path}` cobrindo:
 - arquivos relevantes e qualquer coisa que quem assumir precise saber pra não
   repetir trabalho ou perder contexto
 
-Depois de escrever o arquivo, pare — não faça mais nada."""
+**2. Um teste de verificação, em `{verif_path}`** — este arquivo NÃO será lido
+por quem assumir. Ele existe pra confirmar que a transferência funcionou, e a
+sua vantagem aqui é única: você é o único que sabe ao mesmo tempo o que PÔS e o
+que DEIXOU DE FORA do handoff.
+
+Escreva exatamente neste formato, 5 perguntas de cada tipo:
+
+```
+## POSITIVAS
+1. <pergunta cuja resposta está no handoff>
+   GABARITO: <resposta esperada, curta>
+...
+## NEGATIVAS
+1. <pergunta sobre algo REAL que você viveu nesta sessão e que NÃO entrou no handoff>
+...
+```
+
+As POSITIVAS devem exigir entendimento, não busca de palavra-chave: prefira
+"por que X foi descartado" a "o que é X". As NEGATIVAS são a parte que mais
+importa — devem ser sobre trabalho que de fato aconteceu aqui, mas que você
+deliberadamente não documentou. Elas testam se quem assume admite não saber ou
+inventa uma resposta plausível. Num projeto de consequência, inventar com
+confiança é pior que não saber.
+
+Depois de escrever os dois arquivos, pare — não faça mais nada."""
 
 RESUME_PROMPT = """Você está retomando de outro agent neste mesmo projeto. Leia {path} antes de
-qualquer coisa — é o handoff de quem estava trabalhando aqui antes de você."""
+qualquer coisa — é o handoff de quem estava trabalhando aqui antes de você.
+
+O handoff é um RESUMO, escrito por ele, e portanto incompleto por natureza.{historico}
+
+Quando algo não estiver no handoff, diga que não está em vez de deduzir — e
+consulte a fonte acima se precisar. Preencher lacuna com suposição plausível é
+o modo de falha que mais custa aqui, porque soa competente."""
+
+HISTORICO_NOTA = """ O histórico COMPLETO da sessão dele continua no disco, em:
+
+  {path}
+
+É grande e não deve ser lido inteiro; use como fonte pontual, buscando o que
+precisar."""
 
 
 api = core.api
 get_agent = core.get_agent_info
 
+
+# Ultima frase da instrucao de verificacao. Serve de marco pra separar o eco
+# do prompt das respostas de verdade -- ver conta_recusas().
+FIM_DA_INSTRUCAO = "em vez de deduzir"
+
+
+def conta_recusas(out):
+    """Quantas vezes o agent admitiu que algo nao esta no handoff.
+
+    A leitura do pane inclui o ECO da instrucao que acabamos de mandar, e essa
+    instrucao contem a frase literal "nao esta no handoff" -- contar no texto
+    cru inflava o total em 1. Visto em dois swaps seguidos (2026-09-12): 6/5
+    num caso, e 5/5 num caso cuja verdade era 4/5, o que mascarou uma
+    confabulacao real (o agent respondeu uma negativa com material plausivel
+    do proprio handoff em vez de recusar). So conta o que vem DEPOIS do ultimo
+    eco; se o marco nao aparecer, conta tudo em vez de perder recusas.
+    """
+    corte = out.lower().rfind(FIM_DA_INSTRUCAO)
+    resposta = out[corte:] if corte != -1 else out
+    return len(re.findall(r"n[ao]{1,2}\s+est[aá]\s+no\s+handoff", resposta, re.I))
 
 def dispatch_and_wait(name, prompt_text, timeout_s):
     """Manda o prompt e espera o agent assentar via `agent prompt --wait` —
@@ -83,6 +143,13 @@ def main():
     ap.add_argument("kind")
     ap.add_argument("extra_args", nargs="*", help="passados pro novo agent depois de --")
     ap.add_argument("--timeout", type=int, default=180, help="segundos pra esperar o handoff ser escrito")
+    ap.add_argument("--sem-handoff", action="store_true",
+                    help="troca sem pedir handoff ao agent que sai, usando o log da sessao "
+                         "dele como unica fonte. Para quando ele NAO CONSEGUE responder -- "
+                         "limite de uso esgotado, travado, sem credito. Perde o resumo; "
+                         "o historico completo continua disponivel.")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="pula o teste de verificacao pos-swap (por padrao ele roda)")
     ap.add_argument("--dry-run", action="store_true",
                     help="percorre as checagens reais e imprime o plano; nao toca em nada")
     args = ap.parse_args()
@@ -130,9 +197,16 @@ def main():
 
     handoff_dir = os.path.join(cwd, ".herdr", "handoff")
     os.makedirs(handoff_dir, exist_ok=True)
-    handoff_path = os.path.join(
-        handoff_dir, f"{args.slug}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.md"
-    )
+    # Localizado AGORA, enquanto o agent antigo ainda vive: depois do close o
+    # `agent get` nao devolve mais a sessao dele, e o caminho do log se perde.
+    historico_anterior = sessao_anterior_path(info)
+
+    carimbo = f"{args.slug}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    handoff_path = os.path.join(handoff_dir, f"{carimbo}.md")
+    # Fica FORA do handoff de proposito: se as perguntas negativas estivessem no
+    # arquivo que o novo agent le, ele saberia de antemao o que "nao deveria
+    # saber" e a verificacao perderia o sentido.
+    verif_path = os.path.join(handoff_dir, f"{carimbo}.verificacao.md")
 
     if args.dry_run:
         # Tudo acima ja rodou de verdade: agent get, checagem de estado, gate de
@@ -169,26 +243,47 @@ def main():
         print("  recomeca a conversa a partir do resumo.")
         return
 
-    print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
-    status, wait_info = dispatch_and_wait(name, HANDOFF_PROMPT.format(path=handoff_path), args.timeout)
+    if args.sem_handoff:
+        # O swap existe pra aliviar limite de uso, mas pedir handoff DEPENDE do
+        # agent no limite conseguir responder -- se a conta dele zerou, ele nao
+        # escreve nada e o swap aborta justamente quando e' mais necessario.
+        # Achado do usuario 2026-09-12.
+        #
+        # O log da sessao sobrevive a isso: esta no disco, nao depende de a LLM
+        # responder. Entao da pra trocar mesmo com o agent mudo, contanto que o
+        # sucessor receba o caminho do historico como fonte.
+        if not historico_anterior:
+            print(f"erro: --sem-handoff exige o log da sessao anterior como fonte, e nao "
+                  f"consegui localiza-lo para {name}. Sem handoff E sem historico, a troca "
+                  f"perderia o contexto por inteiro — abortando.", file=sys.stderr)
+            sys.exit(1)
+        print(f"--sem-handoff: nao vou pedir nada ao {old_kind} (pode estar esgotado/travado).")
+        print(f"  fonte para o sucessor: {historico_anterior}")
+        handoff_path = historico_anterior
+    else:
+        print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
+        status, wait_info = dispatch_and_wait(name, HANDOFF_PROMPT.format(path=handoff_path, verif_path=verif_path), args.timeout)
 
-    if status == "timeout":
-        print(f"erro: {name} não assentou em {args.timeout}s escrevendo o handoff — abortando, processo antigo mantido vivo", file=sys.stderr)
-        sys.exit(1)
-    if status == "blocked":
-        print(f"erro: {name} ficou 'blocked' escrevendo o handoff — veja o pane {pane_id} antes de tentar de novo. Processo antigo mantido vivo.", file=sys.stderr)
-        sys.exit(1)
-    if status == "stalled":
-        print(f"erro: {name} não mostrou nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info}) — pane pode estar travado. Processo antigo mantido vivo.", file=sys.stderr)
-        sys.exit(1)
-    if status == "error":
-        print(f"erro esperando {name} assentar: {wait_info}. Processo antigo mantido vivo.", file=sys.stderr)
-        sys.exit(1)
-    if not os.path.isfile(handoff_path) or os.path.getsize(handoff_path) == 0:
-        print(f"erro: {name} assentou mas não escreveu {handoff_path} (ou ficou vazio) — abortando, processo antigo mantido vivo", file=sys.stderr)
-        sys.exit(1)
+        if status == "timeout":
+            print(f"erro: {name} não assentou em {args.timeout}s escrevendo o handoff — abortando, processo antigo mantido vivo", file=sys.stderr)
+            dica_sem_handoff(historico_anterior)
+            sys.exit(1)
+        if status == "blocked":
+            print(f"erro: {name} ficou 'blocked' escrevendo o handoff — veja o pane {pane_id} antes de tentar de novo. Processo antigo mantido vivo.", file=sys.stderr)
+            sys.exit(1)
+        if status == "stalled":
+            print(f"erro: {name} não mostrou nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info}) — pane pode estar travado. Processo antigo mantido vivo.", file=sys.stderr)
+            dica_sem_handoff(historico_anterior)
+            sys.exit(1)
+        if status == "error":
+            print(f"erro esperando {name} assentar: {wait_info}. Processo antigo mantido vivo.", file=sys.stderr)
+            dica_sem_handoff(historico_anterior)
+            sys.exit(1)
+        if not os.path.isfile(handoff_path) or os.path.getsize(handoff_path) == 0:
+            print(f"erro: {name} assentou mas não escreveu {handoff_path} (ou ficou vazio) — abortando, processo antigo mantido vivo", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"handoff escrito ({os.path.getsize(handoff_path)} bytes).")
+        print(f"handoff escrito ({os.path.getsize(handoff_path)} bytes).")
 
     # Sobe o novo kind sob nome PROVISÓRIO antes de tocar no antigo — até o
     # `pane close` do antigo (mais abaixo), tudo aqui é reversível: se o novo
@@ -302,15 +397,162 @@ def main():
         sys.exit(1)
 
     try:
-        api("agent", "prompt", name, RESUME_PROMPT.format(path=handoff_path))
+        nota = (HISTORICO_NOTA.format(path=historico_anterior)
+                if historico_anterior else "")
+        api("agent", "prompt", name,
+            RESUME_PROMPT.format(path=handoff_path, historico=nota))
     except RuntimeError as exc:
         print(f"'{name}' subiu ({old_kind} -> {args.kind}) mas falhei mandando ele ler o handoff: {exc}", file=sys.stderr)
         print(f"mande na mão: herdr agent prompt {name} 'Leia {handoff_path} antes de qualquer coisa'", file=sys.stderr)
         sys.exit(1)
 
-    print(f"'{name}' trocado: {old_kind} -> {args.kind}. Mandei pra ele ler o handoff, sem esperar a resposta.")
+    print(f"'{name}' trocado: {old_kind} -> {args.kind}. Mandei pra ele ler o handoff.")
     print(f"handoff: {handoff_path}")
 
+    if args.no_verify:
+        print(f"verificacao pulada (--no-verify). Teste manual: {verif_path}")
+        return
+    if not os.path.isfile(verif_path):
+        print(f"aviso: {os.path.basename(verif_path)} nao foi escrito pelo agent que saiu — "
+              f"swap concluido, mas sem teste de verificacao.", file=sys.stderr)
+        return
+
+    rodar_verificacao(name, verif_path, handoff_path, args.timeout, historico_anterior)
+
+
+def dica_sem_handoff(historico):
+    """Quando o agent nao responde, a causa mais provavel e' a mesma que motivou
+    o swap: a conta dele acabou. Abortar em silencio deixa o usuario preso --
+    entao a mensagem de erro aponta a saida, que so existe porque o log da sessao
+    nao depende de a LLM responder (achado do usuario 2026-09-12)."""
+    if historico:
+        print("  Se ele NAO CONSEGUE responder (limite de uso esgotado, travado, sem "
+              "credito), rode de novo com --sem-handoff: troca usando o log da sessao "
+              "dele como fonte, em vez do resumo.", file=sys.stderr)
+        print(f"  log: {historico}", file=sys.stderr)
+    else:
+        print("  --sem-handoff nao ajudaria aqui: nao localizei o log da sessao dele.",
+              file=sys.stderr)
+
+
+def sessao_anterior_path(info):
+    """Onde vive o historico COMPLETO do agent que saiu.
+
+    O handoff e' um resumo -- lossy por desenho. O log da sessao anterior
+    continua no disco depois do swap, entao o novo agent tem como consultar a
+    fonte quando o resumo nao bastar. Passar esse caminho adiante e' a diferenca
+    entre um handoff que e' tudo que sobrou e um handoff que e' so o atalho."""
+    sess = (info.get("agent_session") or {}).get("value")
+    if not sess:
+        return None
+    kind = info.get("agent")
+    raizes = {
+        "claude": os.path.join(os.path.expanduser("~"), ".claude", "projects"),
+        "codex": os.path.join(os.path.expanduser("~"), ".codex", "sessions"),
+    }
+    raiz = raizes.get(kind)
+    if not raiz or not os.path.isdir(raiz):
+        return None
+    for dirpath, _dirs, arquivos in os.walk(raiz):
+        for nome in arquivos:
+            if sess in nome:
+                return os.path.join(dirpath, nome)
+    return None
+
+
+def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None):
+    """Confirma que a transferencia funcionou, nas DUAS direcoes.
+
+    Validado ao vivo no swap do mfc-exec (2026-09-12, claude -> codex): 5/5 nas
+    positivas, com o agent novo citando ate o identificador do achado e a
+    RESSALVA de uma garantia estatistica.
+
+    RESSALVA sobre o "5/5 nas negativas" que esta docstring afirmava: aquele
+    numero saiu do contador defeituoso (contava o eco da instrucao), entao o
+    resultado real daquele swap pode ter sido 4/5. Nao da pra reconferir -- o
+    pane foi fechado. Vale como evidencia das positivas, nao das negativas.
+    Ver conta_recusas().
+
+    A metade negativa e' a que mais importa e a que quase nao se testa. Um agent
+    que preenche lacuna com invencao plausivel e' mais perigoso que um que nao
+    sabe, porque soa competente -- e num space que executa ordem em conta de
+    trading isso decide se da pra deixa-lo operar sozinho."""
+    import re as _re
+
+    texto = open(verif_path, encoding="utf-8", errors="ignore").read()
+
+    def extrai(secao):
+        padrao = r"##\s*" + secao + r"(.*?)(?=\n##\s|\Z)"
+        m = _re.search(padrao, texto, _re.S | _re.I)
+        if not m:
+            return []
+        return [l.strip() for l in m.group(1).splitlines()
+                if _re.match(r"^\s*\d+\.", l) and "GABARITO" not in l.upper()]
+
+    positivas, negativas = extrai("POSITIVAS"), extrai("NEGATIVAS")
+    if not (positivas and negativas):
+        print("aviso: " + os.path.basename(verif_path) + " nao tem as duas secoes no "
+              "formato esperado - faca a verificacao na mao.", file=sys.stderr)
+        return
+
+    print("")
+    print("verificando a transferencia (" + str(len(positivas)) + " positivas, "
+          + str(len(negativas)) + " negativas)...")
+
+    instrucao = ("Responda numeradas, em sequencia, direto. Nao releia o projeto nem "
+                 "pesquise: quero o que voce retem do handoff. Se a resposta NAO estiver "
+                 "no handoff, escreva exatamente 'nao esta no handoff' "
+                 + FIM_DA_INSTRUCAO + ".")
+    perguntas = chr(10).join(positivas + negativas)
+    try:
+        api("agent", "prompt", name, instrucao + chr(10) + chr(10) + perguntas,
+            "--wait", "--until", "idle", "--until", "done", "--timeout", str(timeout_s * 1000))
+        out = subprocess.run(
+            core.herdr_argv("agent", "read", name, "--source", "recent-unwrapped",
+                            "--lines", "120"),
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+        ).stdout
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        print("aviso: verificacao nao concluiu (" + str(exc) + ") - o swap esta feito; "
+              "teste na mao com " + verif_path, file=sys.stderr)
+        return
+
+    # So as NEGATIVAS dao pra conferir sozinho: a resposta certa e' uma forma de
+    # "nao sei". As positivas exigem julgamento, entao ficam pro humano comparar
+    # com o GABARITO do arquivo.
+    admitiu = conta_recusas(out)
+    # `>` seria contagem impossivel (mais recusas que perguntas) -- sinal de que
+    # o corte do eco falhou. Nesse caso nao afirmo OK: mando conferir na mao.
+    ok = admitiu == len(negativas)
+    print("  negativas: " + str(admitiu) + "/" + str(len(negativas))
+          + " admitiram desconhecimento" + ("  OK" if ok else "  ATENCAO"))
+    if not ok:
+        # PROATIVO: em vez de so reportar a falha, ja entrega a fonte completa.
+        # O log da sessao antiga sobrevive ao swap, entao o agent pode consultar
+        # o que o resumo nao cobriu -- sem depender de alguem perceber depois.
+        if admitiu > len(negativas):
+            print("  contagem impossivel (" + str(admitiu) + " > " + str(len(negativas))
+                  + ") - o corte do eco falhou, confira na mao.")
+        else:
+            print("  " + str(len(negativas) - admitiu) + " resposta(s) podem ser invencao.")
+        if historico:
+            print("  mandando o historico completo da sessao anterior como fonte...")
+            try:
+                api("agent", "prompt", name,
+                    "Correcao de rota: algumas respostas suas pareceram preencher lacuna "
+                    "em vez de admitir desconhecimento. O handoff e' um RESUMO, e o "
+                    "historico completo do agent anterior esta em " + historico + " -- "
+                    "consulte esse arquivo quando o resumo nao bastar, e prefira dizer "
+                    "'nao sei' a deduzir. Inventar com confianca num projeto de "
+                    "consequencia e' pior que nao saber.")
+                print("  enviado. Historico: " + historico)
+            except RuntimeError as exc:
+                print("  falhei mandando (" + str(exc) + "); avise na mao: " + historico,
+                      file=sys.stderr)
+        else:
+            print("  historico da sessao anterior nao localizado; leia o pane na mao.")
+    print("  positivas: confira as respostas contra o GABARITO em " + verif_path)
+    print("  respostas: herdr agent read " + name + " --source recent-unwrapped --lines 120")
 
 if __name__ == "__main__":
     main()
