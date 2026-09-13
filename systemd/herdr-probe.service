@@ -1,0 +1,16 @@
+[Unit]
+Description=Amostra model/effort reais dos agents do Herdr
+Documentation=https://github.com/brenoperucchi/herdr-mesh-tools
+# Nao adianta rodar sem o servidor do Herdr; o proprio script sai != 0, mas
+# evitar a tentativa mantem o journal limpo.
+ConditionPathExists=%h/.config/herdr/herdr.sock
+
+[Service]
+Type=oneshot
+# systemd --user nao herda ~/.local/bin no PATH (achado 2026-08, mesmo problema
+# ja visto nos binds do Hyprland). Caminho absoluto nos dois, e PATH explicito
+# porque herdr-probe chama `herdr` por dentro.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Devs/herdr-mesh-tools/bin/herdr-probe
+TimeoutStartSec=180
+Nice=10

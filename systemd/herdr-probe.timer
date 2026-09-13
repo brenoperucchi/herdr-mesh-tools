@@ -1,0 +1,13 @@
+[Unit]
+Description=Amostra model/effort dos agents a cada 15min
+
+[Timer]
+# 2min depois do login pra pegar o estado logo, e 15 em 15 depois. Persistent
+# nao serve aqui: uma amostra perdida nao tem o que recuperar -- ela mede o
+# AGORA, e rodar atrasado gravaria um valor velho como se fosse atual.
+OnStartupSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

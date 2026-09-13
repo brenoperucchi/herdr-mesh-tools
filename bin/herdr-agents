@@ -221,6 +221,47 @@ def resume_uuid(argv):
     return None
 
 
+try:
+    import _herdr_probe_cache as probe_cache
+except ImportError:      # pragma: no cover - o listing funciona sem a sonda
+    probe_cache = None
+
+# Acima de quantos minutos uma leitura de pane deixa de valer sozinha. Nao e'
+# validade real -- e' o ponto em que prefiro admitir a idade a afirmar como se
+# fosse agora. `/model` e' instantaneo e nao avisa ninguem.
+IDADE_MAX_MIN = 90
+
+
+def do_cache(nome, agora_model, agora_effort, agora_origem):
+    """Deixa a sonda sobrepor o que o listing conseguiu sozinho.
+
+    A ordem de preferencia nao e' obvia e vale escrever: uma leitura de PANE
+    ganha ate do argv. Argv e' o que o operador pinou no lancamento, mas um
+    `/model` feito depois nao toca no argv -- entao argv e' a INTENCAO, e o
+    pane e' o FATO. Foi assim que quatro agentes apareceram como `high` neste
+    listing enquanto rodavam `medium`/`low`, trocados a mao.
+
+    Quando a leitura esta velha, o valor sai mesmo assim com a idade no SRC:
+    esconder seria voltar ao `(unknown)`, que e' pior -- o operador perde a
+    unica pista que existe.
+    """
+    if probe_cache is None:
+        return agora_model, agora_effort, agora_origem
+    e = (probe_cache.ler() or {}).get(nome)
+    if not e:
+        return agora_model, agora_effort, agora_origem
+    idade = probe_cache.idade_min(e)
+    origem = e.get("origem", "?")
+    if origem == "pane":
+        marca = "pane" if (idade is not None and idade <= IDADE_MAX_MIN) else f"pane~{idade}min"
+        return e.get("model") or agora_model, e.get("effort") or agora_effort, marca
+    # thread-confirmado so entra quando o listing nao soube resolver sozinho
+    if agora_model in ("(unknown)", "?", None) or agora_origem in ("global", "thread?"):
+        marca = "sonda" if (idade is not None and idade <= IDADE_MAX_MIN) else f"sonda~{idade}min"
+        return e.get("model") or agora_model, e.get("effort") or agora_effort, marca
+    return agora_model, agora_effort, agora_origem
+
+
 def sem_prefixo_do_kind(modelo, kind):
     """Tira o prefixo redundante com a coluna KIND: `claude-sonnet-5` vira
     `sonnet-5`, porque a linha ja diz `claude` do lado. Os ids do Codex nao
@@ -314,6 +355,7 @@ def main():
     linhas = []
     for a, (model, effort, origem) in zip(agents, modelos):
         kind = a.get("agent", "?")
+        model, effort, origem = do_cache(a.get("name") or "", model, effort, origem)
         linhas.append([
             a.get("agent_status", "?"), a.get("cwd", "?"), kind,
             sem_prefixo_do_kind(model, kind), effort, origem,
