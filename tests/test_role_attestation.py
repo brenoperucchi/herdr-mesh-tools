@@ -42,6 +42,9 @@ class RoleAttestationTests(unittest.TestCase):
             "claude-bridge-exec",
             "artifact do colega cego",
             "pare e registre a inconsistência",
+            "Panes headless de revisão",
+            "letra isolada digitada por engano",
+            "não deve\nparar o fluxo",
         ):
             self.assertIn(required, prompt)
 
@@ -56,6 +59,22 @@ class RoleAttestationTests(unittest.TestCase):
         self.assertIn("herdr agent get claude-bridge-scout", prompt)
         self.assertIn("READ-ONLY", prompt)
         self.assertIn("papel `scout`", prompt)
+
+    def test_exec_hydration_carries_escalation_policy(self):
+        prompt = self.core.exec_hydration_prompt(
+            "foo-exec", "foo", "/repo/foo", ["foo-rev-1", "foo-rev-2", "foo-scout"],
+        )
+
+        for required in (
+            self.core.EXEC_HYDRATION_MARKER,
+            "no máximo duas rodadas de correção",
+            "herdr-ask --reviewer scout",
+            "sem pedir autorização prévia ao Breno",
+            "devolve somente para este exec",
+            "divergência ou incerteza",
+            "decisão final antes de qualquer commit",
+        ):
+            self.assertIn(required, prompt)
 
     def test_each_dispatch_protocol_repeats_identity_confirmation(self):
         review_prompt = self.review.prompt_text(

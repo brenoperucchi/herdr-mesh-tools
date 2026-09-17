@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Entrega a política atualizada aos ``*-exec`` que já estão vivos.
+
+O bootstrap hidrata um agent no momento em que o cria ou troca. Quando uma
+skill muda no disco, porém, a janela de contexto dos execs existentes não muda
+sozinha. Este comando envia a mesma política por ``herdr agent prompt`` — não
+faz ``/new``/``/clear`` e não toca nos arquivos do projeto.
+
+Por segurança, execs ``working`` são pulados por padrão. Use
+``--include-working`` somente quando o coordenador puder receber um prompt
+read-only durante o trabalho atual; agents ``blocked`` nunca são forçados.
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+write_json_atomic = core.write_json_atomic
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="hidrata os execs vivos com a política atual do Herdr",
+    )
+    ap.add_argument(
+        "--include-working", action="store_true",
+        help="também envia a hidratação a execs working (bloqueados continuam de fora)",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true",
+        help="lista os alvos e os que seriam pulados, sem enviar prompts",
+    )
+    ap.add_argument(
+        "--timeout", type=int, default=120000,
+        help="timeout de cada agent prompt em milissegundos (default: 120000)",
+    )
+    ap.add_argument(
+        "--metrics", metavar="ARQUIVO",
+        help="grava o resultado JSON neste caminho",
+    )
+    args = ap.parse_args()
+    if args.timeout <= 0:
+        ap.error("--timeout deve ser maior que zero")
+
+    core.require_herdr_pane()
+    agents = core.api("agent", "list").get("agents", [])
+    execs = sorted(
+        (a for a in agents if (a.get("name") or "").endswith("-exec")),
+        key=lambda a: a.get("name") or "",
+    )
+    if not execs:
+        print("nenhum *-exec vivo nesta sessão")
+        return 0
+
+    by_slug = {}
+    role_suffixes = ("-rev-1", "-rev-2", "-scout", "-exec", "-rev")
+    for agent in agents:
+        name = agent.get("name") or ""
+        slug = next((name[:-len(suffix)] for suffix in role_suffixes if name.endswith(suffix)), None)
+        if slug:
+            by_slug.setdefault(slug, []).append(name)
+
+    results = []
+    for entry in execs:
+        name = entry["name"]
+        status = entry.get("agent_status", "unknown")
+        if status == "blocked":
+            reason = "blocked — não forçado"
+            print(f"{name}: {reason}")
+            results.append({"name": name, "status": status, "action": "skipped", "reason": reason})
+            continue
+        if status == "working" and not args.include_working:
+            reason = "working — use --include-working se for seguro"
+            print(f"{name}: {reason}")
+            results.append({"name": name, "status": status, "action": "skipped", "reason": reason})
+            continue
+        if status not in ("idle", "done", "working"):
+            reason = f"estado {status} — não forçado"
+            print(f"{name}: {reason}")
+            results.append({"name": name, "status": status, "action": "skipped", "reason": reason})
+            continue
+
+        slug = name[:-5]
+        siblings = [n for n in by_slug.get(slug, []) if n != name]
+        prompt = core.exec_hydration_prompt(name, slug, entry.get("cwd", "?"), siblings)
+        if args.dry_run:
+            print(f"{name}: seria hidratado ({status})")
+            results.append({"name": name, "status": status, "action": "dry-run"})
+            continue
+
+        print(f"{name}: enviando hidratação ({status})...", flush=True)
+        try:
+            prompt_argv = core.herdr_argv("agent", "prompt", name, prompt)
+            if status != "working":
+                # Em um agent ocioso, aguardar idle/done confirma que o
+                # prompt foi processado e assentou. Um agent já trabalhando
+                # não deve ser interrompido só para observar esse estado.
+                prompt_argv += [
+                    "--wait", "--until", "idle", "--until", "done",
+                    "--timeout", str(args.timeout),
+                ]
+                wait_timeout = (args.timeout / 1000) + 30
+            else:
+                # --include-working é uma hidratação read-only durante o
+                # trabalho atual: a entrega aceita pelo CLI é o sinal de
+                # sucesso. Esperar o turno terminar produzia timeout falso
+                # mesmo quando o prompt já tinha chegado ao pane.
+                wait_timeout = 30
+            out = subprocess.run(
+                prompt_argv, capture_output=True, text=True, timeout=wait_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"{name}: falha enviando hidratação: {exc}", file=sys.stderr)
+            results.append({"name": name, "status": status, "action": "error", "error": str(exc)})
+            continue
+        if out.returncode == 0:
+            print(f"{name}: hidratação entregue")
+            results.append({
+                "name": name, "status": status, "action": "sent", "returncode": 0,
+                "waited_for_settle": status != "working",
+            })
+        else:
+            error = (out.stderr or out.stdout).strip()
+            print(f"{name}: agent prompt falhou: {error}", file=sys.stderr)
+            results.append({"name": name, "status": status, "action": "error", "returncode": out.returncode, "error": error})
+
+    payload = {
+        "marker": core.EXEC_HYDRATION_MARKER,
+        "include_working": args.include_working,
+        "dry_run": args.dry_run,
+        "results": results,
+    }
+    if args.metrics:
+        write_json_atomic(args.metrics, payload)
+        print(f"métricas: {args.metrics}")
+
+    return 0 if all(r["action"] not in ("error",) for r in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

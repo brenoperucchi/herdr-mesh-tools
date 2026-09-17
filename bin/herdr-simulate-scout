@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Simula a rota de escalonamento rev-1/rev-2 -> scout em um space descartável.
+# Deve ser executado no pane do <slug>-exec; herdr-ask mantém essa trava para
+# impedir disparos acidentais a partir de um terminal comum.
+set -Eeuo pipefail
+
+usage() {
+    cat <<'EOF'
+Uso: herdr-simulate-scout <slug> [opções]
+
+Roda os testes do herdr-mesh-tools e faz um smoke test da rota
+herdr-ask --reviewer scout. O slug precisa apontar para um space de teste que
+já tenha o agent <slug>-exec e o agent <slug>-scout.
+
+Opções:
+  --question-file ARQUIVO  usa esta pergunta; sem isso cria uma pergunta mínima
+  --context-file ARQUIVO   adiciona um arquivo de contexto (pode repetir)
+  --timeout SEGUNDOS       timeout do herdr-ask (default: 300)
+  --skip-tests             não roda a suíte antes do smoke test
+  --offline                prepara tudo, mas não envia prompt a nenhum agent
+  --allow-production       permite slugs conhecidos de produção (evite usar)
+  -h, --help               mostra esta ajuda
+
+Exemplos:
+  herdr-simulate-scout herdr-pilot
+  herdr-simulate-scout herdr-pilot --offline
+  herdr-simulate-scout herdr-pilot --context-file /tmp/duvida.md
+EOF
+}
+
+die() {
+    echo "herdr-simulate-scout: $*" >&2
+    exit 2
+}
+
+if (($# == 0)); then
+    usage >&2
+    exit 2
+fi
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+slug=$1
+shift
+question_file=""
+context_files=()
+timeout_s=300
+skip_tests=0
+offline=0
+allow_production=0
+
+while (($#)); do
+    case "$1" in
+        --question-file)
+            (($# >= 2)) || die "--question-file exige um caminho"
+            question_file=$2
+            shift 2
+            ;;
+        --context-file)
+            (($# >= 2)) || die "--context-file exige um caminho"
+            context_files+=("$2")
+            shift 2
+            ;;
+        --timeout)
+            (($# >= 2)) || die "--timeout exige um número"
+            timeout_s=$2
+            shift 2
+            ;;
+        --skip-tests)
+            skip_tests=1
+            shift
+            ;;
+        --offline)
+            offline=1
+            shift
+            ;;
+        --allow-production)
+            allow_production=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "opção desconhecida: $1 (use --help)"
+            ;;
+    esac
+done
+
+[[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || die "slug inválido: use letras, números, ponto, sublinhado ou hífen"
+[[ "$timeout_s" =~ ^[0-9]+$ ]] && ((timeout_s > 0)) \
+    || die "--timeout deve ser um inteiro maior que zero"
+
+case "$slug" in
+    mfc|homehub|herdr|omabackup|claude-bridge|llm|llm-bench|omasession|omaspotlight|dre)
+        ((allow_production)) || die "slug '$slug' parece ser de produção; use um space descartável ou --allow-production"
+        ;;
+esac
+
+caller_cwd=$(pwd -P)
+script_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+tool_root=$(cd "$(dirname "$script_path")/.." && pwd -P)
+ask_script="$tool_root/bin/herdr-ask"
+[[ -f "$ask_script" ]] || die "não encontrei $ask_script"
+
+for f in "$question_file" "${context_files[@]}"; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$f" ]] || die "arquivo não encontrado: $f"
+done
+
+input_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-scout-simulacao.XXXXXX")
+if [[ -z "$question_file" ]]; then
+    question_file="$input_dir/question.md"
+    cat >"$question_file" <<'EOF'
+# Simulação de escalonamento
+
+Há uma decisão ambígua entre duas opções. Analise somente as evidências fornecidas. Se não houver base suficiente para escolher uma posição, declare a incerteza explicitamente para o `-exec`.
+EOF
+fi
+
+if ((${#context_files[@]} == 0)); then
+    default_context="$input_dir/contexto.md"
+    cat >"$default_context" <<'EOF'
+# Evidências da simulação
+
+- Opção A: há evidência parcial a favor.
+- Opção B: há evidência conflitante.
+- Não há informação suficiente para resolver a disputa com alta confiança.
+EOF
+    context_files+=("$default_context")
+fi
+
+echo "space alvo: $slug"
+echo "cwd da consulta: $caller_cwd"
+echo "pergunta: $question_file"
+echo "contexto: ${context_files[*]}"
+echo "inputs temporários: $input_dir"
+
+if (( ! skip_tests )); then
+    echo
+    echo "== suíte do herdr-mesh-tools =="
+    (cd "$tool_root" && python3 -m unittest discover -s tests -q)
+fi
+
+ask_args=(
+    "$slug"
+    --question-file "$question_file"
+    --reviewer scout
+    --timeout "$timeout_s"
+)
+if ((${#context_files[@]})); then
+    ask_args+=(--context "${context_files[@]}")
+fi
+
+echo
+echo "== comando que será executado =="
+printf '  %q' python3 "$ask_script" "${ask_args[@]}"
+echo
+
+if ((offline)); then
+    echo "modo offline: nenhum prompt foi enviado"
+    exit 0
+fi
+
+if ! command -v herdr >/dev/null 2>&1; then
+    die "comando herdr não está no PATH"
+fi
+
+echo
+echo "== pré-checagem do scout =="
+if ! herdr agent get "${slug}-scout" >/dev/null 2>&1; then
+    die "agent '${slug}-scout' não foi encontrado; crie/registre o space de teste antes de simular"
+fi
+echo "${slug}-scout encontrado"
+
+ask_log="$input_dir/herdr-ask.log"
+echo
+echo "== escalonamento ao scout =="
+set +e
+(
+    cd "$caller_cwd"
+    python3 "$ask_script" "${ask_args[@]}"
+) 2>&1 | tee "$ask_log"
+ask_rc=${PIPESTATUS[0]}
+set -e
+
+round_dir=$(sed -nE 's/^consulta [0-9]+: (.*)$/\1/p' "$ask_log" | tail -n 1 || true)
+if [[ -n "$round_dir" && -d "$round_dir" ]]; then
+    echo
+    echo "== artefatos =="
+    echo "rodada: $round_dir"
+    [[ -f "$round_dir/metrics.json" ]] && echo "métricas: $round_dir/metrics.json"
+    answer="$round_dir/${slug}-scout/answer.md"
+    if [[ -f "$answer" ]]; then
+        echo
+        echo "--- resposta do scout ---"
+        sed -n '1,240p' "$answer"
+        echo "--- fim da resposta ---"
+    else
+        echo "resposta ainda não encontrada em $answer"
+    fi
+else
+    echo "log completo: $ask_log"
+fi
+
+if ((ask_rc != 0)); then
+    echo "herdr-ask terminou com código $ask_rc; log: $ask_log" >&2
+fi
+exit "$ask_rc"

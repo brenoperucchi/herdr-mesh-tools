@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Observa o contexto dos revisores sem resetar ou trocar seus perfis.
+
+O dispatcher usa este comando como uma sonda periódica. Ele só lê agentes em
+``idle``/``done`` e extrai o bloco ``Context window:`` do status renderizado
+pela CLI. Por padrão, consulta ``/status`` uma vez para obter uma medição atual;
+``--passive`` desliga essa consulta. Nenhuma decisão é aplicada automaticamente:
+o resultado é telemetria para o ``-exec`` decidir entre continuar, trocar o
+pane com ``herdr-swap`` ou consultar o operador.
+
+Uso:
+  herdr-context-watch --once --slug herdr
+  herdr-context-watch --slug herdr --interval 300 --output ~/.herdr/context-watch.json
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core
+
+
+DEFAULT_INTERVAL_S = 300.0
+DEFAULT_THRESHOLD_PERCENT = 20.0
+ROLE_SUFFIXES = ("-rev-1", "-rev-2", "-scout")
+
+# Anchored to the status block. Do not replace this with a loose search for a
+# percentage: prose in a pane can mention arbitrary context numbers.
+CONTEXT_WINDOW_RE = re.compile(
+    r"^\s*Context window:\s*"
+    r"(?P<left>[0-9]+(?:\.[0-9]+)?)%\s+left\s+\("
+    r"(?P<used>[0-9][0-9.,]*)\s*(?P<used_unit>[KMG]?)\s+used\s*/\s*"
+    r"(?P<total>[0-9][0-9.,]*)\s*(?P<total_unit>[KMG]?)"
+    r"(?:\s+tokens?)?\)",
+    re.IGNORECASE | re.MULTILINE,
+)
+MODEL_STATUS_RE = re.compile(
+    r"^\s*(?:Current\s+)?Model:\s*(?P<model>[^\n·|]+?)"
+    r"(?:\s+\(reasoning\s+(?P<inline_effort>[A-Za-z0-9_-]+)\b[^\n)]*\))?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+EFFORT_STATUS_RE = re.compile(
+    r"^\s*(?:Reasoning\s+)?Effort:\s*"
+    r"(?P<effort>[A-Za-z0-9_-]+)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _number(raw: str) -> float:
+    """Parse a display number accepting either decimal point or comma."""
+    value = raw.strip().replace(",", ".")
+    return float(value)
+
+
+def _tokens(raw: str, unit: str) -> int:
+    multipliers = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+    return int(round(_number(raw) * multipliers.get(unit.upper(), 1)))
+
+
+def parse_context_window(text: str) -> dict | None:
+    """Extract a structured context measurement or return ``None``.
+
+    The parser deliberately requires the exact status label and the complete
+    ``used / total`` tuple. A missing or differently formatted status is
+    ``unknown`` to the caller rather than an invitation to guess from prose.
+    """
+    matches = list(CONTEXT_WINDOW_RE.finditer(text or ""))
+    if not matches:
+        return None
+    match = matches[-1]
+    used_raw = match.group("used") + match.group("used_unit")
+    total_raw = match.group("total") + match.group("total_unit")
+    try:
+        left = float(match.group("left"))
+        used = _tokens(match.group("used"), match.group("used_unit"))
+        total = _tokens(match.group("total"), match.group("total_unit"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (0 <= left <= 100 and total > 0 and 0 <= used <= total):
+        return None
+    return {
+        "left_percent": left,
+        "used_display": used_raw,
+        "total_display": total_raw,
+        "used_tokens": used,
+        "total_tokens": total,
+        "source": "pane_status",
+    }
+
+
+def parse_runtime_status(text: str) -> dict:
+    """Extract either supported Claude status rendering when present."""
+    matches = list(MODEL_STATUS_RE.finditer(text or ""))
+    if not matches:
+        return {"observed": False, "source": "unknown"}
+    match = matches[-1]
+    effort = match.group("inline_effort")
+    if effort is None:
+        efforts = list(EFFORT_STATUS_RE.finditer(text or ""))
+        for effort_match in reversed(efforts):
+            if abs(match.start() - effort_match.start()) <= 2000:
+                effort = effort_match.group("effort")
+                break
+    if effort is None:
+        return {"observed": False, "source": "unknown"}
+    model = re.split(r"\s+(?:\(|·|\|)", match.group("model"), maxsplit=1)[0].strip()
+    return {
+        "observed": True,
+        "model": model,
+        "reasoning_effort": effort.casefold(),
+        "source": "pane_status",
+    }
+
+
+def _session_value(info: dict) -> str | None:
+    session = info.get("agent_session") or {}
+    return session.get("value") if isinstance(session, dict) else None
+
+
+def identity_snapshot(info: dict) -> dict:
+    """Fields used to detect a state change while reading a pane."""
+    return {
+        "agent": info.get("agent"),
+        "agent_status": info.get("agent_status"),
+        "pane_id": info.get("pane_id"),
+        "workspace_id": info.get("workspace_id"),
+        "tab_id": info.get("tab_id"),
+        "cwd": info.get("cwd"),
+        "foreground_cwd": info.get("foreground_cwd"),
+        "agent_session": _session_value(info),
+        "revision": info.get("revision"),
+        "state_change_seq": info.get("state_change_seq"),
+    }
+
+
+def _process_evidence(info: dict) -> dict:
+    pane_id = info.get("pane_id")
+    if not pane_id:
+        return {"observed": False, "error": "pane_id ausente"}
+    try:
+        process_info = core.api("pane", "process-info", "--pane", pane_id).get("process_info", {})
+    except Exception as exc:  # telemetry must not stop the other agents
+        return {"observed": False, "error": str(exc)}
+    processes = process_info.get("foreground_processes") or []
+    process = processes[0] if processes else None
+    if process is None:
+        return {"observed": False, "error": "nenhum processo foreground"}
+    return {
+        "observed": True,
+        "pid": process.get("pid"),
+        "argv": process.get("argv") or [],
+    }
+
+
+def observe_agent(name: str, threshold_percent: float, *, probe_status: bool = False) -> dict:
+    observed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        before = core.get_agent_info(name)
+    except Exception as exc:
+        return {"name": name, "state": "error", "error": str(exc), "observed_at": observed_at}
+
+    snapshot_before = identity_snapshot(before)
+    record = {
+        "name": name,
+        "observed_at": observed_at,
+        "identity_before": snapshot_before,
+        "status": before.get("agent_status"),
+    }
+    if before.get("agent_status") not in ("idle", "done"):
+        record["state"] = "skipped"
+        record["reason"] = "agent não está idle/done; nenhuma leitura de contexto feita"
+        return record
+
+    if probe_status:
+        try:
+            probe_result, probe_info, _ = core.dispatch_and_wait_all(
+                {name: "/status"},
+                30,
+                expected_agents={name: before},
+                check_composition=False,
+            )
+            probe_state = probe_result.get(name)
+            record["status_probe"] = {
+                "attempted": True,
+                "status": probe_state,
+                "info": probe_info.get(name),
+            }
+            if probe_state not in ("idle", "done"):
+                record["state"] = "unknown"
+                record["reason"] = f"sonda /status terminou em {probe_state!r}"
+                record["reason_code"] = "status_probe_failed"
+                return record
+            # /status cria uma nova saída e pode avançar state_change_seq. A
+            # leitura seguinte vira a nova base da janela, não uma corrida.
+            before = core.get_agent_info(name)
+            snapshot_before = identity_snapshot(before)
+            record["identity_before"] = snapshot_before
+            record["status"] = before.get("agent_status")
+        except Exception as exc:
+            record["status_probe"] = {"attempted": True, "error": str(exc)}
+            record["state"] = "unknown"
+            record["reason"] = f"falha na sonda /status: {exc}"
+            record["reason_code"] = "status_probe_failed"
+            return record
+
+    pane_id = before.get("pane_id")
+    if not pane_id:
+        record["state"] = "unknown"
+        record["reason"] = "pane_id ausente"
+        return record
+
+    try:
+        text = core._read_agent_recent(name, lines=120)
+    except Exception as exc:
+        record["state"] = "unknown"
+        record["reason"] = f"falha lendo pane: {exc}"
+        record["reason_code"] = "read_failed"
+        return record
+
+    context = parse_context_window(text)
+    runtime = parse_runtime_status(text)
+    record["runtime"] = runtime
+    record["process"] = _process_evidence(before)
+    record["context"] = context
+
+    try:
+        after = core.get_agent_info(name)
+    except Exception as exc:
+        record["state"] = "unknown"
+        record["reason"] = f"não consegui confirmar estado após leitura: {exc}"
+        record["reason_code"] = "identity_confirmation_failed"
+        record["context"] = None
+        record["runtime"] = None
+        record["process"] = None
+        return record
+    snapshot_after = identity_snapshot(after)
+    record["identity_after"] = snapshot_after
+    if snapshot_before != snapshot_after:
+        record["state"] = "race"
+        record["reason"] = "metadata mudou durante a leitura; medição descartada"
+        record["reason_code"] = "identity_changed"
+        record["context"] = None
+        record["runtime"] = None
+        record["process"] = None
+        return record
+
+    if context is None:
+        record["state"] = "unknown"
+        record["reason"] = "bloco Context window ausente ou não reconhecido"
+        record["reason_code"] = (
+            "unsupported_cli_format" if before.get("agent") == "claude"
+            else "status_unrecognized"
+        )
+    elif context["left_percent"] <= threshold_percent:
+        record["state"] = "near_limit"
+        record["recommendation"] = "avaliar herdr-swap; nenhuma ação automática foi feita"
+    else:
+        record["state"] = "ok"
+        record["recommendation"] = "continuar observando"
+    return record
+
+
+def _slug_from_name(name: str) -> str | None:
+    for suffix in ROLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def target_names(slug: str | None) -> list[str]:
+    if slug:
+        return [f"{slug}{suffix}" for suffix in ROLE_SUFFIXES]
+    agents = core.api("agent", "list").get("agents", [])
+    names = {
+        item.get("name")
+        for item in agents
+        if _slug_from_name(item.get("name") or "") is not None
+    }
+    return sorted(name for name in names if name)
+
+
+def run_once(slug: str | None, threshold_percent: float, *, probe_status: bool = False) -> dict:
+    try:
+        names = target_names(slug)
+        results = [observe_agent(name, threshold_percent, probe_status=probe_status) for name in names]
+    except Exception as exc:
+        # A transient daemon/list failure is telemetry, not a reason to kill a
+        # long-lived watcher. The next interval retries the complete snapshot.
+        names = []
+        results = [{"state": "error", "reason": str(exc),
+                    "reason_code": "target_enumeration_failed"}]
+    return {
+        "schema_version": 1,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "slug": slug,
+        "threshold_percent": threshold_percent,
+        "reset": False,
+        "prompt": False,
+        "status_probe": probe_status,
+        "agents": results,
+    }
+
+
+def write_output(path: str, payload: dict) -> None:
+    path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    lock_path = f"{path}.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--slug", help="space específico; sem ele observa todos os papéis vivos")
+    parser.add_argument("--once", action="store_true", help="faz uma leitura e sai")
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="segundos entre leituras (default: 300)")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD_PERCENT, help="percentual restante que gera near_limit (default: 20)")
+    parser.add_argument("--output", help="arquivo JSON publicado atomicamente a cada leitura")
+    parser.add_argument("--passive", action="store_true",
+                        help="não enviar /status; usa somente o buffer já visível")
+    args = parser.parse_args(argv)
+    if args.interval <= 0:
+        parser.error("--interval deve ser maior que zero")
+    if not 0 <= args.threshold <= 100:
+        parser.error("--threshold deve ficar entre 0 e 100")
+
+    core.require_herdr_pane()
+    try:
+        while True:
+            payload = run_once(args.slug, args.threshold, probe_status=not args.passive)
+            encoded = json.dumps(payload, ensure_ascii=False)
+            print(encoded, flush=True)
+            if args.output:
+                write_output(args.output, payload)
+            if args.once:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        print(f"erro: monitor de contexto falhou: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

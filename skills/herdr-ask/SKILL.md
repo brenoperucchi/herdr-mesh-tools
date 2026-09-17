@@ -1,12 +1,12 @@
 ---
 name: herdr-ask
-description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, pra uma pergunta de design ABERTA — não uma revisão de código. Use quando precisar de uma segunda (e terceira) opinião independente antes de decidir uma arquitetura, um trade-off, ou qualquer questão sem resposta óbvia — antes de construir, não depois. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec, com <slug>-rev-1 e <slug>-rev-2 vivos no mesmo space."
+description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, ou a terceira análise automática do <slug>-scout quando o exec julgar necessário após duas rodadas. Use para uma pergunta de design ABERTA — não uma revisão de código. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
 ---
 
 # herdr-ask
 
 Mesma mecânica cega/paralela do `herdr-review` (isolamento por diretório,
-congelamento de contexto, os dois assentando antes de você ler qualquer
+congelamento de contexto, os alvos assentando antes de você ler qualquer
 resposta), mas pra pergunta de design aberta em vez de revisão de código já
 feito. Não é bug hunt: não há achado atômico, não há `APPROVE`, não há
 CONFIRMADO/ÚNICO/CONFLITO — a resposta é uma **posição com premissas
@@ -69,7 +69,36 @@ Isso cria `.herdr/ask/<slug>-<n>/` (namespace **separado** de
 consultor dentro dela, escreve o `request.md` de cada um (protocolo de
 consulta + `.herdr/reviewer.md` do projeto, se existir, + sua pergunta),
 dispara `<slug>-rev-1` e `<slug>-rev-2` em paralelo, cegos um do outro, espera
-os dois assentarem.
+os dois assentarem. O dispatcher entrega a consulta aos panes existentes sem reset automático.
+Model e `reasoning_effort` podem ser capturados como evidência, mas não são
+permissão de despacho: diferenças, mudanças ou valores desconhecidos não
+abortam a consulta. Quando for necessária uma fronteira limpa, recrie o pane
+explicitamente com `herdr-swap`, copiando o handoff; para acompanhamento
+rotineiro use `herdr-context-watch`, que é somente leitura. Reasoning não é
+dimensão de seleção e nenhum default é inventado.
+
+O lifecycle do Herdr não acompanha a escrita do turno: `agent prompt --wait`
+pode devolver `done` antes de o consultor publicar `answer.md`. Por isso o
+dispatcher exige, além de `idle`/`done`, um `answer.md` regular, não vazio e
+novo (ou alterado) desde o disparo. Se o prazo terminar sem esse artefato, o
+resultado é `artifact_missing` e a consulta falha; nunca trate `done` com
+`answer_bytes: 0` como resposta válida. O `metrics.json` é publicado por um
+temporário no mesmo diretório e `os.replace`, de modo que leituras concorrentes
+não observem JSON parcial.
+
+Os panes de `rev-1`, `rev-2` e `scout` são headless. Uma composição residual
+(inclusive uma letra digitada por engano) é descartável e não impede o reset ou
+o próximo despacho; somente um diálogo real do CLI, reportado pelo canal
+oficial como `agent_blocked`, interrompe a cadeia. A proteção contra texto
+humano não enviado continua valendo para o `-exec` e para o `herdr-swap`.
+
+Antes de criar os prompts, o dispatcher revalida sob lock curto o snapshot
+capturado de cada alvo: status, pane, workspace, cwd, sessão, revision e
+`state_change_seq`, além da ausência de diálogo. Qualquer mudança aborta sem
+enviar e fica registrada em `preflight_error`. Se `agent_prompt --wait` retornar
+`agent_prompt_stalled`, a mesma checagem ocorre antes do único retry; um alvo já
+`working`, ou cuja sequência avançou, recebe `agent wait` e não um segundo
+prompt. O reenvio só ocorre com a identidade e o estado idle/done inalterados.
 
 Precisa que os dois leiam material além da pergunta em si (código real,
 outro doc)? `--context <path> [<path> ...]` congela cada arquivo no disparo
@@ -83,6 +112,35 @@ entre posições independentes, que é o ponto principal disto.
 Sai com código 0 só se todos os consultores despachados produziram resposta
 não vazia.
 
+Se um consultor obrigatório não estiver registrado (`agent_not_found`), o
+dispatcher tenta automaticamente `herdr-bootstrap --slug <slug>` antes de
+criar a consulta e só prossegue depois de observar o agent restaurado em
+`idle`/`done`. A tabela fornece perfil apenas quando não existe pane/base para
+reaproveitar; um pane já em uso conserva seu modelo e raciocínio durante
+limpeza, restauração ou swap. Falha real de recuperação é registrada como
+bloqueio operacional, sem enviar uma consulta parcial.
+
+## Terceira análise automática pelo scout
+
+Quando `herdr-review` encontrar uma disputa que o exec não consiga resolver,
+ou quando duas rodadas de correção terminarem com um achado aberto, o exec
+pode julgar necessária uma terceira análise. Nesse caso, escreva uma pergunta
+focada e execute automaticamente:
+
+```bash
+herdr-ask "$slug" --question-file /caminho/da-duvida.md \
+  --reviewer scout --context /caminho/material-relevante
+```
+
+O `--reviewer scout` envia para `<slug>-scout` sem reset implícito. Essa
+chamada é a terceira análise automática, não uma terceira rodada de correção
+dos revisores. O scout escreve `answer.md` para o
+`<slug>-exec`; não fala diretamente com o usuário, não decide pelo space e não
+faz commit. Se continuar incerto ou devolver uma divergência, declara isso
+explicitamente para o exec. Depois de ler a resposta, se o exec ainda julgar
+necessária outra análise, ou se houver INCERTEZA/DIVERGÊNCIA, somente ele leva a
+questão ao Breno.
+
 ## Ler e reconciliar
 
 Leia os `answer.md` de cada consultor (`<round_dir>/<slug>-rev-1/answer.md`,
@@ -95,7 +153,7 @@ premissas, não só da conclusão:
 | Conclusões | Premissas | O que é | O que fazer |
 |---|---|---|---|
 | iguais | iguais | convergência real | siga com confiança |
-| opostas | a mesma premissa carregando o peso | discordância genuína | leve pro usuário decidir |
+| opostas | a mesma premissa carregando o peso | discordância genuína | acione o scout; se continuar, somente o exec leva ao Breno |
 | opostas | diferentes | não é conflito — é uma questão de fato em aberto | resolva você mesmo descobrindo qual premissa vale (não precisa escalar) |
 
 A terceira linha é a mais fácil de errar: duas conclusões opostas parecem
@@ -110,7 +168,8 @@ entre posições.
   premissas, não é erro dele, mas não trate como se fosse mais rigoroso só
   por parecer uma lista.
 - Não decida sozinho uma discordância genuína (mesma premissa, conclusão
-  oposta) — isso é exatamente o caso que existe pra levar ao usuário.
+  oposta) — acione a terceira análise automática do scout; se a dúvida
+  continuar, somente o exec leva a questão ao Breno.
 - Não rode isso como substituto de `herdr-review` depois que o código já
   existe — nesse ponto a pergunta certa é "isso está correto", não "qual a
   melhor abordagem", e o formato de achado atômico do `herdr-review` serve

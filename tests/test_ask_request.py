@@ -59,6 +59,24 @@ class WriteRequestIsolationTests(unittest.TestCase):
         self.assertIn("CEGA", content)
         self.assertIn(sibling, content)
 
+    def test_scout_request_routes_only_back_to_exec(self):
+        self.mod.write_request(
+            self.tmpdir.name, self.verdict_dir, None,
+            "pergunta de escalonamento", None, {}, scout_exec="foo-exec",
+        )
+        content = self._read_request()
+        self.assertIn("Terceira análise automática pelo scout", content)
+        self.assertIn("resposta em `answer.md`", content)
+        self.assertIn("ele é quem consulta o Breno", content)
+        self.assertIn("não precisa de autorização prévia do Breno", content)
+        self.assertNotIn("diretório irmão", content)
+
+    def test_scout_target_is_the_space_scout(self):
+        self.assertEqual(
+            self.mod.target_names_for("foo", "foo-rev-1", "scout"),
+            ["foo-scout"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

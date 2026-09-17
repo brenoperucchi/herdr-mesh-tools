@@ -50,9 +50,35 @@ vale pra qualquer papel (`exec`, `rev`, `rev-2`, `scout`) de qualquer space:
 TODA revisão de código, consulta de design ou "segunda opinião" passa pelas
 skills `herdr-review` (código já pronto, pra revisar) ou `herdr-ask`
 (pergunta de design ABERTA, antes de construir) — nunca uma pela outra, e
-nunca um atalho fora das duas. As duas despacham pros panes reais e vivos
-do mesmo space (`<slug>-rev-1`, `<slug>-rev-2`); veja o `SKILL.md` de cada uma
-pro critério exato de quando usar qual.
+nunca um atalho fora das duas. O fluxo normal usa os panes reais e vivos
+`<slug>-rev-1` e `<slug>-rev-2`; uma indecisão ou um achado aberto depois do
+limite de duas rodadas usa, se o exec julgar necessário, uma terceira análise
+automática com `herdr-ask --reviewer scout`. O dispatcher não reseta
+automaticamente rev-1, rev-2 ou scout e não bloqueia pela troca de modelo ou
+reasoning; a recreação deliberada é feita por `herdr-swap` com handoff. O
+scout devolve a análise ao `<slug>-exec`; somente o exec leva ao Breno uma nova
+necessidade de análise ou uma divergência/incerteza que permaneça. Veja os
+`SKILL.md` de cada uma pro critério exato de quando usar cada rota. Qualquer
+perfil observado antes/depois de uma troca é evidência, não guarda de execução.
+Reasoning não escolhe o perfil; quando não for observável, registre `unknown` e
+nunca invente um default.
+
+## Papéis obrigatórios ausentes e perfil de restauração
+
+`<slug>-exec`, os dois revisores e `<slug>-scout` quando a tabela do space o
+declara são papéis obrigatórios. Se um dispatcher observar `agent_not_found`,
+ele chama automaticamente `herdr-bootstrap --slug <slug>` antes de criar
+snapshot, resetar contexto ou enviar prompt. O bootstrap é idempotente,
+revalida o registro e espera o papel recém-criado chegar a `idle`/`done`;
+texto de erro fica como falha operacional explícita, sem despachar uma rodada
+parcial.
+
+A tabela `SPACES` é a fonte de modelo, kind e raciocínio somente para uma
+inicialização em pane/tab sem base existente. O dispatcher não faz limpeza
+automática para aplicar essa tabela. Quando o owner decidir recriar um pane já
+em uso, `herdr-swap` copia o handoff, abre o sucessor e entrega o contexto; o
+perfil efetivo anterior e qualquer divergência ficam registrados como
+evidência. O exec do próprio space coordena essa operação.
 
 NUNCA use o sistema nativo de sub-agentes do seu próprio CLI (ex:
 `agents`/`pipeline_reviewer` do Codex, ou o tool `Agent` do Claude) como
@@ -190,6 +216,25 @@ herdr agent prompt reviewer "Review the current diff and report only actionable 
 `agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending any input. Inspect the blocked UI and ask the user before answering it. For normal agent work, `--wait` is enough: it waits for the first settled `idle`, `done`, or `blocked` state. Do not repeat those defaults with `--until`.
 
 A prompt sent from a non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
+
+File-producing dispatchers must apply a second completion boundary: the
+lifecycle response is only a candidate until the expected non-empty artifact
+has been published. `herdr-ask` waits for `answer.md` and
+`herdr-review-dispatch` waits for `verdict.md`; a missing artifact at the
+deadline is `artifact_missing`, even when Herdr reported `done`.
+
+Reviewers and scouts are headless panes. Residual text in their compose box is
+discardable and must not stop a reset or dispatch; only a real CLI dialog, or
+the official channel's `agent_blocked`, blocks the chain. Human compose guards
+remain enabled for `-exec` and for `herdr-swap`.
+
+File dispatchers also revalidate the pre-dispatch `agent get` snapshot under a
+short submission lock immediately before creating prompts. A change in status,
+pane, workspace, cwd, session, revision or `state_change_seq`, or a dialog,
+aborts without sending and is recorded as `preflight_error`. Before a retry
+after `agent_prompt_stalled`, a working target or an advanced sequence is
+waited on rather than prompted again; only an unchanged idle/done snapshot can
+authorize the single resend.
 
 Use `--until` only for a state-specific workflow, such as waiting for an already-running agent to request input:
 

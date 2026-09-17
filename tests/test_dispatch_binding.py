@@ -164,4 +164,5 @@ class ConfirmacaoDeEntregaTests(unittest.TestCase):
         """Sem marcador ou com falha de leitura, `prompt_chegou` devolve None --
         e None nao pode acionar reenvio nem ser lido como entrega confirmada."""
         fonte = open(os.path.join(BIN_DIR, "_herdr_dispatch.py")).read()
-        self.assertIn("chegou is False and name not in reenviados", fonte)
+        self.assertIn("chegou is not None", fonte)
+        self.assertIn("elif name not in reenviados", fonte)

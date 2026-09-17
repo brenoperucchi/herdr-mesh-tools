@@ -59,13 +59,23 @@ trocar em cima de `working`/`blocked`. Ele:
 2. Divide um pane novo do lado e sobe o novo `kind` ali sob um nome
    **provisório** (`<slug>-<role>-new`) — o agent antigo **continua vivo e
    intocado** nesse momento.
-3. Só depois de confirmar que o provisório respondeu (subiu de verdade, não
-   travou num diálogo desconhecido), fecha o pane antigo — **esse é o ponto de
-   não-retorno real**, tudo antes dele é reversível — e renomeia o provisório
-   pro nome final (`<slug>-<role>-new` → `<slug>-<role>`) via `herdr agent
-   rename`.
-4. Manda o novo agent (já com o nome final) ler o handoff antes de fazer
-   qualquer coisa — sem esperar resposta.
+3. Captura o perfil efetivo antes de criar o substituto. No Claude, envia
+   `/status` pelo canal oficial e aceita somente o par `Model`/`Effort` rotulado;
+   o cabeçalho de inicialização e o `argv` ficam como evidência, não como
+   seleção atual. Quando a família do destino é compatível, o swap passa
+   `--model` e o parâmetro de reasoning observado explicitamente; se a família
+   não for compatível ou a leitura estiver desconhecida, não inventa um
+   modelo.
+4. Envia o handoff ao provisório e exige `HERDR_HANDOFF_READ_OK` antes de
+   fechar o antigo. Se a confirmação não chegar, fecha somente o provisório e
+   mantém o processo antigo intacto.
+5. Só depois de confirmar que o provisório respondeu e leu o handoff, fecha o
+   pane antigo — **esse é o ponto de não-retorno real**, tudo antes dele é
+   reversível — e renomeia o provisório pro nome final (`<slug>-<role>-new` →
+   `<slug>-<role>`) via `herdr agent rename`.
+6. Na modalidade `--em-tab-novo`, a segunda fase revalida sessão, pane,
+   workspace, cwd e revisão dos dois panes e executa a verificação antes de
+   qualquer close. Se qualquer identidade mudar, aborta preservando ambos.
 
 **Se o passo 2 falhar** (o novo kind não sobe): o script já fecha sozinho o
 pane provisório e imprime que o agent antigo **não foi tocado** — nada a

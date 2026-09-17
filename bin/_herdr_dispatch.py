@@ -10,22 +10,85 @@ código e consulta de design produzem respostas estruturalmente diferentes
 (lista de achados atômicos vs. posição com premissas) e forçar as duas no
 mesmo texto pesa mais do que ajuda.
 """
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 CLI_TIMEOUT_S = 30  # teto por chamada individual ao binario herdr, nao pelo ciclo inteiro
 BLOCKED_GRACE_S = 15  # quanto tempo em blocked sustentado ate reportar sem esperar o --timeout inteiro
+AGENT_RESTORE_TIMEOUT_S = 300  # teto para um papel recém-criado chegar a idle/done
+DISPATCH_LOCK_WAIT_S = 30  # não deixar uma segunda rodada parecer travada em silêncio
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def write_json_atomic(path, payload):
+    """Grava JSON em um temporário do mesmo diretório e publica com replace.
+
+    Métricas são lidas por outros processos enquanto uma rodada pode estar
+    terminando. ``open(path, 'w')`` expõe uma janela em que o arquivo existe,
+    mas contém apenas parte do JSON; ``os.replace`` mantém sempre a versão
+    anterior ou a nova versão completa visível.
+    """
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _artifact_snapshot(path):
+    """Retorna metadados de um artefato regular, não vazio, ou ``None``."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    if not os.path.isfile(path) or stat.st_size <= 0:
+        return None
+    return {
+        "path": os.path.abspath(path),
+        "bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "inode": stat.st_ino,
+    }
+
+
+def _artifact_changed_and_ready(path, baseline):
+    """Aceita só um artefato não vazio novo ou alterado desde o dispatch."""
+    current = _artifact_snapshot(path)
+    if current is None:
+        return None
+    if baseline is not None and all(
+        current[key] == baseline[key] for key in ("bytes", "mtime_ns", "inode")
+    ):
+        return None
+    return current
 
 
 def herdr_argv(*args):
@@ -62,6 +125,175 @@ def api(*args):
 
 def get_agent_info(name):
     return api("agent", "get", name)["agent"]
+
+
+class AgentRestoreError(RuntimeError):
+    """Falha operacional ao restaurar um papel obrigatório ausente.
+
+    ``agent_not_found`` é recuperável quando a entrada do space existe na
+    tabela do bootstrap. Esta exceção só sai depois de a tentativa automática
+    falhar, com a causa observável preservada para o dispatcher registrar em
+    vez de deixar um traceback ou um alvo parcialmente despachado.
+    """
+
+
+def _is_agent_not_found(exc):
+    return "agent_not_found" in str(exc).casefold()
+
+
+def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S):
+    """Espera um agent criado pelo bootstrap chegar a um estado assentado.
+
+    ``herdr agent start`` pode retornar enquanto o reforço de papel ainda está
+    trabalhando. O dispatcher não deve confundir esse intervalo com uma
+    revisão já em andamento, nem disparar por cima dele. Diálogo/blocked é
+    uma falha real e continua sendo tratado como tal.
+    """
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while True:
+        try:
+            info = get_agent_info(name)
+        except RuntimeError as exc:
+            if _is_agent_not_found(exc):
+                last = str(exc)
+                if time.monotonic() >= deadline:
+                    raise AgentRestoreError(
+                        f"agent '{name}' não reapareceu após a recuperação automática: {last}"
+                    ) from exc
+                time.sleep(0.5)
+                continue
+            raise AgentRestoreError(
+                f"não consegui observar '{name}' após a recuperação automática: {exc}"
+            ) from exc
+        last = info
+        status = info.get("agent_status")
+        if status in ("idle", "done"):
+            return info
+        if status == "blocked":
+            raise AgentRestoreError(
+                f"agent '{name}' foi restaurado, mas ficou blocked; confira o diálogo antes de continuar"
+            )
+        if time.monotonic() >= deadline:
+            raise AgentRestoreError(
+                f"agent '{name}' não chegou a idle/done em {timeout_s}s após a recuperação "
+                f"(estado observado: {status!r})"
+            )
+        time.sleep(0.5)
+
+
+@contextmanager
+def _agent_restore_lock(slug):
+    """Serializa recuperações do mesmo space neste host.
+
+    Dois dispatchers que observam a mesma ausência ao mesmo tempo não podem
+    abrir duas tabs para o mesmo papel. O lock cobre a nova observação, o
+    bootstrap e a confirmação; outro slug continua independente.
+    """
+    lock_dir = os.path.join(tempfile.gettempdir(), "herdr-agent-restore-locks")
+    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug) or "space"
+    path = os.path.join(lock_dir, f"{component}.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def ensure_required_agents(slug, cwd, required_names):
+    """Serializa e executa a recuperação de papéis obrigatórios ausentes."""
+    with _agent_restore_lock(slug):
+        return _ensure_required_agents_locked(slug, cwd, required_names)
+
+
+def _ensure_required_agents_locked(slug, cwd, required_names):
+    """Garante que os papéis obrigatórios existem antes de criar uma rodada.
+
+    A tabela única de ``herdr-bootstrap`` é a fonte dos perfis usados quando
+    não há um pane/base existente. O helper é chamado pelos dispatchers antes
+    de qualquer validação, snapshot ou prompt: se um nome sumiu do registro,
+    executa um bootstrap **somente para esse slug**, reobserva os agentes e só
+    retorna quando os recém-criados estão prontos. Um pane já ocupado nunca é
+    reiniciado nem recebe o perfil da tabela; o bootstrap só usa um pane/tab
+    vazio para uma inicialização sem base.
+
+    Retorna um registro pequeno para ``metrics.json``. Erros de servidor,
+    diálogo ou falta de uma entrada na tabela são ``AgentRestoreError`` e não
+    são mascarados como revisão concluída.
+    """
+    names = list(dict.fromkeys(required_names))
+    observed = {}
+    missing = []
+    for name in names:
+        try:
+            observed[name] = get_agent_info(name)
+        except RuntimeError as exc:
+            if _is_agent_not_found(exc):
+                missing.append(name)
+                continue
+            raise AgentRestoreError(
+                f"não consegui consultar o agent obrigatório '{name}': {exc}"
+            ) from exc
+
+    result = {
+        "attempted": bool(missing),
+        "missing_before": missing,
+        "restored": [],
+    }
+    if not missing:
+        return result
+
+    bootstrap = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
+    command = [sys.executable, bootstrap, "--slug", slug]
+    try:
+        out = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=AGENT_RESTORE_TIMEOUT_S,
+            cwd=cwd,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AgentRestoreError(
+            f"recuperação automática dos agents ausentes ({', '.join(missing)}) "
+            f"não respondeu em {AGENT_RESTORE_TIMEOUT_S}s"
+        ) from exc
+    except OSError as exc:
+        raise AgentRestoreError(
+            f"não consegui executar o bootstrap para recuperar {', '.join(missing)}: {exc}"
+        ) from exc
+
+    result["bootstrap_returncode"] = out.returncode
+    result["bootstrap_stdout"] = (out.stdout or "")[-4000:]
+    result["bootstrap_stderr"] = (out.stderr or "")[-4000:]
+    if out.returncode != 0:
+        raise AgentRestoreError(
+            f"bootstrap não conseguiu recuperar {', '.join(missing)} "
+            f"(exit {out.returncode}): {result['bootstrap_stderr'] or result['bootstrap_stdout']}"
+        )
+
+    for name in names:
+        if name in missing:
+            # The bootstrap may return before Herdr registers the new name;
+            # let the bounded retry observe it instead of failing on an
+            # eager lookup that defeats _wait_restored_agent.
+            info = _wait_restored_agent(name)
+            result["restored"].append(name)
+            observed[name] = info
+            continue
+        try:
+            info = get_agent_info(name)
+        except RuntimeError as exc:
+            raise AgentRestoreError(
+                f"bootstrap terminou, mas o agent obrigatório '{name}' continua ausente: {exc}"
+            ) from exc
+        observed[name] = info
+    return result
 
 
 def agent_status(name):
@@ -326,6 +558,22 @@ subagentes nativos; não crie agent/pane novo para fricção; e, se houver
 discordância factual genuína, encaminhe pela rota aprovada de `herdr-ask`.
 Este aviso vale para ambos os revisores e deve ser repetido na próxima rodada.
 
+Política de escalonamento que o exec deve aplicar ao ciclo de revisão:
+
+5. O fluxo normal usa `rev-1` e `rev-2`, com no máximo duas rodadas de
+   correção. Se depois delas você julgar necessária uma análise adicional,
+   chame automaticamente `herdr-ask --reviewer scout`; isso é a terceira
+   análise do ciclo, não uma terceira rodada de correção dos revisores, e não
+   exige autorização prévia do Breno.
+6. O dispatcher entrega a dúvida ao scout existente sem reset automático. Se
+   uma fronteira limpa for necessária, o exec usa `herdr-swap` com handoff;
+   `herdr-context-watch` mede o contexto somente em leitura.
+7. O scout devolve `answer.md` ao `{slug}-exec`; não fala diretamente com o
+   usuário, não decide pelo space e não faz commit. Depois de ler a resposta,
+   se você ainda julgar necessária outra análise, ou se o scout registrar
+   divergência ou incerteza, pare e consulte o Breno. A decisão final deve estar
+   registrada antes de qualquer commit.
+
 Canal oficial para falar com outro agent: a CLI, `herdr agent prompt <alvo>
 "<texto>"`. Ela entrega pelo caminho suportado — respeita bracketed-paste,
 manda o Enter codificado e RECUSA com `agent_blocked` se o alvo estiver
@@ -337,6 +585,21 @@ ambiente em 2026-09-10 — eram pacote de terceiro que chamava um subcomando
 `pane send-text` + `send-keys enter`, que escreve direto na caixa de
 composição e, se houver rascunho humano não enviado ali, concatena e submete
 junto (dois incidentes reais registrados no CLAUDE.md do usuário)."""
+
+# Os revisores e o scout não são superfícies de conversa humana. Um texto que
+# ficou na caixa de composição por erro de teclado é descartável; a decisão e
+# qualquer escalonamento passam pelo exec. A guarda de composição continua
+# ativa no exec e no swap, onde pode haver uma pessoa operando o pane.
+HEADLESS_REVIEWER_NOTE = """
+
+Panes headless de revisão: `{slug}-rev-1`, `{slug}-rev-2` e `{slug}-scout` são
+usados somente para análise. Texto residual na caixa de composição (inclusive
+uma letra isolada digitada por engano) não é autorização humana e não deve
+parar o fluxo de reset ou despacho; o dispatcher pode descartá-lo e seguir
+pelo canal oficial. Um diálogo real do CLI ainda pode ser recusado como
+`agent_blocked`. O `{slug}-exec` é quem consolida a análise e fala com Breno;
+a guarda de composição humana permanece no exec e no `herdr-swap`.
+"""
 
 SCOUT_ROLE_NOTE = """
 
@@ -381,23 +644,67 @@ def role_reinforcement_prompt(name, slug, cwd, siblings):
     if _infer_role(name) == "scout":
         exec_name = f"{slug}-exec"
         prompt += SCOUT_ROLE_NOTE.format(name=name, exec_name=exec_name)
+    prompt += HEADLESS_REVIEWER_NOTE.format(slug=slug)
     return prompt
 
 
-_COMPOSE_LINE_RE = re.compile(r"^(❯|›)\s+(\S.*)$")
+EXEC_HYDRATION_MARKER = "HERDR_EXEC_POLICY_ESCALATION_2026_09_14"
+
+
+def exec_hydration_prompt(name, slug, cwd, siblings):
+    """Prompt read-only para atualizar um exec que já estava vivo.
+
+    O bootstrap já entrega ``role_reinforcement_prompt`` quando cria ou troca
+    um agent. Este complemento existe para a mudança de política: editar uma
+    skill no disco não altera a janela de contexto de uma sessão que continua
+    rodando. O marcador permite confirmar nos logs que a hidratação foi
+    enviada, sem resetar a sessão nem apagar o trabalho do exec.
+    """
+    if _infer_role(name) != "exec":
+        raise ValueError(f"hidratação de exec recebeu papel inesperado: {name}")
+    return role_reinforcement_prompt(name, slug, cwd, siblings) + f"""
+
+Hidratação da política de escalonamento — {EXEC_HYDRATION_MARKER}
+
+As skills compartilhadas foram atualizadas; releia, em modo read-only,
+`skills/herdr/SKILL.md`, `skills/herdr-review/SKILL.md` e
+`skills/herdr-ask/SKILL.md` no projeto de ferramentas. A regra operacional é:
+`rev-1` e `rev-2` têm no máximo duas rodadas de correção. Se depois delas este
+exec julgar necessária uma análise adicional, chama automaticamente
+`herdr-ask --reviewer scout`, sem pedir autorização prévia ao Breno. O
+dispatcher não limpa nem reseta revisores automaticamente: preserve o modelo e
+o reasoning observados e use `herdr-swap` quando uma troca de pane for
+necessária. O scout devolve somente para este exec, nunca diretamente ao
+usuário, e não decide nem faz commit. Se o scout registrar divergência ou
+incerteza, ou se este exec ainda julgar necessária outra análise, pare e leve a
+questão ao Breno. Registre a decisão final antes de qualquer commit.
+
+Não edite arquivos nesta hidratação. Confirme somente com:
+`{EXEC_HYDRATION_MARKER} ACK`.
+"""
+
+
+_COMPOSE_LINE_RE = re.compile(r"^(❯|›)(?:\s+(.*?))?\s*$")
+_COMPOSE_PLACEHOLDERS = {"ask codex to do anything"}
 _PENDING_MARKERS = (
     "interrupted", "what should claude do instead", "do you trust",
     "confia", "trust the contents",
 )
 
 
-def pane_looks_busy_with_human_input(pane_id, lines=12):
+def pane_looks_busy_with_human_input(pane_id, lines=12, *, check_composition=True):
     """Heurística, não garantia: lê o pane (`--source detection`, o buffer
     que o próprio Herdr usa pra detectar estado de agent, onde a caixa de
     composição vive) e sinaliza suspeita de texto humano não confirmado ou
     diálogo pendente. Existe uma corrida real que isso não fecha: texto pode
     chegar ENTRE essa leitura e a ação seguinte — reduz a janela, não prova
     segurança. Ver discussão em herdr-6 (herdr-ask) sobre os limites disso.
+
+    ``check_composition=False`` é usado somente para revisores/scout
+    headless. Nesses panes, um rascunho residual (inclusive uma letra digitada
+    por engano) não é uma aprovação humana nem deve interromper a cadeia; um
+    diálogo real continua sendo reportado. O pane do ``-exec`` mantém o valor
+    padrão, assim como o swap, que pode estar operando sobre uma sessão humana.
 
     Retorna (suspeito: bool, motivo: str|None). Em qualquer erro de leitura,
     trata como suspeito (falha segura, não silenciosa)."""
@@ -411,18 +718,763 @@ def pane_looks_busy_with_human_input(pane_id, lines=12):
     if out.returncode != 0:
         return True, f"falha lendo pane pra checar composição: {out.stderr.strip()}"
     text = out.stdout
+    # O source `detection` inclui prompts já enviados que ainda estão no
+    # buffer. A caixa atual é o ÚLTIMO marcador `❯`/`›`; olhar o primeiro
+    # confundia o histórico de uma revisão com um rascunho humano (observado
+    # no piloto herdr-20). O Codex também deixa um placeholder explícito
+    # quando a caixa está vazia.
+    compose = None
     for line in text.splitlines():
         m = _COMPOSE_LINE_RE.match(line.strip())
         if m:
-            return True, f"caixa de composição parece ter texto não enviado: {m.group(2)[:80]!r}"
-    lowered = text.lower()
+            compose = (m.group(2) or "").strip()
+    if check_composition and compose and compose.casefold() not in _COMPOSE_PLACEHOLDERS:
+        return True, f"caixa de composição parece ter texto não enviado: {compose[:80]!r}"
+    # Diálogos ficam no fim do buffer; restringir a janela evita que uma
+    # palavra como "interrupted" de uma resposta antiga arme o guard.
+    lowered = "\n".join(text.splitlines()[-8:]).lower()
     for marker in _PENDING_MARKERS:
         if marker in lowered:
             return True, f"pane mostra diálogo/pergunta pendente (marcador: {marker!r})"
     return False, None
 
 
-def dispatch_and_wait_all(prompts, timeout_s):
+class DispatchPreflightError(RuntimeError):
+    """O alvo mudou entre a leitura decisória e a submissão do prompt."""
+
+    def __init__(self, name, reason, expected=None, observed=None):
+        self.name = name
+        self.reason = reason
+        self.expected = expected
+        self.observed = observed
+        super().__init__(
+            f"preflight do dispatch abortado para '{name}': {reason}"
+        )
+
+    def as_dict(self):
+        return {
+            "name": self.name,
+            "reason": self.reason,
+            "expected": self.expected,
+            "observed": self.observed,
+        }
+
+
+# Campos que identificam o agent/pane que recebeu a decisão. `agent_status` e
+# `state_change_seq` ficam fora daqui porque são os sinais de lifecycle que
+# podem mudar quando o primeiro prompt finalmente começa; a política de
+# retry trata essa transição como evidência para esperar, nunca para duplicar.
+_DISPATCH_IDENTITY_FIELDS = (
+    "agent",
+    "pane_id",
+    "workspace_id",
+    "tab_id",
+    "cwd",
+    "foreground_cwd",
+    "revision",
+)
+
+
+def _agent_session_value(info):
+    session = info.get("agent_session") if isinstance(info, dict) else None
+    if isinstance(session, dict):
+        return session.get("value")
+    return session
+
+
+def _dispatch_state_view(info):
+    """Extrai só metadados serializáveis relevantes para uma decisão."""
+    if not isinstance(info, dict):
+        return None
+    view = {field: info.get(field) for field in _DISPATCH_IDENTITY_FIELDS}
+    view.update({
+        "agent_session": _agent_session_value(info),
+        "agent_status": info.get("agent_status"),
+        "state_change_seq": info.get("state_change_seq"),
+    })
+    return view
+
+
+def _dispatch_differences(expected, observed, *, include_lifecycle=True):
+    """Lista campos que mudaram entre duas leituras de `agent get`."""
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return ["metadata"]
+    fields = list(_DISPATCH_IDENTITY_FIELDS) + ["agent_session"]
+    if include_lifecycle:
+        fields += ["agent_status", "state_change_seq"]
+    differences = []
+    for field in fields:
+        if field == "agent_session":
+            before = _agent_session_value(expected)
+            after = _agent_session_value(observed)
+        else:
+            before = expected.get(field)
+            after = observed.get(field)
+        # A caller may provide a reduced fixture in a unit test or an older
+        # Herdr response may omit an optional field. Compare a field whenever
+        # the expected snapshot actually contains a value; a present value
+        # changing to None is still a mismatch.
+        expected_has_value = before is not None
+        if expected_has_value and before != after:
+            differences.append(f"{field}: {before!r} -> {after!r}")
+    return differences
+
+
+def _dispatch_observe(name, expected, *, check_composition=True,
+                      include_lifecycle=True, allow_working=False):
+    """Revalida identidade, lifecycle e diálogo imediatamente antes do envio."""
+    try:
+        observed = get_agent_info(name)
+    except RuntimeError as exc:
+        raise DispatchPreflightError(
+            name,
+            f"não consegui revalidar o agent: {exc}",
+            expected=_dispatch_state_view(expected),
+        ) from exc
+
+    differences = _dispatch_differences(
+        expected, observed, include_lifecycle=include_lifecycle
+    )
+    if differences:
+        raise DispatchPreflightError(
+            name,
+            "metadata mudou (" + "; ".join(differences) + ")",
+            expected=_dispatch_state_view(expected),
+            observed=_dispatch_state_view(observed),
+        )
+    status = observed.get("agent_status")
+    allowed_statuses = ("idle", "done", "working") if allow_working else ("idle", "done")
+    if status not in allowed_statuses:
+        raise DispatchPreflightError(
+            name,
+            f"estado não enviável: {status!r} (esperado idle/done"
+            + ("/working" if allow_working else "") + ")",
+            expected=_dispatch_state_view(expected),
+            observed=_dispatch_state_view(observed),
+        )
+    pane_id = observed.get("pane_id")
+    if not pane_id:
+        raise DispatchPreflightError(
+            name,
+            "pane_id ausente na revalidação",
+            expected=_dispatch_state_view(expected),
+            observed=_dispatch_state_view(observed),
+        )
+    busy, why = pane_looks_busy_with_human_input(
+        pane_id, check_composition=check_composition
+    )
+    if busy:
+        raise DispatchPreflightError(
+            name,
+            f"diálogo pendente antes do envio: {why}",
+            expected=_dispatch_state_view(expected),
+            observed=_dispatch_state_view(observed),
+        )
+    return observed
+
+
+def _lock_component(value):
+    value = str(value or "unknown")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:120]
+
+
+@contextmanager
+def _dispatch_submission_locks(expected_agents):
+    """Serializa todo o ciclo de submissão e assentamento por agent.
+
+    O lock não substitui a comparação de metadata: ele impede dois
+    dispatchers deste host de passar pela mesma janela ao mesmo tempo, e a
+    revalidação sob o lock ainda aborta se outro processo já tiver alterado o
+    alvo. O chamador mantém o lock até o subprocesso e os artefatos assentarem.
+    """
+    if not expected_agents:
+        yield
+        return
+    lock_dir = os.path.join(tempfile.gettempdir(), "herdr-dispatch-locks")
+    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    descriptors = []
+    try:
+        for name in sorted(expected_agents):
+            expected = expected_agents[name] or {}
+            key = "{}-{}".format(
+                _lock_component(expected.get("workspace_id")),
+                _lock_component(name),
+            )
+            path = os.path.join(lock_dir, f"{key}.lock")
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            deadline = time.monotonic() + DISPATCH_LOCK_WAIT_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        raise DispatchLockBusyError(
+                            name,
+                            f"outro dispatcher mantém o alvo reservado; "
+                            f"aguarde e tente novamente (limite {DISPATCH_LOCK_WAIT_S}s)",
+                        )
+                    time.sleep(0.2)
+            descriptors.append(fd)
+        yield
+    finally:
+        for fd in reversed(descriptors):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+class DispatchLockBusyError(RuntimeError):
+    """Outro dispatcher ainda possui a reserva do mesmo agent."""
+
+    def __init__(self, name, message):
+        self.name = name
+        super().__init__(message)
+
+
+class ContextResetError(RuntimeError):
+    """Falha operacional do helper de reset legado (fora do dispatch normal)."""
+
+
+# Revisores e scout não são mais resetados automaticamente pelo dispatcher.
+# A troca explícita (`herdr-swap`) é a única operação que recria um pane e
+# transfere o contexto; o monitor periódico observa o tamanho da conversa sem
+# enviar comandos. Mantemos `reset_reviewer_context()` abaixo para ferramentas
+# legadas e testes, mas nenhum ciclo normal deve chamá-lo.
+AUTOMATIC_REVIEWER_RESET = False
+
+
+def skipped_reset_info(names):
+    """Retorna evidência explícita de que o reset foi deliberadamente pulado."""
+    return {
+        name: {
+            "skipped": True,
+            "reason": "reset automático desativado; use herdr-swap para recriar o pane",
+        }
+        for name in names
+    }
+
+
+_RESET_COMMANDS = {
+    "codex": "/new",
+    "claude": "/clear",
+}
+
+
+def _read_agent_recent(name, lines=80):
+    """Lê a saída recente de um agent para validar uma sonda de contexto."""
+    try:
+        out = subprocess.run(
+            herdr_argv(
+                "agent", "read", name, "--source", "recent-unwrapped",
+                "--lines", str(lines), "--format", "text",
+            ),
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ContextResetError(f"falha lendo a resposta da sonda: {exc}") from exc
+    if out.returncode != 0:
+        raise ContextResetError(
+            f"falha lendo a resposta da sonda: {out.stderr.strip() or out.stdout.strip()}"
+        )
+    return out.stdout
+
+
+_RUNTIME_EFFORTS = "minimal|low|medium|high|xhigh|max"
+_RUNTIME_FOOTER_RE = re.compile(
+    rf"(?:^|\s)(?P<model>(?:gpt[-a-z0-9.]*[a-z0-9]|o[0-9][a-z0-9.-]*|claude[-a-z0-9.]*[a-z0-9]|sonnet[-a-z0-9.]*[a-z0-9]|opus[-a-z0-9.]*[a-z0-9]))\s+"
+    rf"(?P<effort>{_RUNTIME_EFFORTS})\b",
+    re.I,
+)
+_CLAUDE_HEADER_RE = re.compile(
+    rf"\b(?P<model>(?:opus|sonnet|claude)[-a-z0-9. ]*[a-z0-9])\s+"
+    rf"(?:\([^\n)]*\)\s+)?with\s+(?P<effort>{_RUNTIME_EFFORTS})\s+effort\b",
+    re.I,
+)
+# Claude's startup banner is historical display text: after an interactive
+# `/model`, it can continue showing the model with which the process started.
+# `/status` emits labelled fields instead.  Keep these expressions anchored to
+# the labels so prose such as "Model: ..." in a handoff cannot become a
+# runtime reading.
+_CLAUDE_STATUS_MODEL_RE = re.compile(
+    r"^\s*(?:Current\s+)?Model:\s*(?P<model>[^\n·|]+?)"
+    rf"(?:\s+\(reasoning\s+(?P<inline_effort>{_RUNTIME_EFFORTS})\b[^\n)]*\))?\s*$",
+    re.I | re.M,
+)
+_CLAUDE_STATUS_EFFORT_RE = re.compile(
+    rf"^\s*(?:Reasoning\s+)?Effort:\s*(?P<effort>{_RUNTIME_EFFORTS})\b",
+    re.I | re.M,
+)
+
+
+def _claude_status_runtime(text):
+    """Return a complete runtime pair from an explicit Claude status block.
+
+    A partial block is deliberately ignored.  The caller may then retain the
+    process/legacy-banner evidence, but must not call it an effective profile.
+    """
+    models = list(_CLAUDE_STATUS_MODEL_RE.finditer(text or ""))
+    efforts = list(_CLAUDE_STATUS_EFFORT_RE.finditer(text or ""))
+    if not models:
+        return None
+    # Pair labels from the same recent status rendering.  Do not combine a
+    # stale `Model:` line with an unrelated `Effort:` mention from prose.
+    pair = None
+    inline_effort = None
+    for model_match in reversed(models):
+        inline_effort = model_match.groupdict().get("inline_effort")
+        if inline_effort:
+            pair = (model_match, None)
+            break
+        for effort_match in reversed(efforts):
+            if abs(model_match.start() - effort_match.start()) <= 2000:
+                pair = (model_match, effort_match)
+                break
+        if pair:
+            break
+    if pair is None:
+        return None
+    model = pair[0].group("model").strip()
+    # Some Claude builds append context/billing metadata to the label, e.g.
+    # ``Opus 5 (1M context)``.  Keep only the model identifier for a future
+    # explicit `--model` launch flag.
+    model = re.split(r"\s+(?:\(|·|\|)", model, maxsplit=1)[0].strip()
+    effort = (inline_effort or pair[1].group("effort")).casefold()
+    if not model or effort not in _RUNTIME_EFFORTS.split("|"):
+        return None
+    return model, effort
+
+
+def _agent_foreground_argv(pane_id, kind):
+    """Retorna argv/pid do processo principal do CLI naquele pane.
+
+    ``agent get`` expõe o papel e o pane, mas não expõe model/effort. O
+    processo em foreground é a fonte passiva que continua válida durante
+    ``/clear`` e ``/new``; processos auxiliares de MCP são ignorados pelo
+    nome/caminho do executável do CLI.
+    """
+    try:
+        process_info = api("pane", "process-info", "--pane", pane_id).get("process_info", {})
+    except (RuntimeError, KeyError, TypeError) as exc:
+        raise ContextResetError(
+            f"não consegui ler process-info do pane {pane_id}: {exc}"
+        ) from exc
+    processes = process_info.get("foreground_processes") or []
+    for process in processes:
+        argv = process.get("argv") or []
+        executable = os.path.basename(argv[0]) if argv else ""
+        if process.get("name") == kind or executable == kind:
+            return argv, process.get("pid")
+    raise ContextResetError(
+        f"não encontrei o processo {kind!r} no foreground do pane {pane_id}"
+    )
+
+
+def _runtime_settings_from_argv(argv):
+    """Extrai model e effort explicitamente pinados no argv do CLI."""
+    model = effort = None
+    for i, arg in enumerate(argv):
+        if arg.startswith("--model="):
+            model = arg.split("=", 1)[1]
+        elif arg in ("--model", "-m") and i + 1 < len(argv):
+            model = argv[i + 1]
+        elif arg.startswith("--effort="):
+            effort = arg.split("=", 1)[1]
+        elif arg == "--effort" and i + 1 < len(argv):
+            effort = argv[i + 1]
+        elif arg.startswith("-c=") or arg.startswith("--config="):
+            setting = arg.split("=", 1)[1]
+            if setting.startswith("model_reasoning_effort="):
+                effort = setting.split("=", 1)[1]
+        elif arg in ("-c", "--config") and i + 1 < len(argv):
+            setting = argv[i + 1]
+            if setting.startswith("model_reasoning_effort="):
+                effort = setting.split("=", 1)[1]
+        elif arg.startswith("model_reasoning_effort="):
+            effort = arg.split("=", 1)[1]
+    return model, effort
+
+
+def _canonical_runtime_model(model):
+    if model is None:
+        return None
+    value = str(model).casefold().strip().replace("-", " ")
+    value = re.sub(r"\s+", " ", value)
+    if value.startswith("claude "):
+        value = value[7:]
+    value = value.replace(" ", "")
+    return {"opus": "opus5", "sonnet": "sonnet5"}.get(value, value)
+
+
+def _runtime_profile(name, info, *, recent_lines=40):
+    """Captura o model/effort efetivos observáveis antes/depois do reset.
+
+    Codex imprime o par no rodapé da pane, o que cobre uma troca interativa
+    posterior ao argv. Claude pode ter um bloco `Model`/`Effort` produzido por
+    `/status`; quando esse bloco não existe, o processo/banner não é tratado
+    como seleção efetiva e não inventamos um default global.
+    """
+    kind = info.get("agent")
+    pane_id = info.get("pane_id")
+    if not kind or not pane_id:
+        raise ContextResetError(f"não há kind/pane_id para observar o perfil de '{name}'")
+    argv, pid = _agent_foreground_argv(pane_id, kind)
+    argv_model, argv_effort = _runtime_settings_from_argv(argv)
+    # The pane/session is authoritative: argv records launch intent and can be
+    # stale after an interactive /model change. Read the visible runtime
+    # indicator for every family, then fall back to argv only when no complete
+    # effective pair is observable.
+    pane_model = pane_effort = None
+    recent = _read_agent_recent(name, lines=recent_lines)
+    if kind == "claude":
+        status_pair = _claude_status_runtime(recent)
+        if status_pair:
+            pane_model, pane_effort = status_pair
+            status_source = "status"
+        else:
+            status_source = None
+    else:
+        status_source = None
+    patterns = [_RUNTIME_FOOTER_RE]
+    if kind == "claude":
+        patterns.insert(0, _CLAUDE_HEADER_RE)
+    # An explicit `/status` pair has priority over every banner/footer match.
+    # Otherwise retain the previous passive parsing for Codex and for old
+    # Claude panes that have no status block in their recent output.
+    if not status_source:
+        matches = [match for pattern in patterns for match in pattern.finditer(recent)]
+        matches.sort(key=lambda match: match.start())
+        if matches:
+            match = matches[-1]
+            pane_model = match.group("model")
+            pane_effort = match.group("effort")
+    if pane_model and pane_effort:
+        model, effort, source = pane_model, pane_effort, (status_source or "pane")
+    else:
+        model, effort, source = argv_model, argv_effort, ("argv" if argv_model and argv_effort else None)
+    if model:
+        # Claude accepts short aliases in argv but renders the resolved model
+        # family/version in its header. Treat only these documented aliases as
+        # equivalent; different explicit versions remain a real mismatch.
+        model = str(model).casefold()
+    if effort:
+        effort = str(effort).casefold()
+    if effort is None:
+        effort = "unknown"
+    return {
+        # A Claude banner is historical UI text and may predate `/model`.
+        # Only an explicit status pair (or a complete launch argv when no
+        # banner was found) counts as an effective profile for inheritance.
+        "observed": bool(
+            model and effort and effort != "unknown"
+            and (kind != "claude" or source in ("status", "argv"))
+        ),
+        "kind": kind,
+        "model": model,
+        "reasoning_effort": effort,
+        "source": source,
+        "pid": pid,
+        "argv": argv,
+    }
+
+
+def runtime_profile_evidence(name, info=None):
+    """Best-effort passive profile snapshot for dispatcher metrics.
+
+    This helper never sends `/status`, `/clear`, or `/new`.  For Claude a
+    header/argv result is therefore labelled with its real source and remains
+    evidence only; `herdr-swap` is the path that can actively confirm `/status`
+    before inheriting a profile.
+    """
+    try:
+        observed_info = info if info is not None else get_agent_info(name)
+        return _runtime_profile(name, observed_info)
+    except Exception as exc:
+        return {
+            "observed": False,
+            "source": "unknown",
+            "error": str(exc),
+        }
+
+
+def _assert_runtime_preserved(name, before_profile, after_profile):
+    """Compara perfis sem bloquear a operação.
+
+    A comparação permanece útil como evidência para logs e para o monitor, mas
+    não é uma permissão de execução. Os CLIs podem resolver outro modelo ou
+    esforço depois de ``/new``/``/clear``; impedir a rodada por essa diferença
+    foi a causa dos abortos repetidos. O nome é mantido para compatibilidade
+    com consumidores antigos.
+    """
+    differences = []
+    unknown = []
+    if not before_profile.get("observed"):
+        unknown.append("before")
+    if not after_profile.get("observed"):
+        unknown.append("after")
+    for field in ("kind", "model", "reasoning_effort"):
+        before = before_profile.get(field)
+        after = after_profile.get(field)
+        if field == "model":
+            before = _canonical_runtime_model(before)
+            after = _canonical_runtime_model(after)
+        if before is None or after is None:
+            continue
+        if before != after:
+            differences.append({"field": field, "before": before, "after": after})
+    return {
+        "preserved": not differences and not unknown,
+        "comparable": not unknown,
+        "differences": differences,
+        "unknown": unknown,
+    }
+
+
+def runtime_profile_summary(reset_info):
+    """Texto curto para o operador ver o perfil que foi preservado."""
+    profile = reset_info.get("runtime_before") or {}
+    model = profile.get("model") or "?"
+    effort = profile.get("reasoning_effort") or "?"
+    source = profile.get("source") or "?"
+    return f"model={model} reasoning_effort={effort} preservados ({source})"
+
+
+def _probe_answer(text, probe_token):
+    """Extrai somente a linha de resposta da sonda, nunca o texto do prompt."""
+    start = text.rfind(probe_token)
+    if start < 0:
+        return None
+    answers = {"HERDR_RESET_MARKER_PRESENT", "HERDR_RESET_MARKER_ABSENT"}
+    for line in text[start:].splitlines():
+        stripped = line.strip()
+        # As CLIs renderizam a resposta com bullet; o prefixo de prompt é
+        # `❯`/`›` e deve ser ignorado para não casar a instrução da sonda.
+        if stripped.startswith(("❯", "›")):
+            continue
+        stripped = re.sub(r"^[•●]\s*", "", stripped).strip().rstrip(".")
+        # Claude renders completed lines with a timestamp between the bullet
+        # and the answer, e.g. ``● [03:08:29] HERDR_RESET_MARKER_ABSENT``.
+        # The timestamp is display metadata, not part of the probe response.
+        stripped = re.sub(r"^\[\d{1,2}:\d{2}:\d{2}\]\s*", "", stripped)
+        if stripped in answers:
+            return stripped
+    return None
+
+
+def _wait_for_probe_answer(name, probe_token, timeout_s=30):
+    """Espera a resposta da sonda aparecer no buffer depois do estado final.
+
+    ``agent prompt --wait`` observa a transição de estado do processo, mas a
+    saída renderizada pode chegar alguns instantes depois. Uma leitura única
+    nesse intervalo produzia ``reset_error`` mesmo quando o scout havia
+    respondido corretamente (observado em llm-bench-scout). Portanto, o
+    marcador é sondado por uma janela curta e independente do timeout do
+    dispatch; sem uma resposta exata ao fim dela, o reset continua falhando
+    fechado.
+    """
+    deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    while True:
+        answer = _probe_answer(_read_agent_recent(name), probe_token)
+        if answer is not None:
+            return answer
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def _prompt_now(name, text):
+    """Envia um comando instantâneo (como /clear ou /new) sem esperar turno."""
+    try:
+        return api("agent", "prompt", name, text)
+    except RuntimeError as exc:
+        raise ContextResetError(f"falha enviando comando de reset: {exc}") from exc
+
+
+def _wait_for_reset_settle(name, first_observed, pane_id, timeout_s):
+    """Espera o CLI terminar ``/new``/``/clear`` antes da sonda.
+
+    O comando nativo pode devolver o pane ainda ``working`` por um curto
+    intervalo. Usar esse snapshot diretamente como ``expected_agents`` faz o
+    preflight da sonda rejeitar a operação; usar uma leitura posterior sem
+    conferir identidade poderia enviar para outro pane. Mantemos a primeira
+    identidade observada e só aceitamos a transição de lifecycle para
+    ``idle``/``done``.
+    """
+    deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    observed = first_observed
+    while True:
+        busy, why = pane_looks_busy_with_human_input(
+            pane_id, check_composition=False
+        )
+        if busy:
+            raise ContextResetError(f"'{name}' tem diálogo após o reset: {why}")
+        status = observed.get("agent_status")
+        if status in ("idle", "done"):
+            return observed
+        if status == "blocked":
+            raise ContextResetError(f"'{name}' ficou blocked depois do reset")
+        if status not in ("working", "unknown"):
+            raise ContextResetError(
+                f"'{name}' ficou em estado inesperado depois do reset: {status!r}"
+            )
+
+        if time.monotonic() >= deadline:
+            raise ContextResetError(
+                f"'{name}' não assentou depois do reset: estado {status!r}"
+            )
+        time.sleep(0.25)
+        try:
+            next_observed = get_agent_info(name)
+        except RuntimeError as exc:
+            raise ContextResetError(
+                f"não consegui acompanhar '{name}' depois do reset: {exc}"
+            ) from exc
+        differences = _dispatch_differences(
+            first_observed, next_observed, include_lifecycle=False
+        )
+        if differences:
+            raise ContextResetError(
+                "metadata mudou enquanto o reset assentava ("
+                + "; ".join(differences)
+                + ")"
+            )
+        observed = next_observed
+
+
+def reset_reviewer_context(name, timeout_s=1200):
+    """Reseta e comprova o contexto de um revisor antes de uma rodada.
+
+    O Herdr não possui um verbo `agent reset`; cada CLI tem seu comando nativo.
+    Um marcador é enviado antes do reset e sondado depois. A rodada só pode
+    prosseguir quando a resposta é explicitamente ABSENT. O id da sessão é
+    registrado como evidência, mas não é a única prova: no Codex ele pode ficar
+    stale até o próximo turno (observado ao vivo). O par model/reasoning_effort
+    é capturado antes e depois somente como evidência. Uma mudança ou ausência
+    de observação não cancela o reset nem impede a próxima rodada; o caminho
+    normal não chama esta função e usa ``herdr-swap`` para recriar um pane com
+    handoff. Esses três papéis são headless: texto residual na composição é
+    ignorado; somente um diálogo real do CLI impede o reset.
+    """
+    try:
+        before = get_agent_info(name)
+    except RuntimeError as exc:
+        raise ContextResetError(f"não consegui ler o revisor antes do reset: {exc}") from exc
+    if before.get("agent_status") not in ("idle", "done"):
+        raise ContextResetError(
+            f"'{name}' está '{before.get('agent_status')}' — não reseto revisor em trabalho ou diálogo"
+        )
+    pane_id = before.get("pane_id")
+    if not pane_id:
+        raise ContextResetError(f"'{name}' não tem pane_id observável")
+    # Revisores e scout são panes headless: composição residual não é canal de
+    # autorização humana e não pode parar a cadeia. Só diálogos reais ficam
+    # como bloqueio; o canal oficial `agent prompt` também recusa esses panes
+    # com `agent_blocked` antes de enviar qualquer texto.
+    busy, why = pane_looks_busy_with_human_input(pane_id, check_composition=False)
+    if busy:
+        raise ContextResetError(f"'{name}' tem diálogo pendente: {why}")
+
+    kind = before.get("agent")
+    reset_command = _RESET_COMMANDS.get(kind)
+    if not reset_command:
+        raise ContextResetError(f"kind '{kind}' não tem comando de reset conhecido")
+    before_profile = _runtime_profile(name, before)
+
+    token = f"HERDR_RESET_SENTINEL_{uuid.uuid4().hex}"
+    seed_delivery_marker = f"/tmp/.herdr/{token}"
+    seed = (
+        f"{token}. Delivery marker: {seed_delivery_marker}. Não leia arquivos nem edite nada. "
+        "Memorize este token arbitrário apenas para a sonda seguinte. "
+        "Responda exatamente HERDR_RESET_SEED_OK."
+    )
+    try:
+        seed_result, _, _ = dispatch_and_wait_all(
+            {name: seed}, timeout_s,
+            expected_agents={name: before},
+            check_composition=False,
+        )
+    except DispatchPreflightError as exc:
+        raise ContextResetError(str(exc)) from exc
+    if seed_result.get(name) not in ("idle", "done"):
+        raise ContextResetError(
+            f"seed do reset não assentou para '{name}': {seed_result.get(name)}"
+        )
+
+    # O seed foi enviado pelo canal oficial. Em reviewer/scout headless,
+    # composição residual continua sendo descartável; só um diálogo pendente
+    # precisa impedir o comando nativo.
+    busy, why = pane_looks_busy_with_human_input(pane_id, check_composition=False)
+    if busy:
+        raise ContextResetError(f"'{name}' ganhou diálogo antes do reset: {why}")
+
+    _prompt_now(name, reset_command)
+    time.sleep(1)
+    try:
+        after_reset = get_agent_info(name)
+    except RuntimeError as exc:
+        raise ContextResetError(f"revisor sumiu depois de {reset_command}: {exc}") from exc
+    after_reset = _wait_for_reset_settle(
+        name, after_reset, pane_id, timeout_s
+    )
+
+    probe_token = f"HERDR_RESET_PROBE_{uuid.uuid4().hex}"
+    probe_delivery_marker = f"/tmp/.herdr/{probe_token}"
+    probe = (
+        f"{probe_token}. Delivery marker: {probe_delivery_marker}. Não leia arquivos nem edite nada. Responda em uma única linha "
+        "exatamente HERDR_RESET_MARKER_PRESENT se você ainda lembra o token "
+        "arbitrário que recebeu no turno imediatamente anterior ao reset; "
+        "caso contrário responda exatamente HERDR_RESET_MARKER_ABSENT. "
+        "Não infira a resposta a partir desta mensagem."
+    )
+    try:
+        probe_result, _, _ = dispatch_and_wait_all(
+            {name: probe}, timeout_s,
+            expected_agents={name: after_reset},
+            check_composition=False,
+        )
+    except DispatchPreflightError as exc:
+        raise ContextResetError(str(exc)) from exc
+    if probe_result.get(name) not in ("idle", "done"):
+        raise ContextResetError(
+            f"sonda pós-reset não assentou para '{name}': {probe_result.get(name)}"
+        )
+    answer = _wait_for_probe_answer(name, probe_token, timeout_s=min(timeout_s, 30))
+    if answer != "HERDR_RESET_MARKER_ABSENT":
+        if answer == "HERDR_RESET_MARKER_PRESENT":
+            detail = "o marcador ainda está acessível"
+        else:
+            detail = "não encontrei uma resposta inequívoca da sonda"
+        raise ContextResetError(f"reset de '{name}' não comprovado: {detail}")
+
+    try:
+        after = get_agent_info(name)
+    except RuntimeError as exc:
+        raise ContextResetError(f"não consegui confirmar '{name}' após a sonda: {exc}") from exc
+    after_profile = _runtime_profile(name, after)
+    runtime_evidence = _assert_runtime_preserved(
+        name, before_profile, after_profile
+    )
+    session_before = (before.get("agent_session") or {}).get("value")
+    session_after = (after.get("agent_session") or {}).get("value")
+    return {
+        "verified": True,
+        "kind": kind,
+        "reset_command": reset_command,
+        "session_before": session_before,
+        "session_after": session_after,
+        "session_changed": bool(session_before and session_after and session_before != session_after),
+        "runtime_before": before_profile,
+        "runtime_after": after_profile,
+        "runtime_preserved": runtime_evidence["preserved"],
+        "runtime_evidence": runtime_evidence,
+    }
+
+
+def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
+                                *, expected_agents=None, check_composition=True,
+                                allow_working=False):
     """Manda o prompt e espera cada agent assentar (idle/done) via
     `agent prompt --wait`, um subprocesso concorrente por nome — um agent
     lento ou travado não atrasa a detecção dos outros. Ancorado na submissão,
@@ -437,26 +1489,95 @@ def dispatch_and_wait_all(prompts, timeout_s):
     contínuo, sem esperar o --timeout inteiro.
 
     prompts: dict nome -> texto do prompt.
+    required_artifacts: opcional, dict nome -> caminho de um artefato que o
+    turno precisa publicar. Para esses agents, `idle`/`done` do Herdr é apenas
+    um candidato: o dispatcher só assenta depois de observar o arquivo regular
+    não vazio, criado ou alterado desde o disparo. Isso cobre o caso em que o
+    detector de lifecycle anuncia `done` antes de o agent terminar de gravar
+    `answer.md`/`verdict.md`. Se o prazo acabar depois do lifecycle terminal,
+    o resultado é `artifact_missing`, nunca um `done` falso.
+
+    `expected_agents`: snapshot de `agent get` capturado pelo chamador antes
+    da decisão de disparar. Quando fornecido, todos os alvos são revalidados
+    sob um lock curto imediatamente antes de criar qualquer subprocesso; uma
+    mudança em status, pane, workspace, cwd, sessão, revision ou
+    `state_change_seq`, ou um diálogo, aborta sem enviar prompts. O snapshot
+    observado é anexado ao detalhe do resultado para as métricas. Esse gate é
+    opcional apenas para callers genéricos/fixtures antigos; os dispatchers de
+    review/ask e o swap passam o snapshot real.
+
+    `check_composition` controla somente a heurística de texto não enviado.
+    Reviewers/scout passam `False` por serem headless; o swap mantém `True`.
+
+    `allow_working` só é usado pelo auto-swap, que precisa entregar o handoff
+    ao próprio exec enquanto o processo que iniciou o swap ainda está working.
+    Dispatchers de revisão/ask deixam o padrão `False`: um snapshot já
+    `working` é uma corrida ou trabalho concorrente e aborta antes de enviar.
+
     Retorna (result, info, settle_ts): dicts nome -> status ("idle"/"done"/
-    "blocked"/"timeout"/"stalled"/"error"); nome -> dict do agent quando
+    "blocked"/"timeout"/"artifact_missing"/"stalled"/"preflight_aborted"/"error"); nome -> dict do agent quando
     disponível, senão uma mensagem (str) ou None; nome -> timestamp ISO de
     quando resolveu.
     """
+    required_artifacts = dict(required_artifacts or {})
+    expected_agents = None if expected_agents is None else dict(expected_agents)
+    unknown_artifacts = set(required_artifacts) - set(prompts)
+    if unknown_artifacts:
+        raise ValueError(
+            "required_artifacts contém agents que não estão em prompts: "
+            + ", ".join(sorted(unknown_artifacts))
+        )
+    if expected_agents is not None:
+        unknown_expected = set(expected_agents) - set(prompts)
+        if unknown_expected:
+            raise ValueError(
+                "expected_agents contém agents que não estão em prompts: "
+                + ", ".join(sorted(unknown_expected))
+            )
+        missing_expected = set(prompts) - set(expected_agents)
+        if missing_expected:
+            raise ValueError(
+                "expected_agents não cobre todos os prompts: "
+                + ", ".join(sorted(missing_expected))
+            )
+
+    # Captura antes de criar qualquer processo. Um arquivo antigo não pode
+    # validar uma rodada nova só porque já está presente no diretório.
+    artifact_baseline = {
+        name: _artifact_snapshot(path)
+        for name, path in required_artifacts.items()
+    }
     deadline = time.time() + timeout_s
-    procs = {
-        name: subprocess.Popen(
+    preflight_observed = {}
+
+    def prompt_process(name, text):
+        return subprocess.Popen(
             herdr_argv("agent", "prompt", name, text,
                        "--wait", "--until", "idle", "--until", "done",
                        "--timeout", str(timeout_s * 1000)),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        for name, text in prompts.items()
-    }
+
+    # A função pública mantém os locks até o ciclo terminar. Revalidar e
+    # apenas iniciar Popen dentro de uma seção curta deixava outro dispatcher
+    # observar o mesmo idle antes de o daemon registrar a entrega.
+    if expected_agents is not None:
+        for name in prompts:
+            preflight_observed[name] = _dispatch_observe(
+                name,
+                expected_agents[name],
+                check_composition=check_composition,
+                allow_working=allow_working,
+            )
+    procs = {name: prompt_process(name, text) for name, text in prompts.items()}
     result = {name: None for name in procs}
     info = {}
     settle_ts = {}
     blocked_since = dict.fromkeys(procs)
     reenviados = set()   # ping-pong: quem ja teve UMA segunda tentativa
+    artifact_pending = {}
+    retry_preflight_observed = {}
+    retry_suppressed = {}
 
     def prompt_chegou(name, texto):
         """O prompt aparece no pane? Usa o caminho do diretorio de veredito como
@@ -483,21 +1604,196 @@ def dispatch_and_wait_all(prompts, timeout_s):
         return marcador.rstrip(".,;:") in out.stdout
 
     def finish(name, status, detail):
+        if name in preflight_observed:
+            if isinstance(detail, dict):
+                detail = dict(detail)
+                detail["dispatch_preflight"] = _dispatch_state_view(
+                    preflight_observed[name]
+                )
+            else:
+                detail = {
+                    "message": detail,
+                    "dispatch_preflight": _dispatch_state_view(
+                        preflight_observed[name]
+                    ),
+                }
+        if name in retry_preflight_observed:
+            if isinstance(detail, dict):
+                detail = dict(detail)
+                detail["retry_preflight"] = _dispatch_state_view(
+                    retry_preflight_observed[name]
+                )
+                if name in retry_suppressed:
+                    detail["resend_suppressed"] = retry_suppressed[name]
+            else:
+                detail = {
+                    "message": detail,
+                    "retry_preflight": _dispatch_state_view(
+                        retry_preflight_observed[name]
+                    ),
+                    "resend_suppressed": retry_suppressed.get(name),
+                }
         result[name] = status
         info[name] = detail
         settle_ts[name] = now_iso()
+
+    def wait_process(name):
+        return subprocess.Popen(
+            herdr_argv("agent", "wait", name,
+                       "--until", "idle", "--until", "done",
+                       "--timeout", str(timeout_s * 1000)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def retry_preflight(name):
+        """Decide retry under the per-agent submission lock.
+
+        A `stalled` result is ambiguous. If the same agent is now working, or
+        its lifecycle sequence advanced, the original prompt won the race and
+        must be awaited. A prompt is re-sent only when the stable identity and
+        the idle/done snapshot are unchanged; any pane/workspace/session/
+        revision change fails closed instead of sending into a new target.
+        """
+        baseline = preflight_observed.get(name)
+        if baseline is not None:
+            observed = _dispatch_observe(
+                name,
+                baseline,
+                check_composition=check_composition,
+                include_lifecycle=False,
+                # Working aqui é justamente o sinal de que a primeira
+                # submissão venceu a corrida; a decisão abaixo converte isso
+                # em `agent wait` e suprime o retry.
+                allow_working=True,
+            )
+        else:
+            try:
+                observed = get_agent_info(name)
+            except RuntimeError as exc:
+                raise DispatchPreflightError(
+                    name, f"não consegui revalidar o agent no retry: {exc}",
+                ) from exc
+            if observed.get("agent_status") not in ("idle", "done", "working"):
+                raise DispatchPreflightError(
+                    name,
+                    f"estado não enviável no retry: {observed.get('agent_status')!r}",
+                    observed=_dispatch_state_view(observed),
+                )
+            pane_id = observed.get("pane_id")
+            if not pane_id:
+                raise DispatchPreflightError(
+                    name, "pane_id ausente na revalidação do retry",
+                    observed=_dispatch_state_view(observed),
+                )
+            busy, why = pane_looks_busy_with_human_input(
+                pane_id, check_composition=check_composition
+            )
+            if busy:
+                raise DispatchPreflightError(
+                    name, f"diálogo pendente antes do retry: {why}",
+                    observed=_dispatch_state_view(observed),
+                )
+
+        status = observed.get("agent_status")
+        if status == "working":
+            return observed, "wait", "agent já está working; retry suprimido"
+        if baseline is not None:
+            before_seq = baseline.get("state_change_seq")
+            after_seq = observed.get("state_change_seq")
+            if before_seq is not None and after_seq != before_seq:
+                return observed, "wait", (
+                    "state_change_seq avançou; o prompt original pode estar em curso"
+                )
+            before_status = baseline.get("agent_status")
+            if before_status is not None and status != before_status:
+                raise DispatchPreflightError(
+                    name,
+                    f"status mudou sem evidência de turno ativo: {before_status!r} -> {status!r}",
+                    expected=_dispatch_state_view(baseline),
+                    observed=_dispatch_state_view(observed),
+                )
+        return observed, "resend", "snapshot inalterado; retry permitido"
 
     while any(v is None for v in result.values()):
         for name, proc in procs.items():
             if result[name] is not None:
                 continue
+
+            if time.time() >= deadline:
+                if name in artifact_pending:
+                    pending = artifact_pending.pop(name)
+                    finish(
+                        name,
+                        "artifact_missing",
+                        {
+                            "reason": "lifecycle terminou, mas o artefato obrigatório não apareceu",
+                            "artifact_path": os.path.abspath(required_artifacts[name]),
+                            "lifecycle_status": pending["status"],
+                            "lifecycle_info": pending["detail"],
+                            "lifecycle_settle_ts": pending["lifecycle_settle_ts"],
+                            "artifact_wait_started": pending["started_at"],
+                        },
+                    )
+                elif proc is not None:
+                    proc.kill()
+                    proc.wait()
+                    finish(name, "timeout", None)
+                else:
+                    finish(name, "timeout", None)
+                continue
+
+            # `agent prompt --wait` já resolveu o lifecycle, mas o agent pode
+            # ainda estar finalizando a escrita do answer/verdict. O processo
+            # do CLI já terminou; só a publicação do artefato libera o nome.
+            if name in artifact_pending:
+                artifact = _artifact_changed_and_ready(
+                    required_artifacts[name], artifact_baseline[name]
+                )
+                if artifact is not None:
+                    pending = artifact_pending.pop(name)
+                    detail = pending["detail"]
+                    if isinstance(detail, dict):
+                        detail = dict(detail)
+                        detail["required_artifact"] = artifact
+                        detail["lifecycle_settle_ts"] = pending["lifecycle_settle_ts"]
+                    else:
+                        detail = {
+                            "lifecycle_info": detail,
+                            "required_artifact": artifact,
+                            "lifecycle_settle_ts": pending["lifecycle_settle_ts"],
+                        }
+                    finish(name, pending["status"], detail)
+                continue
+
             ret = proc.poll()
             if ret is not None:
                 out, err = proc.communicate()
                 if ret == 0:
                     try:
                         agent_info = json.loads(out)["result"]["agent"]
-                        finish(name, agent_info["agent_status"], agent_info)
+                        status = agent_info["agent_status"]
+                        if status in ("idle", "done") and name in required_artifacts:
+                            artifact = _artifact_changed_and_ready(
+                                required_artifacts[name], artifact_baseline[name]
+                            )
+                            if artifact is None:
+                                lifecycle_settle_ts = now_iso()
+                                artifact_pending[name] = {
+                                    "status": status,
+                                    "detail": agent_info,
+                                    "lifecycle_settle_ts": lifecycle_settle_ts,
+                                    "started_at": lifecycle_settle_ts,
+                                }
+                                # O subprocesso já foi consumido; os próximos
+                                # ciclos observam somente a publicação do
+                                # artefato, até o mesmo deadline do dispatch.
+                                procs[name] = None
+                            else:
+                                agent_info = dict(agent_info)
+                                agent_info["required_artifact"] = artifact
+                                finish(name, status, agent_info)
+                        else:
+                            finish(name, status, agent_info)
                     except (json.JSONDecodeError, KeyError):
                         finish(name, "error", (out or err).strip())
                     continue
@@ -516,34 +1812,43 @@ def dispatch_and_wait_all(prompts, timeout_s):
                     # chegou, uma segunda tentativa -- e so uma, pra nao entrar
                     # em laco nem duplicar prompt num agent que so estava lento.
                     chegou = prompt_chegou(name, prompts[name])
-                    if chegou is False and name not in reenviados:
-                        reenviados.add(name)
-                        procs[name] = subprocess.Popen(
-                            herdr_argv("agent", "prompt", name, prompts[name],
-                                       "--wait", "--until", "idle", "--until", "done",
-                                       "--timeout", str(timeout_s * 1000)),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        )
-                        continue
-                    if chegou is True:
-                        # chegou: o `stalled` era falso negativo (agent lento).
-                        # Segue esperando o assentamento pelo caminho normal.
-                        procs[name] = subprocess.Popen(
-                            herdr_argv("agent", "wait", name,
-                                       "--until", "idle", "--until", "done",
-                                       "--timeout", str(timeout_s * 1000)),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        )
+                    if chegou is not None:
+                        # A leitura do marcador só diz se o texto chegou; não
+                        # substitui a identidade viva. Revalide dentro do lock
+                        # antes de decidir entre esperar e reenviar.
+                        try:
+                            observed, action, reason = retry_preflight(name)
+                            retry_preflight_observed[name] = observed
+                            if chegou is True:
+                                action = "wait"
+                                reason = "marcador confirma entrega; retry suprimido"
+                            if action == "wait":
+                                retry_suppressed[name] = reason
+                                procs[name] = wait_process(name)
+                            elif name not in reenviados:
+                                reenviados.add(name)
+                                procs[name] = prompt_process(name, prompts[name])
+                            else:
+                                finish(
+                                    name,
+                                    "stalled",
+                                    f"retry já usado; {reason}",
+                                )
+                                procs[name] = None
+                        except DispatchPreflightError as exc:
+                            # Mesmo no abort fechado, preserve a última
+                            # observação reduzida para que `finish()` e as
+                            # métricas mostrem qual alvo foi visto antes de
+                            # suprimir o reenvio.
+                            if exc.observed is not None:
+                                retry_preflight_observed[name] = exc.observed
+                            procs[name] = None
+                            finish(name, "preflight_aborted", exc.as_dict())
                         continue
                     sufixo = " (reenviado uma vez, sem sucesso)" if name in reenviados else ""
                     finish(name, "stalled", (message or "") + sufixo)
                 else:
                     finish(name, "error", message or f"exit {ret}")
-                continue
-            if time.time() >= deadline:
-                proc.kill()
-                proc.wait()
-                finish(name, "timeout", None)
                 continue
             try:
                 agent_info = get_agent_info(name)
@@ -561,3 +1866,28 @@ def dispatch_and_wait_all(prompts, timeout_s):
         if any(v is None for v in result.values()):
             time.sleep(2)
     return result, info, settle_ts
+
+
+def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
+                          *, expected_agents=None, check_composition=True,
+                          allow_working=False):
+    """Run a dispatch while reserving every expected target until settlement.
+
+    The reservation spans preflight, prompt submission, retries and artifact
+    publication. This prevents a second dispatcher from reusing the same
+    idle snapshot during the daemon's submission window or while the first
+    turn is still settling.
+    """
+    expected = None if expected_agents is None else dict(expected_agents)
+    try:
+        with _dispatch_submission_locks(expected):
+            return _dispatch_and_wait_all_impl(
+                prompts,
+                timeout_s,
+                required_artifacts,
+                expected_agents=expected,
+                check_composition=check_composition,
+                allow_working=allow_working,
+            )
+    except DispatchLockBusyError as exc:
+        raise DispatchPreflightError(exc.name, str(exc)) from exc

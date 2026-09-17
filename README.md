@@ -20,9 +20,13 @@ project's **slug**:
 | agent | tab | role |
 |---|---|---|
 | `<slug>-exec` | 1 | does the work; the interactive session you talk to |
-| `<slug>-rev-1` | 1 | first reviewer (Codex, `model_reasoning_effort=high`) |
-| `<slug>-rev-2` | 1 | second reviewer (Claude Opus) — deliberately a different lens |
-| `<slug>-scout` | 2 | parallel reading/exploration; its own tab because the work is a different kind |
+| `<slug>-rev-1` | 1 | first reviewer (model `gpt-5.6-luna` or `gpt-6-astra`) |
+| `<slug>-rev-2` | 1 | second reviewer (model `opus-5`) — deliberately a different lens |
+| `<slug>-scout` | 2 | parallel reading/exploration (model `gpt-6-astra`, `fable-5` or `opus-5`); its own tab because the work is a different kind |
+
+The `llm-scout` workspace is a recorded `Need you` exception: it remains on
+`gpt-5.6-sol` with `xhigh` reasoning until the owner decides otherwise; no
+automatic migration changes it.
 
 The two reviewers are the point: they review **blind to each other**, and a
 finding both reach independently means something different from a finding only
@@ -47,11 +51,13 @@ exception, and the comment next to it explains why.
   without one lands with a visible TODO.
 - **`herdr-bootstrap`** — ensures the workspaces/panes/agents of the working
   environment exist (idempotent; only ever acts on an empty pane). Defines, per
-  workspace, who the executor is and who the two reviewers are (kind, model,
-  effort), and arms a `herdr-notify-watch` for each `*-exec`. Run it from
+  workspace, who the executor is and who the two reviewers are (kind and
+  model), and arms a `herdr-notify-watch` for each `*-exec`. Run it from
   anywhere: it reads absolute paths from its own table, not the cwd.
   `--dry-run` first — it has already caught an entry gone stale after a
-  workspace was renamed by hand, which would have created a duplicate.
+  workspace was renamed by hand, which would have created a duplicate. A
+  dispatcher can target one row with `--slug <slug>` (or `--space <label>`) to
+  restore a missing mandatory agent without touching other spaces.
 - **`herdr-agents [--name <cwd-filter>]`** — one tabular line per agent: status,
   cwd, kind, **model**, **effort**, **src**, name, pane, tab. The `src` column
   says where the model/effort actually came from, because the three sources
@@ -93,17 +99,72 @@ exception, and the comment next to it explains why.
   the two reviewers of a workspace (`--verify` runs a cheaper single-reviewer
   verification pass). Freezes the diff (including untracked files), isolates
   each reviewer in its own subdirectory, and writes a per-round `metrics.json`
-  for cost correlation.
+  for cost correlation. The dispatcher leaves reviewer panes intact and does
+  not enforce model/reasoning preservation; those guards caused valid rounds
+  to abort when the CLI reported a different effective profile. Recreate a
+  pane deliberately with `herdr-swap`, which transfers a handoff before
+  closing the old process. Use `herdr-context-watch` for periodic,
+  read-only context measurements.
 - **`herdr-ask`** — same blind/parallel dispatch mechanism, for an open
   design question instead of a code diff (`--question-file`, optionally
   `--context <path>...` to freeze reference material, `--reviewer
-  rev|rev-1|rev-2` for a single cheaper consultant — `rev` and `rev-1` are
-  aliases of the same role). The response format is a decision with explicit
-  premises, not an atomic finding — writes to `.herdr/ask/`, a namespace
-  separate from `.herdr/review/`.
+  rev|rev-1|rev-2|scout` for a single consultant — `rev` and `rev-1` are
+  aliases of the same role, while `scout` is the automatic third analysis when
+  the exec needs it after two correction rounds). The response format
+  is a decision with explicit premises, and the dispatcher leaves every
+  reviewer/scout context intact. Recreate a pane deliberately with
+  `herdr-swap`; `herdr-context-watch` reports context pressure without
+  sending commands. Responses go to `.herdr/ask/`, a namespace separate from
+  `.herdr/review/`. A scout response returns to the `-exec`; it never speaks
+  directly to the user or decides for the space. The exec consults Breno only
+  when another analysis is still needed or the scout returns a
+  divergence/uncertainty.
+
+  **Lifecycle versus resposta:** o `herdr agent prompt --wait` observa o
+  lifecycle do pane e não acompanha a escrita do turno. Portanto `idle` ou
+  `done` é apenas um candidato a término para dispatchers que esperam um
+  arquivo. `herdr-ask` só assenta depois de ver um `answer.md` regular, não
+  vazio e novo (ou alterado) desde o disparo; se o prazo acabar, registra
+  `artifact_missing` e sai com falha, sem declarar uma resposta vazia como
+  sucesso. O `metrics.json` é publicado por temporário no mesmo diretório e
+  `os.replace`, para leitores concorrentes enxergarem sempre JSON completo.
+  Os panes de `rev-1`, `rev-2` e `scout` são headless: texto residual na caixa
+  de composição, inclusive uma letra digitada por engano, é descartável e não
+  interrompe a cadeia. Um diálogo real continua bloqueando pelo canal oficial
+  (`agent_blocked`); a proteção contra composição humana permanece no
+  `-exec` e no `herdr-swap`.
+  Antes de criar os prompts, o dispatcher revalida o snapshot de cada alvo sob
+  um lock curto (status, pane, workspace, cwd, sessão, revision e
+  `state_change_seq`). Se qualquer campo ou diálogo mudar, registra o
+  `preflight_error` e não envia a rodada. Em um `agent_prompt_stalled`, a mesma
+  checagem acontece antes de um retry: se o agent já ficou `working` ou a
+  sequência avançou, usa `agent wait` e suprime o segundo prompt; só reenvia
+  com a identidade e o estado idle/done inalterados.
+  Se um papel obrigatório não estiver registrado, a consulta/revisão chama o
+  bootstrap direcionado antes de criar a rodada e espera a restauração. A
+  tabela fornece modelo/kind/raciocínio só quando não existe uma pane-base;
+  o dispatcher não faz limpeza automática. Restauração e swap transferem o
+  contexto por handoff, e qualquer divergência de perfil fica como evidência
+  para decisão posterior.
+- **`herdr-context-watch`** — leitura periódica (ou `--once`) de `rev-1`,
+  `rev-2` e `scout` em `idle`/`done`. Extrai somente o bloco ancorado
+  `Context window:` do status da CLI, registra modelo/reasoning como
+  evidência, detecta mudanças de sessão durante a leitura e publica JSON
+  atomicamente. Nunca envia prompt, `/clear`, `/new` ou troca de modelo.
 - **`herdr-notify-watch`** — a `flock`-protected daemon that notifies via
   `omarchy-notification-send` when a `*-exec` agent has a genuine state
   change (edge-triggered on `state_change_seq`, not naive status polling).
+- **`herdr-simulate-scout`** — prepara uma pergunta e evidências mínimas,
+  roda a suíte e executa (ou apenas imprime com `--offline`) um smoke test da
+  rota `herdr-ask --reviewer scout` em um space descartável. Exige um slug
+  explícito e não libera slugs conhecidos de produção sem `--allow-production`.
+- **`herdr-simulate-full.sh`** — encena o ciclo completo em um fixture de
+  teste: duas rodadas com `rev-1`/`rev-2`, correção sintética, terceira análise
+  automática pelo scout e registro da decisão pendente do Breno. Não faz commit
+  nem altera arquivos do projeto.
+- **`herdr-hydrate-execs`** — entrega aos `*-exec` já vivos a política de
+  escalonamento atualizada. Pula `working`/`blocked` por segurança por padrão;
+  `--include-working` é uma escolha explícita.
 
 ### Changing a space
 
@@ -162,9 +223,11 @@ exception, and the comment next to it explains why.
 - **`_herdr_dispatch.py`** — mechanics behind `herdr-review-dispatch`,
   `herdr-ask` and `herdr-swap`: talking to the `herdr` CLI, resolving agent
   status/cwd, numbering a round directory, freezing context, canonicalising a
-  project root, and `dispatch_and_wait_all()` (concurrent `agent prompt
-  --wait` per agent, with a per-agent watchdog for a genuinely sustained
-  `blocked`).
+  project root, and retaining a legacy explicit reset helper alongside
+  `dispatch_and_wait_all()` (concurrent `agent prompt --wait` per agent, with
+  a per-agent watchdog for a genuinely sustained `blocked`). Também mantém a
+  barreira opcional de artefato obrigatório e o escritor atômico de métricas;
+  `herdr-ask` usa `answer.md` e `herdr-review-dispatch` usa `verdict.md`.
 - **`_herdr_migration.py`** — the `<slug>-rev` → `<slug>-rev-1` rename
   mechanism and the per-space `.herdr/migration-state.json` (`phase`,
   `rev2_kind`). `herdr-migrate-rev` is the only writer; the dispatchers and
@@ -188,10 +251,17 @@ Claude Code / Codex skills, shared through `~/.agents/skills/` (each
   tabs, workspaces, agents).
 - **`herdr-review`** — the dispatch protocol and finding classification
   (CONFIRMED/UNIQUE/CONFLICT) for the code-review cycle, capped at 2 rounds.
-- **`herdr-ask`** — the dispatch protocol for open design questions, and how
-  to reconcile two positions by their premises rather than by classifying
-  findings.
+- **`herdr-ask`** — the dispatch protocol for open design questions, how to
+  reconcile two positions by their premises, and how the automatic
+  `--reviewer scout` third analysis returns uncertainty to the `-exec`.
 - **`herdr-swap`** — the executor-swap protocol with context handoff.
+  Antes de iniciar o sucessor, captura o perfil efetivo. Para Claude, a fonte
+  usada para herdar é um `/status` confirmado com `Model` e `Effort` ancorados;
+  o banner inicial pode estar stale depois de `/model` e nunca é usado sozinho.
+  O handoff precisa ser reconhecido por `HERDR_HANDOFF_READ_OK` enquanto os dois
+  panes ainda estão vivos. No modo de duas fases, a finalização revalida as
+  identidades e roda a verificação antes de fechar o antigo; qualquer mudança
+  deixa ambos preservados.
 
 ## `tests/`
 
@@ -206,6 +276,15 @@ for them:
   `dispatch_and_wait_all()` (sustained-`blocked` vs. transient blip vs. real
   timeout). This loop has already regressed once by being "fixed" in a way
   that over-corrected.
+- **`test_dispatch_artifact_lifecycle.py`** — impede que `done` feche uma
+  rodada antes de `answer.md`/`verdict.md`, rejeita artefato velho, registra
+  `artifact_missing` no prazo e verifica a publicação atômica de métricas.
+- **`test_dispatch_preflight.py`** — revalida identidade sob lock antes de
+  enviar, aborta quando `idle` vira `working` ou o alvo muda, e impede um
+  segundo prompt no retry.
+- **`test_agent_restore.py`** — cobre a recuperação automática de papéis
+  ausentes, o lock contra duas restaurações concorrentes, o perfil pinado do
+  HomeHub e a falha controlada quando o bootstrap não consegue recriar o papel.
 - **`test_ask_request.py`** — a real bug caught while testing `herdr-ask`'s
   single-consultant mode: a placeholder string leaking into the isolation
   paragraph instead of being omitted.

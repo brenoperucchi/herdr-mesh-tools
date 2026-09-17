@@ -344,10 +344,13 @@ def agent_status_or_raise(name):
         raise RuntimeError(f"falha executando o CLI do Herdr pra '{name}': {exc}") from exc
 
 
-def resolve_reviewer_name(cwd, slug):
+def resolve_reviewer_name(cwd, slug, allow_missing=False):
     """Dual-read do primeiro revisor: <slug>-rev-1 se vivo, senão <slug>-rev.
     Fail-closed (RuntimeError) se os dois estiverem vivos ao mesmo tempo
-    (estado ambíguo — nunca escolhe sozinho) ou se nenhum existir.
+    (estado ambíguo — nunca escolhe sozinho) ou se nenhum existir. Com
+    ``allow_missing=True``, a ausência devolve o nome esperado pela fase de
+    migração para que o dispatcher possa executar a recuperação automática
+    pelo bootstrap; ambiguidade e falhas de infraestrutura continuam fatais.
 
     Achado P1 herdr-13 (herdr-rev): usava `core.agent_status_safe`, que
     converte QUALQUER RuntimeError (inclusive timeout/infra) em `False` —
@@ -373,6 +376,9 @@ def resolve_reviewer_name(cwd, slug):
         return rev1_name
     if rev_alive:
         return rev_name
+    if allow_missing:
+        state = read_migration_state(cwd)
+        return rev1_name if state["phase"] == "migrated" else rev_name
     raise RuntimeError(
         f"nem '{rev1_name}' nem '{rev_name}' existem — space sem primeiro "
         "revisor configurado"
@@ -520,5 +526,5 @@ def extra_args_for_rev2(kind):
         # par, continua intacta; o que se perde e' profundidade de raciocinio no
         # segundo revisor. Decisao de custo consciente, revisitavel quando o
         # limite resetar.
-        return ["--model", "opus", "--effort", "low"]
+        return ["--model", "opus-5", "--effort", "low"]
     return []

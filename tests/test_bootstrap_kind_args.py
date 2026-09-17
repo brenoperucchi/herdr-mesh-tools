@@ -58,6 +58,35 @@ def _papeis():
             yield nome, kind, list(args or [])
 
 
+def _modelo(args):
+    for i, arg in enumerate(args):
+        if arg == "--model" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _modelo_canonico(modelo):
+    return {
+        "sonnet": "sonnet-5",
+        "claude-sonnet-5": "sonnet-5",
+        "opus": "opus-5",
+    }.get(modelo, modelo)
+
+
+def _papel(nome):
+    if nome.endswith("-rev-1") or nome.endswith("-rev"):
+        return "rev-1"
+    if nome.endswith("-rev-2"):
+        return "rev-2"
+    if nome.endswith("-scout"):
+        return "scout"
+    if nome.endswith("-exec"):
+        return "exec"
+    return None
+
+
 class BootstrapKindArgsTests(unittest.TestCase):
     def test_nenhum_papel_mistura_flags_de_cli(self):
         for nome, kind, args in _papeis():
@@ -70,19 +99,31 @@ class BootstrapKindArgsTests(unittest.TestCase):
                     self.assertFalse(usadas & SO_CLAUDE,
                                      f"{nome} e' codex mas usa flag do Claude: {usadas & SO_CLAUDE}")
 
-    def test_todo_papel_pina_model_e_effort(self):
-        """A regra de 2026-09-09: model E effort explicitos em TODO papel.
+    def test_todo_papel_usa_modelo_permitido_pela_matriz(self):
+        """A matriz normativa valida somente o modelo por papel.
 
-        Sem isso o papel herda ~/.claude/settings.json ou ~/.codex/config.toml,
-        que o /model interativo reescreve -- foi assim que dois revisores
-        acordaram em Fable 5.1, o modelo mais caro do catalogo.
+        ``llm-scout`` é uma exceção operacional Need you e permanece no perfil
+        manual gpt-5.6-sol/xhigh até decisão explícita do owner.
         """
         for nome, kind, args in _papeis():
             with self.subTest(papel=nome):
-                self.assertIn("--model", args, f"{nome} nao pina --model")
-                tem_effort = "--effort" in args or any(
-                    "reasoning_effort" in a for a in args)
-                self.assertTrue(tem_effort, f"{nome} nao pina effort")
+                if nome == "llm-scout":
+                    self.assertEqual(_modelo(args), "gpt-5.6-sol")
+                    continue
+                papel = _papel(nome)
+                self.assertIsNotNone(papel, nome)
+                modelo = _modelo_canonico(_modelo(args))
+                self.assertIn(modelo, boot.ALLOWED_MODELS_BY_ROLE[papel],
+                              f"{nome} usa modelo fora da matriz: {modelo}")
+
+    def test_reasoning_args_nao_criam_uma_segunda_dimensao_de_modelo(self):
+        """O effort pode variar sem tornar o modelo fora da matriz."""
+        for nome, _kind, args in _papeis():
+            if nome == "llm-scout":
+                continue
+            papel = _papel(nome)
+            modelo = _modelo_canonico(_modelo(args))
+            self.assertIn(modelo, boot.ALLOWED_MODELS_BY_ROLE[papel])
 
 
 if __name__ == "__main__":

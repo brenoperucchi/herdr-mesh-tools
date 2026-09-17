@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """herdr-ask <slug> — dispara uma consulta de design cega e paralela pros dois
-revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr. Mesma mecânica do
+revisores (<slug>-rev-1, <slug>-rev-2), ou uma consulta única ao scout para
+escalonamento automático após as duas rodadas, de um space do Herdr. Mesma mecânica do
 herdr-review-dispatch (isolamento por diretório, congelamento de contexto,
 `agent prompt --wait` concorrente), formato de resposta diferente: não é bug
 hunt, não tem achado atômico P0-P3 nem APPROVE — é uma pergunta de design
@@ -10,16 +11,18 @@ Uso:
   herdr-ask <slug> --question-file pergunta.md
   herdr-ask <slug> --question-file pergunta.md --context /caminho/a /caminho/b
   herdr-ask <slug> --question-file pergunta.md --reviewer rev   # só 1 consultor
+  herdr-ask <slug> --question-file pergunta.md --reviewer scout # escalonamento
 
 Grava em .herdr/ask/<slug>-<N>/ — namespace separado de .herdr/review/, pra
 não colidir a numeração de rodada com o encadeamento de --verify do
 herdr-review-dispatch.
 
 Sai com 0 só se todos os consultores despachados produziram resposta não
-vazia. Qualquer BLOCKED/TIMEOUT/resposta ausente sai com 1.
+vazia. O lifecycle `idle`/`done` só fecha a espera depois de `answer.md`; se
+o artefato não aparecer no prazo, o status é `artifact_missing`. Qualquer
+BLOCKED/TIMEOUT/resposta ausente sai com 1.
 """
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -36,6 +39,9 @@ validate_agent_project = core.validate_agent_project
 get_agent_info = core.get_agent_info
 freeze_files = core.freeze_files
 dispatch_and_wait_all = core.dispatch_and_wait_all
+skipped_reset_info = core.skipped_reset_info
+runtime_profile_evidence = core.runtime_profile_evidence
+write_json_atomic = core.write_json_atomic
 
 ISOLATION_NOTE = """
 Esta consulta é CEGA: outro consultor está respondendo à MESMA pergunta ao
@@ -89,6 +95,20 @@ discordância factual, siga apenas a rota aprovada de `herdr-ask`.
 {context_instruction}
 """
 
+SCOUT_ESCALATION_NOTE = """## Terceira análise automática pelo scout
+
+Você é o scout consultado automaticamente pelo `{exec_name}` quando, depois
+de no máximo duas rodadas de correção de `rev-1`/`rev-2`, ele julgar necessária
+uma análise adicional. Esta chamada não precisa de autorização prévia do Breno e não é uma terceira rodada de correção dos revisores. Analise apenas a
+pergunta e o material fornecido, e escreva a resposta em `answer.md` para o
+`-exec`.
+
+Não comunique diretamente com o usuário, não tome a decisão pelo space e não
+faça commit. Se a evidência continuar insuficiente, ou se houver mais de uma
+interpretação defensável, registre **INCERTEZA** ou **DIVERGÊNCIA** de forma
+explícita e devolva-a ao `{exec_name}`. Se o exec ainda julgar necessária outra análise depois da sua resposta, ou se você devolver INCERTEZA/DIVERGÊNCIA, ele é quem consulta o Breno.
+"""
+
 
 def load_invariants(cwd):
     reviewer_md_path = os.path.join(cwd, ".herdr", "reviewer.md")
@@ -98,7 +118,7 @@ def load_invariants(cwd):
     return None
 
 
-def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapshot_map):
+def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapshot_map, scout_exec=None):
     if context_files:
         listing = "\n".join(f"- `{snapshot_map[f]}` (original: `{f}`)" for f in context_files)
         context_instruction = (
@@ -114,7 +134,9 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
 
     isolation_note = ISOLATION_NOTE.format(sibling_dir=sibling_dir) if sibling_dir else ""
 
+    scout_note = SCOUT_ESCALATION_NOTE.format(exec_name=scout_exec) if scout_exec else ""
     content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT)}
+{scout_note}
 {invariants_section}
 ## Pergunta
 
@@ -122,6 +144,17 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
 """
     with open(os.path.join(verdict_dir, "request.md"), "w") as f:
         f.write(content)
+
+
+def target_names_for(slug, rev_name, reviewer):
+    """Resolve o alvo normal ou a rota de escalonamento para o scout."""
+    if reviewer in ("rev", "rev-1"):
+        return [rev_name]
+    if reviewer == "rev-2":
+        return [f"{slug}-rev-2"]
+    if reviewer == "scout":
+        return [f"{slug}-scout"]
+    return [rev_name, f"{slug}-rev-2"]
 
 
 def prompt_text(verdict_dir):
@@ -140,7 +173,7 @@ def main():
     ap.add_argument("slug")
     ap.add_argument("--question-file", required=True, help="arquivo com a pergunta de design (markdown, pode ser longo)")
     ap.add_argument("--context", nargs="+", default=None, help="arquivos de contexto — congelados no disparo, como --files do herdr-review-dispatch")
-    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2"], default=None, help="consulta só 1 (default: os dois); 'rev' e 'rev-1' sao o mesmo papel logico, aceitos como alias")
+    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2", "scout"], default=None, help="consulta só 1 (default: os dois); 'scout' é a terceira análise automática após duas rodadas")
     ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por consultor (default 1200)")
     args = ap.parse_args()
 
@@ -171,17 +204,23 @@ def main():
         sys.exit(1)
 
     try:
-        rev_name = migration.resolve_reviewer_name(cwd, args.slug)
+        rev_name = migration.resolve_reviewer_name(cwd, args.slug, allow_missing=True)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
     rev2_name = f"{args.slug}-rev-2"
-    if args.reviewer in ("rev", "rev-1"):
-        target_names = [rev_name]
-    elif args.reviewer == "rev-2":
-        target_names = [rev2_name]
-    else:
-        target_names = [rev_name, rev2_name]
+    target_names = target_names_for(args.slug, rev_name, args.reviewer)
+
+    # Um papel obrigatório pode desaparecer do registro do Herdr após reset do
+    # daemon, reboot ou troca de pane. A ausência é recuperável: o helper usa a
+    # tabela única do bootstrap para criar somente o que falta, espera o novo
+    # agent assentar e então devolve o controle ao fluxo normal. Isso acontece
+    # antes de qualquer snapshot, reset ou prompt da consulta.
+    try:
+        agent_restore = core.ensure_required_agents(args.slug, cwd, target_names)
+    except core.AgentRestoreError as exc:
+        print(f"erro: recuperação automática dos consultores obrigatórios falhou: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     for name in target_names:
         try:
@@ -208,6 +247,8 @@ def main():
         os.makedirs(verdict_dirs[name])
 
     def sibling_dir_for(name):
+        if args.reviewer == "scout":
+            return None
         other = rev2_name if name == rev_name else rev_name
         return verdict_dirs.get(other)  # None se for consulta a 1 consultor só
 
@@ -218,21 +259,39 @@ def main():
             print(f"{len(context_files)} arquivo(s) de contexto congelado(s) em {round_dir}/_snapshot/")
 
         for name in target_names:
-            write_request(cwd, verdict_dirs[name], sibling_dir_for(name), question, context_files, snapshot_map)
+            scout_exec = f"{args.slug}-exec" if args.reviewer == "scout" else None
+            write_request(
+                cwd, verdict_dirs[name], sibling_dir_for(name), question,
+                context_files, snapshot_map, scout_exec=scout_exec,
+            )
         print(f"request.md escrito pr{'o' if len(target_names) == 1 else 'os'} {'consultor' if len(target_names) == 1 else 'dois'}")
     except (RuntimeError, OSError) as exc:
         print(f"erro preparando a consulta: {exc}", file=sys.stderr)
         shutil.rmtree(round_dir, ignore_errors=True)
         sys.exit(1)
 
+    # O dispatcher não limpa mais contexto automaticamente. Isso evita que
+    # `/new`/`/clear` troque o modelo ou o reasoning e derrube a rodada. A
+    # recriação deliberada de um pane continua disponível via `herdr-swap`,
+    # que transfere um handoff antes de fechar o processo antigo. O monitor
+    # `herdr-context-watch` registra o tamanho da conversa sem promptar.
+    reset_info = skipped_reset_info(target_names)
+    print(
+        "reset automático desativado para "
+        + ", ".join(target_names)
+        + "; use herdr-swap para recriar um pane e transferir o contexto"
+    )
+
     verb = "disparando" if len(target_names) > 1 else "disparando (consultor único)"
     print(f"{verb} {', '.join(target_names)}...")
     dispatch_ts = {name: now_iso() for name in target_names}
     pre_info = {}
+    runtime_before = {}
     dispatched = {}
     for name in target_names:
         try:
             pre_info[name] = get_agent_info(name)
+            runtime_before[name] = runtime_profile_evidence(name, pre_info[name])
             dispatched[name] = True
         except RuntimeError as exc:
             print(f"  aviso: falha checando '{name}' antes de disparar: {exc}", file=sys.stderr)
@@ -252,7 +311,35 @@ def main():
         for name in active_names
     }
     prompts = {name: prompt_text(verdict_dirs[name]) for name in active_names}
-    result, wait_info, settle_ts = dispatch_and_wait_all(prompts, args.timeout)
+    required_artifacts = {
+        name: os.path.join(verdict_dirs[name], "answer.md")
+        for name in active_names
+    }
+    try:
+        result, wait_info, settle_ts = dispatch_and_wait_all(
+            prompts,
+            args.timeout,
+            required_artifacts=required_artifacts,
+            expected_agents={name: pre_info[name] for name in active_names},
+            check_composition=False,
+        )
+    except core.DispatchPreflightError as exc:
+        print(f"erro: preflight dos consultores abortou o dispatch: {exc}", file=sys.stderr)
+        write_json_atomic(os.path.join(round_dir, "metrics.json"), {
+            "round_dir": round_dir,
+            "slug": args.slug,
+            "mode": "ask",
+            "reviewer": args.reviewer,
+            "question_file": os.path.abspath(args.question_file),
+            "context_files": context_files or [],
+            "agent_restore": agent_restore,
+            "reset": reset_info,
+            "runtime_before": runtime_before,
+            "dispatch": False,
+            "preflight_error": str(exc),
+            "preflight": exc.as_dict(),
+        })
+        sys.exit(1)
 
     print("\nresultado da consulta:")
     ok_count = 0
@@ -260,8 +347,13 @@ def main():
         "round_dir": round_dir,
         "slug": args.slug,
         "mode": "ask",
+        "reviewer": args.reviewer,
         "question_file": os.path.abspath(args.question_file),
         "context_files": context_files or [],
+        "agent_restore": agent_restore,
+        "reset": reset_info,
+        "runtime_before": runtime_before,
+        "runtime_after": {},
         "reviewers": {},
     }
     for name in target_names:
@@ -270,6 +362,11 @@ def main():
             metrics["reviewers"][name] = {"dispatched": False}
             continue
         status = result[name]
+        try:
+            post_info = get_agent_info(name)
+        except RuntimeError:
+            post_info = None
+        metrics["runtime_after"][name] = runtime_profile_evidence(name, post_info)
         answer_path = os.path.join(verdict_dirs[name], "answer.md")
         size = os.path.getsize(answer_path) if os.path.isfile(answer_path) else 0
         di = dispatch_info[name]
@@ -277,17 +374,46 @@ def main():
             "dispatched": True,
             "kind": di["kind"],
             "agent_session": di["agent_session"],
+            "runtime_before": runtime_before.get(name),
+            "runtime_after": metrics["runtime_after"].get(name),
             "dispatch_ts": di["dispatch_ts"],
             "settle_ts": settle_ts.get(name),
             "status": status,
             "answer_bytes": size,
         }
+        wait_detail = wait_info.get(name)
+        if isinstance(wait_detail, dict):
+            if status == "preflight_aborted":
+                # O retry pode ser abortado depois que o primeiro prompt já
+                # devolveu `agent_prompt_stalled`; preserve a decisão e a
+                # leitura efetiva (pane/status/sessão) no metrics, em vez de
+                # deixar só o status sem causa observável.
+                metrics["reviewers"][name]["preflight"] = wait_detail
+            if wait_detail.get("dispatch_preflight"):
+                metrics["reviewers"][name]["dispatch_preflight"] = wait_detail["dispatch_preflight"]
+            if wait_detail.get("retry_preflight"):
+                metrics["reviewers"][name]["retry_preflight"] = wait_detail["retry_preflight"]
+            if wait_detail.get("resend_suppressed"):
+                metrics["reviewers"][name]["resend_suppressed"] = wait_detail["resend_suppressed"]
+            if wait_detail.get("lifecycle_settle_ts"):
+                metrics["reviewers"][name]["lifecycle_settle_ts"] = wait_detail["lifecycle_settle_ts"]
+            if wait_detail.get("required_artifact"):
+                metrics["reviewers"][name]["artifact"] = wait_detail["required_artifact"]
+            elif status == "artifact_missing":
+                metrics["reviewers"][name]["artifact"] = {
+                    "path": wait_detail.get("artifact_path"),
+                    "ready": False,
+                }
         if status == "blocked":
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem answer.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é resposta" + (f" (answer.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "artifact_missing":
+            print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas answer.md não foi publicado" + (f" (answer.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":
             print(f"  {name}: STALLED — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado")
+        elif status == "preflight_aborted":
+            print(f"  {name}: PREFLIGHT_ABORTED — alvo mudou antes de qualquer reenvio ({wait_info.get(name)})")
         elif status == "error":
             print(f"  {name}: ERRO esperando assentar ({wait_info.get(name)})")
         elif size == 0:
@@ -296,8 +422,7 @@ def main():
             print(f"  {name}: {status}, resposta em {answer_path} ({size}b)")
             ok_count += 1
 
-    with open(os.path.join(round_dir, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
+    write_json_atomic(os.path.join(round_dir, "metrics.json"), metrics)
 
     print(f"\nround dir: {round_dir}")
     sys.exit(0 if ok_count == len(target_names) else 1)

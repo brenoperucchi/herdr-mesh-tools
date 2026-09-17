@@ -18,6 +18,10 @@ handoff), confere heuristicamente se o pane não tem composição humana ou
 diálogo pendente (`core.pane_looks_busy_with_human_input`) — não é garantia
 (existe corrida real entre a leitura e a ação seguinte), é redução de janela.
 
+Depois que o handoff assenta, captura o perfil efetivo. Em Claude, a sonda
+`/status` pelo canal oficial é a fonte de seleção atual; o banner de
+inicialização pode estar obsoleto depois de `/model` e nunca é herdado sozinho.
+
 Uso:
   herdr-swap <slug> <role> <kind> [-- <agent-args...>]
 
@@ -102,6 +106,70 @@ api = core.api
 get_agent = core.get_agent_info
 
 
+def send_pane_keys(pane_id, *keys):
+    """Confirma apenas diálogos de inicialização no pane provisório.
+
+    ``pane send-keys`` é uma operação de controle que não emite JSON em todas
+    as versões da CLI; não passe por ``core.api`` (que desserializa respostas
+    JSON). Isto nunca é usado para entregar prompts, apenas para selecionar
+    "Yes, I trust this folder" durante o bootstrap do novo CLI.
+    """
+    try:
+        out = subprocess.run(
+            core.herdr_argv("pane", "send-keys", pane_id, *keys),
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"pane send-keys {pane_id}: {exc}") from exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"pane send-keys {pane_id}: {out.stderr.strip() or out.stdout.strip()}"
+        )
+
+
+def _accept_trust_dialog(pane_id, pane_text):
+    """Select the visibly highlighted trust option, without guessing its order."""
+    def selection(text):
+        lines = (text or "").splitlines()
+        yes_index = no_index = selected_index = None
+        for index, line in enumerate(lines):
+            normalized = line.casefold()
+            if "yes, i trust" in normalized or "sim, confio" in normalized:
+                yes_index = index
+            if "no, exit" in normalized or "não, sair" in normalized:
+                no_index = index
+            if re.search(r"(?:^|\s)[❯›>].*(?:yes|sim|no,|não,)", normalized):
+                selected_index = index
+        return yes_index, no_index, selected_index
+
+    yes_index, no_index, selected_index = selection(pane_text)
+    if yes_index is None or no_index is None or selected_index is None:
+        return False
+    if selected_index == yes_index:
+        send_pane_keys(pane_id, "enter")
+        return True
+    if selected_index != no_index:
+        return False
+    delta = yes_index - selected_index
+    key = "down" if delta > 0 else "up"
+    send_pane_keys(pane_id, *([key] * abs(delta)))
+    time.sleep(0.1)
+    try:
+        moved = subprocess.run(
+            core.herdr_argv("pane", "read", pane_id, "--source", "visible", "--lines", "30"),
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    moved_yes, moved_no, moved_selected = selection(moved)
+    if moved_yes is None or moved_no is None or moved_selected != moved_yes:
+        return False
+    send_pane_keys(pane_id, "enter")
+    return True
+
+
 # Ultima frase da instrucao de verificacao. Serve de marco pra separar o eco
 # do prompt das respostas de verdade -- ver conta_recusas().
 FIM_DA_INSTRUCAO = "em vez de deduzir"
@@ -122,7 +190,8 @@ def conta_recusas(out):
     resposta = out[corte:] if corte != -1 else out
     return len(re.findall(r"n[ao]{1,2}\s+est[aá]\s+no\s+handoff", resposta, re.I))
 
-def dispatch_and_wait(name, prompt_text, timeout_s):
+def dispatch_and_wait(name, prompt_text, timeout_s, expected_info=None,
+                      check_composition=True, allow_working=False):
     """Manda o prompt e espera o agent assentar via `agent prompt --wait` —
     caso de 1 agent só do core.dispatch_and_wait_all (mesma mecânica usada
     pelo herdr-review-dispatch com N agentes concorrentes; ver docstring lá
@@ -130,11 +199,211 @@ def dispatch_and_wait(name, prompt_text, timeout_s):
     do --until).
 
     Retorna (status, info): status em "idle"/"done"/"blocked"/"timeout"/
-    "stalled"/"error"; info é o dict do agent quando disponível, senão uma
-    mensagem (str) ou None.
+    "stalled"/"preflight_aborted"/"error"; info é o dict do agent quando
+    disponível, senão uma mensagem (str) ou None.
     """
-    result, info, _ = core.dispatch_and_wait_all({name: prompt_text}, timeout_s)
+    try:
+        result, info, _ = core.dispatch_and_wait_all(
+            {name: prompt_text},
+            timeout_s,
+            expected_agents=({name: expected_info} if expected_info is not None else None),
+            check_composition=check_composition,
+            allow_working=allow_working,
+        )
+    except core.DispatchPreflightError as exc:
+        return "preflight_aborted", exc.as_dict()
     return result[name], info[name]
+
+
+def _identity_snapshot(info):
+    """Identity fields that must remain stable across a swap transaction."""
+    session = info.get("agent_session") or {}
+    return {
+        "agent": info.get("agent"),
+        "pane_id": info.get("pane_id"),
+        "workspace_id": info.get("workspace_id"),
+        "tab_id": info.get("tab_id"),
+        "cwd": info.get("cwd"),
+        "foreground_cwd": info.get("foreground_cwd"),
+        "agent_session": session.get("value") if isinstance(session, dict) else None,
+        "revision": info.get("revision"),
+        "state_change_seq": info.get("state_change_seq"),
+    }
+
+
+def _runtime_capture(name, info, timeout_s):
+    """Capture the effective profile, actively confirming Claude with /status.
+
+    Claude's initial banner can be stale after `/model`.  The status command is
+    sent through the official Herdr agent channel (never pane send-text), and
+    the resulting labelled pair is accepted only when it is visible in the
+    refreshed pane.  Failure to obtain that pair is recorded as evidence and
+    never replaced with a guessed default.
+    """
+    initial_identity = _identity_snapshot(info)
+    evidence = {"profile_before": {}, "status_probe": {"attempted": False},
+                "identity_before": initial_identity}
+    try:
+        profile = core._runtime_profile(name, info)
+    except Exception as exc:  # profile is evidence; swap can still proceed
+        profile = {"observed": False, "source": "unknown", "error": str(exc),
+                   "kind": info.get("agent")}
+    evidence["profile_before"] = profile
+    refreshed = info
+    if info.get("agent") != "claude":
+        return profile, evidence, refreshed
+
+    evidence["status_probe"] = {"attempted": True, "command": "/status"}
+    try:
+        headless_reviewer = name.endswith(("-rev-1", "-rev-2", "-scout"))
+        status, wait_info = dispatch_and_wait(
+            name, "/status", min(max(int(timeout_s), 1), 30),
+            expected_info=info, check_composition=not headless_reviewer,
+        )
+        evidence["status_probe"]["status"] = status
+        if isinstance(wait_info, dict):
+            evidence["status_probe"]["settled"] = wait_info
+        if status not in ("idle", "done"):
+            evidence["status_probe"]["verified"] = False
+            evidence["status_probe"]["reason"] = (
+                f"a sonda terminou em estado não terminal: {status!r}"
+            )
+            failed = dict(profile)
+            failed["observed"] = False
+            failed["source"] = "probe_failed"
+            return failed, evidence, refreshed
+        refreshed = get_agent(name)
+        refreshed_identity = _identity_snapshot(refreshed)
+        identity_fields = ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                           "foreground_cwd", "agent_session", "revision")
+        identity_changes = [
+            f"{field}: {initial_identity.get(field)!r} -> {refreshed_identity.get(field)!r}"
+            for field in identity_fields
+            if initial_identity.get(field) is not None
+            and initial_identity.get(field) != refreshed_identity.get(field)
+        ]
+        evidence["identity_after"] = refreshed_identity
+        if identity_changes:
+            evidence["status_probe"]["verified"] = False
+            evidence["status_probe"]["reason"] = "; ".join(identity_changes)
+            profile["observed"] = False
+            profile["source"] = "identity_changed"
+            return profile, evidence, refreshed
+        confirmed = core._runtime_profile(name, refreshed, recent_lines=120)
+        evidence["profile_after_status"] = confirmed
+        if confirmed.get("source") == "status" and confirmed.get("observed"):
+            return confirmed, evidence, refreshed
+        evidence["status_probe"]["verified"] = False
+        evidence["status_probe"]["reason"] = (
+            "o /status não apresentou um par Model/Effort ancorado"
+        )
+        # A banner/argv reading is retained for diagnostics, but it cannot be
+        # inherited automatically because the effective Claude selection is
+        # unconfirmed.
+        confirmed["observed"] = False
+        confirmed["source"] = "unconfirmed"
+        return confirmed, evidence, refreshed
+    except Exception as exc:
+        evidence["status_probe"]["verified"] = False
+        evidence["status_probe"]["error"] = str(exc)
+        failed = dict(profile)
+        failed["observed"] = False
+        failed["source"] = "probe_failed"
+        return failed, evidence, refreshed
+
+
+def _has_runtime_arg(args):
+    """Whether the operator explicitly pinned model/effort in extra args."""
+    for i, arg in enumerate(args):
+        if arg in ("--model", "-m", "--effort") or arg.startswith(("--model=", "--effort=")):
+            return True
+        if arg in ("-c", "--config") and i + 1 < len(args):
+            if str(args[i + 1]).startswith("model_reasoning_effort="):
+                return True
+        if str(arg).startswith(("-c=", "--config=", "model_reasoning_effort=")):
+            return True
+    return False
+
+
+def _runtime_start_args(kind, profile, *, explicit=False):
+    """Build explicit launch flags only for a compatible, observed profile."""
+    if explicit or not profile.get("observed"):
+        return []
+    model = str(profile.get("model") or "").strip()
+    effort = str(profile.get("reasoning_effort") or "").strip().casefold()
+    if not model or effort in ("", "unknown"):
+        return []
+    canonical = core._canonical_runtime_model(model)
+    source_kind = str(profile.get("kind") or "").casefold()
+    if kind == "codex":
+        # Codex accepts GPT/o-series identifiers. A Claude model cannot be
+        # copied across families; leave target-role defaults in that case.
+        if source_kind and source_kind != "codex":
+            return []
+        if not (canonical.startswith("gpt") or canonical.startswith("o")):
+            return []
+        result = ["--model", model]
+        result += ["-c", f"model_reasoning_effort={effort}"]
+        return result
+    if kind == "claude":
+        if source_kind and source_kind != "claude":
+            return []
+        if not (canonical.startswith("opus") or canonical.startswith("sonnet")
+                or canonical.startswith("claude")):
+            return []
+        # Status renders friendly names (`Opus 5`, `Sonnet 5`); launch accepts
+        # the stable aliases used by the bootstrap table.
+        launch_model = {"opus5": "opus-5", "sonnet5": "sonnet-5"}.get(
+            canonical, model
+        )
+        return ["--model", launch_model, "--effort", effort]
+    return []
+
+
+def _handoff_prompt(path, historico=""):
+    return RESUME_PROMPT.format(path=path, historico=historico) + (
+        "\n\nDepois de ler e entender o handoff, responda exatamente "
+        "HERDR_HANDOFF_READ_OK. Não faça alterações nem execute tarefas nesta "
+        "confirmação."
+    )
+
+
+def _handoff_acknowledged(name, timeout_s=30):
+    """Find the exact acknowledgement after the resume prompt echo."""
+    deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    token = "HERDR_HANDOFF_READ_OK"
+    while True:
+        try:
+            out = subprocess.run(
+                core.herdr_argv("agent", "read", name, "--source", "recent-unwrapped",
+                                "--lines", "120"),
+                capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("❯", "›")):
+                continue
+            stripped = re.sub(r"^[•●]\s*", "", stripped).strip()
+            stripped = re.sub(r"^\[\d{1,2}:\d{2}:\d{2}\]\s*", "", stripped)
+            if stripped == token:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _send_handoff_and_confirm(name, path, historico, timeout_s, expected_info):
+    prompt = _handoff_prompt(path, historico)
+    status, detail = dispatch_and_wait(
+        name, prompt, timeout_s, expected_info=expected_info,
+        check_composition=False,
+    )
+    if status not in ("idle", "done"):
+        return False, {"status": status, "detail": detail}
+    ack = _handoff_acknowledged(name, timeout_s=min(timeout_s, 30))
+    return ack, {"status": status, "acknowledged": ack, "detail": detail}
 
 
 def main():
@@ -234,7 +503,13 @@ def main():
     if args.kind == old_kind:
         print(f"aviso: '{name}' já é '{old_kind}' — trocando mesmo assim (contexto zera igual)", file=sys.stderr)
 
-    busy, why = core.pane_looks_busy_with_human_input(pane_id)
+    # Rev-1, rev-2 e scout são panes headless: uma composição residual (até
+    # uma letra digitada por engano) é descartável. A guarda de composição
+    # humana continua valendo para exec e para qualquer papel interativo.
+    headless_reviewer = args.role in {"rev-1", "rev-2", "scout"}
+    busy, why = core.pane_looks_busy_with_human_input(
+        pane_id, check_composition=not headless_reviewer
+    )
     if busy and not auto:
         print(f"erro: {pane_id} parece ter composição humana ou diálogo pendente ({why}) — abortando antes de mandar qualquer coisa. Confira o pane na mão.", file=sys.stderr)
         sys.exit(1)
@@ -245,6 +520,11 @@ def main():
     if args.finalizar:
         # Segunda fase: nao pede handoff nem sobe nada, so consuma o que a
         # primeira deixou pendente.
+        if auto:
+            print("erro: --finalizar não pode rodar no pane antigo que este swap "
+                  "precisa fechar; execute a segunda fase no pane sobrevivente.",
+                  file=sys.stderr)
+            sys.exit(1)
         finalizar(args, name, handoff_dir)
         return
     # Localizado AGORA, enquanto o agent antigo ainda vive: depois do close o
@@ -405,7 +685,16 @@ def main():
         handoff_path = historico_anterior
     else:
         print(f"pedindo handoff pro {name} atual ({old_kind}) em {handoff_path}")
-        status, wait_info = dispatch_and_wait(name, HANDOFF_PROMPT.format(path=handoff_path, verif_path=verif_path), args.timeout)
+        status, wait_info = dispatch_and_wait(
+            name,
+            HANDOFF_PROMPT.format(path=handoff_path, verif_path=verif_path),
+            args.timeout,
+            expected_info=info,
+            # No auto-swap human composition guard: the prompt that launched
+            # this process is intentionally visible in the current pane.
+            check_composition=(not auto and not headless_reviewer),
+            allow_working=auto,
+        )
 
         if status == "timeout":
             print(f"erro: {name} não assentou em {args.timeout}s escrevendo o handoff — abortando, processo antigo mantido vivo", file=sys.stderr)
@@ -422,11 +711,41 @@ def main():
             print(f"erro esperando {name} assentar: {wait_info}. Processo antigo mantido vivo.", file=sys.stderr)
             dica_sem_handoff(historico_anterior)
             sys.exit(1)
+        if status == "preflight_aborted":
+            print(f"erro: preflight de {name} mudou antes do handoff; processo antigo mantido vivo ({wait_info})", file=sys.stderr)
+            sys.exit(1)
         if not os.path.isfile(handoff_path) or os.path.getsize(handoff_path) == 0:
             print(f"erro: {name} assentou mas não escreveu {handoff_path} (ou ficou vazio) — abortando, processo antigo mantido vivo", file=sys.stderr)
             sys.exit(1)
 
         print(f"handoff escrito ({os.path.getsize(handoff_path)} bytes).")
+
+    # Capture the effective runtime only after the handoff has settled.  For
+    # Claude this actively asks `/status`: the startup banner is allowed as a
+    # diagnostic fallback, never as the profile inherited by a replacement.
+    try:
+        info = get_agent(name)
+    except RuntimeError as exc:
+        print(f"erro: não consegui revalidar '{name}' antes de criar o substituto: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
+    profile_before, profile_evidence, info = _runtime_capture(
+        name, info, args.timeout
+    )
+    if info.get("pane_id") != pane_id or profile_before.get("source") == "identity_changed":
+        print(f"erro: o pane de '{name}' mudou durante a captura do perfil; swap abortado.",
+              file=sys.stderr)
+        sys.exit(1)
+    if profile_before.get("source") == "status":
+        print(f"perfil efetivo confirmado via /status: "
+              f"{profile_before.get('model')} / {profile_before.get('reasoning_effort')}")
+    elif old_kind == "claude":
+        print("aviso: Claude não confirmou o par atual via /status; "
+              "não vou herdar o cabeçalho inicial nem um default global.", file=sys.stderr)
+    else:
+        print(f"perfil observado: {profile_before.get('model', '?')} / "
+              f"{profile_before.get('reasoning_effort', '?')} "
+              f"({profile_before.get('source', 'unknown')})")
 
     # Sobe o novo kind sob nome PROVISÓRIO antes de tocar no antigo — até o
     # `pane close` do antigo (mais abaixo), tudo aqui é reversível: se o novo
@@ -476,6 +795,16 @@ def main():
         sys.exit(1)
 
     full_extra = list(args.extra_args)
+    inherited_extra = _runtime_start_args(
+        args.kind, profile_before,
+        explicit=_has_runtime_arg(full_extra),
+    )
+    if inherited_extra:
+        full_extra = inherited_extra + full_extra
+        print("herdando perfil observado no novo processo: " + " ".join(inherited_extra))
+    elif profile_before.get("observed") and args.kind != old_kind:
+        print("aviso: perfil observado não é compatível com a família do novo CLI; "
+              "mantendo somente os argumentos explícitos do destino.", file=sys.stderr)
     if args.kind == "codex":
         # desliga o sistema nativo de sub-agentes do Codex - ver
         # core.CODEX_NO_NATIVE_AGENTS pro porque (achado real, omabackup-exec
@@ -525,10 +854,21 @@ def main():
             trust_markers = ("Do you trust", "confia", "trust the contents", "Yes, I trust")
             if any(m.lower() in pane_text.lower() for m in trust_markers):
                 print(f"'{temp_name}' parou num diálogo de confiança de diretório (1a vez desse kind aqui) — aprovando...")
-                api("agent", "send-keys", temp_name, "enter")
-                time.sleep(2)
-                if get_agent(temp_name)["agent_status"] in ("idle", "working", "done"):
-                    last_exc = None
+                # Enquanto o diálogo de confiança está aberto o registro do
+                # agent provisório ainda pode não existir; o pane_id já é
+                # estável. Envie somente a confirmação do diálogo pelo
+                # controle do pane, sem usar isso como canal de comunicação.
+                # Só confirma quando a TUI mostra explicitamente qual opção
+                # está selecionada. A ordem inicial varia entre versões de
+                # Claude/Codex; nunca assuma que `down` significa confiar.
+                if _accept_trust_dialog(new_pane_id, pane_text):
+                    time.sleep(2)
+                    if get_agent(temp_name)["agent_status"] in ("idle", "working", "done"):
+                        last_exc = None
+                else:
+                    print("diálogo de confiança reconhecido, mas a opção "
+                          "selecionada não pôde ser identificada; não vou "
+                          "pressionar teclas às cegas.", file=sys.stderr)
             if last_exc is not None:
                 print(f"'{temp_name}' ficou bloqueado num diálogo que não reconheço — veja o pane {new_pane_id} na mão:", file=sys.stderr)
                 print(pane_text[-800:], file=sys.stderr)
@@ -545,30 +885,77 @@ def main():
             print(f"pane provisório {new_pane_id} ficou pra trás sem fechar ({exc2}) — feche na mão se quiser. O antigo continua sendo o '{name}' válido.", file=sys.stderr)
         sys.exit(1)
 
-    if args.em_tab_novo:
-        # PARA AQUI. O antigo continua vivo, o substituto ja leu o handoff, e os
-        # dois estao na tela. O que falta e' destrutivo, entao vira um comando
-        # separado que uma pessoa dispara depois de olhar -- e' esse o ponto de
-        # ter duas fases.
+    try:
+        temp_info = get_agent(temp_name)
+    except RuntimeError as exc:
+        print(f"erro: não consegui observar o substituto '{temp_name}': {exc}",
+              file=sys.stderr)
         try:
-            api("agent", "prompt", temp_name,
-                RESUME_PROMPT.format(
-                    path=handoff_path,
-                    historico=(HISTORICO_NOTA.format(path=historico_anterior)
-                               if historico_anterior else "")),
-                "--wait", "--until", "idle", "--until", "done",
-                "--timeout", str(args.timeout * 1000))
+            api("pane", "close", new_pane_id)
+        except RuntimeError:
+            pass
+        sys.exit(1)
+
+    ok_handoff, handoff_evidence = _send_handoff_and_confirm(
+        temp_name, handoff_path,
+        (HISTORICO_NOTA.format(path=historico_anterior)
+         if historico_anterior else ""),
+        args.timeout, temp_info,
+    )
+    if not ok_handoff:
+        print(f"erro: o substituto não confirmou a leitura do handoff; "
+              f"mantendo '{name}' vivo e fechando apenas o provisório.",
+              file=sys.stderr)
+        print(f"  evidência: {handoff_evidence}", file=sys.stderr)
+        try:
+            api("pane", "close", new_pane_id)
         except RuntimeError as exc:
-            print(f"aviso: nao consegui mandar o handoff pro provisorio ({exc}) — "
-                  f"mande na mao: herdr agent prompt {temp_name} 'Leia {handoff_path}'",
+            print(f"aviso: não consegui fechar o provisório {new_pane_id}: {exc}",
                   file=sys.stderr)
-        grava_swap_state(swap_state_path(handoff_dir, name), {
+        if tab_temp:
+            try:
+                api("tab", "close", tab_temp)
+            except RuntimeError:
+                pass
+        sys.exit(1)
+
+    try:
+        temp_info = get_agent(temp_name)
+        profile_after = core._runtime_profile(temp_name, temp_info)
+    except Exception as exc:
+        profile_after = {"observed": False, "source": "unknown", "error": str(exc)}
+    runtime_comparison = core._assert_runtime_preserved(
+        temp_name, profile_before, profile_after
+    )
+    if profile_before.get("observed") and not runtime_comparison.get("preserved"):
+        print("aviso: o perfil observado no substituto diverge ou ficou "
+              "desconhecido; registrando a evidência sem bloquear o swap.",
+              file=sys.stderr)
+
+    pending_state = {
             "name": name, "temp_name": temp_name,
             "old_pane_id": pane_id, "new_pane_id": new_pane_id,
             "tab_original": info["tab_id"], "tab_temp": tab_temp,
             "handoff": handoff_path, "verificacao": verif_path,
+            "verification_required": bool(
+                not args.no_verify and os.path.isfile(verif_path)
+            ),
+            "handoff_acknowledged": True,
+            "old_identity": _identity_snapshot(info),
+            "new_identity": _identity_snapshot(temp_info),
+            "runtime": {
+                "before": profile_before,
+                "after": profile_after,
+                "comparison": runtime_comparison,
+                "capture": profile_evidence,
+                "requested_args": inherited_extra,
+            },
+            "no_verify": bool(args.no_verify),
             "criado_em": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        })
+    }
+    if args.em_tab_novo:
+        # PARA AQUI. Nada destrutivo ocorre antes da confirmação explícita.
+        grava_swap_state(swap_state_path(handoff_dir, name), pending_state)
         print()
         print(f"PAROU ANTES DE FECHAR. Os dois estao vivos:")
         print(f"  antigo  {name:24s} {pane_id}  ({old_kind})")
@@ -583,6 +970,70 @@ def main():
         print(f"Pra desistir: herdr pane close {new_pane_id} && herdr tab close {tab_temp}")
         print(f"  (e apague {swap_state_path(handoff_dir, name)})")
         return
+
+    # O handoff foi confirmado enquanto os dois panes ainda estavam vivos.
+    # Execute a verificação antes do ponto de não-retorno; se ela falhar, o
+    # pane antigo permanece disponível para nova tentativa.
+    if not args.no_verify and os.path.isfile(verif_path):
+        verification = rodar_verificacao(temp_name, verif_path, handoff_path,
+                                          args.timeout, historico_anterior)
+        if verification is False:
+            print("erro: a verificação do handoff não passou; antigo preservado e "
+                  "provisório fechado.", file=sys.stderr)
+            try:
+                api("pane", "close", new_pane_id)
+            except RuntimeError:
+                pass
+            if tab_temp:
+                try:
+                    api("tab", "close", tab_temp)
+                except RuntimeError:
+                    pass
+            sys.exit(1)
+        if verification is None:
+            print("aviso: a verificação não produziu uma conclusão; mantendo o "
+                  "handoff confirmado e seguindo sem descartar o provisório.",
+                  file=sys.stderr)
+
+    # A verificação pode demorar e o antigo pode receber trabalho nesse
+    # intervalo. Reobserve identidade, lifecycle e diálogos no instante em que
+    # o close se torna irreversível.
+    try:
+        old_final = get_agent(name)
+        new_final = get_agent(temp_name)
+    except RuntimeError as exc:
+        print(f"erro: identidade não pôde ser confirmada imediatamente antes do "
+              f"close ({exc}); nenhum pane será fechado.", file=sys.stderr)
+        sys.exit(1)
+    old_snapshot = _identity_snapshot(old_final)
+    new_snapshot = _identity_snapshot(new_final)
+    for label, expected, observed in (
+        ("antigo", _identity_snapshot(info), old_snapshot),
+        ("substituto", _identity_snapshot(temp_info), new_snapshot),
+    ):
+        fields = ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                  "foreground_cwd", "agent_session", "revision")
+        if label == "antigo":
+            fields += ("state_change_seq",)
+        changed = [k for k in fields
+                   if expected.get(k) is not None and expected.get(k) != observed.get(k)]
+        if changed:
+            print(f"erro: identidade do {label} mudou na última checagem; "
+                  "abortando sem fechar panes.", file=sys.stderr)
+            sys.exit(1)
+    if old_final.get("agent_status") not in ("idle", "done"):
+        print("erro: o antigo voltou a trabalhar antes do close "
+              f"({old_final.get('agent_status')!r}); nenhum pane será fechado.",
+              file=sys.stderr)
+        sys.exit(1)
+    headless_reviewer = args.role in {"rev-1", "rev-2", "scout"}
+    busy, why = core.pane_looks_busy_with_human_input(
+        old_final.get("pane_id", pane_id), check_composition=not headless_reviewer
+    )
+    if busy and not args.forcar_fechamento:
+        print(f"erro: o antigo tem diálogo ou texto humano pendente antes do "
+              f"close: {why}; nenhum pane será fechado.", file=sys.stderr)
+        sys.exit(1)
 
     # Ponto de não-retorno de verdade: só a partir daqui o antigo é encerrado.
     # Tudo antes disso era reversível.
@@ -602,17 +1053,7 @@ def main():
         print(f"handoff: {handoff_path}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        nota = (HISTORICO_NOTA.format(path=historico_anterior)
-                if historico_anterior else "")
-        api("agent", "prompt", name,
-            RESUME_PROMPT.format(path=handoff_path, historico=nota))
-    except RuntimeError as exc:
-        print(f"'{name}' subiu ({old_kind} -> {args.kind}) mas falhei mandando ele ler o handoff: {exc}", file=sys.stderr)
-        print(f"mande na mão: herdr agent prompt {name} 'Leia {handoff_path} antes de qualquer coisa'", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"'{name}' trocado: {old_kind} -> {args.kind}. Mandei pra ele ler o handoff.")
+    print(f"'{name}' trocado: {old_kind} -> {args.kind}. Handoff confirmado antes do close.")
     print(f"handoff: {handoff_path}")
 
     if args.no_verify:
@@ -623,7 +1064,9 @@ def main():
               f"swap concluido, mas sem teste de verificacao.", file=sys.stderr)
         return
 
-    rodar_verificacao(name, verif_path, handoff_path, args.timeout, historico_anterior)
+    # A verificação já foi executada antes do close. Esta linha fica apenas
+    # como marcador de compatibilidade para logs antigos; não reenvia prompt.
+    print(f"verificação concluída antes da promoção: {verif_path}")
 
 
 # --- swap em duas fases (--em-tab-novo / --finalizar) ---------------------
@@ -651,8 +1094,21 @@ def swap_state_path(handoff_dir, name):
 
 def grava_swap_state(path, dados):
     import json as _json
-    with open(path, "w", encoding="utf-8") as fh:
-        _json.dump(dados, fh, indent=2, sort_keys=True)
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(dados, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def le_swap_state(path):
@@ -665,7 +1121,7 @@ def le_swap_state(path):
 
 
 def finalizar(args, name, handoff_dir):
-    """Segunda fase: mata o antigo, promove o nome, arruma o layout."""
+    """Segunda fase transacional: verifica os dois panes e só então promove."""
     st_path = swap_state_path(handoff_dir, name)
     st = le_swap_state(st_path)
     if not st:
@@ -690,6 +1146,56 @@ def finalizar(args, name, handoff_dir):
               file=sys.stderr)
         sys.exit(1)
 
+    # Nunca permita que a segunda fase mate o próprio pane que a executa.
+    if os.environ.get("HERDR_PANE_ID") == old_pane:
+        print("erro: o pane atual é o antigo do swap; --finalizar precisa ser "
+              "executado no pane sobrevivente.", file=sys.stderr)
+        sys.exit(1)
+
+    # A primeira fase guarda as identidades. Revalidar imediatamente antes de
+    # qualquer close evita promover um processo que mudou de sessão/pane,
+    # workspace ou projeto enquanto o operador comparava os dois.
+    expected_old = st.get("old_identity")
+    expected_new = st.get("new_identity")
+    try:
+        old_info = get_agent(name)
+    except RuntimeError as exc:
+        print(f"erro: não consegui revalidar o antigo '{name}': {exc}; "
+              "nenhum pane será fechado.", file=sys.stderr)
+        sys.exit(1)
+    if expected_old:
+        old_now = _identity_snapshot(old_info)
+        old_diffs = [
+            f"{key}: {expected_old.get(key)!r} -> {old_now.get(key)!r}"
+            for key in ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                        "foreground_cwd", "agent_session", "revision",
+                        "state_change_seq")
+            if expected_old.get(key) is not None
+            and expected_old.get(key) != old_now.get(key)
+        ]
+        if old_diffs:
+            print("erro: identidade do antigo mudou desde a fase 1; "
+                  "preservando os dois panes: " + "; ".join(old_diffs),
+                  file=sys.stderr)
+            sys.exit(1)
+    if expected_new:
+        new_now = _identity_snapshot(prov)
+        new_diffs = [
+            f"{key}: {expected_new.get(key)!r} -> {new_now.get(key)!r}"
+            for key in ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                        "foreground_cwd", "agent_session", "revision")
+            if expected_new.get(key) is not None
+            and expected_new.get(key) != new_now.get(key)
+        ]
+        if new_diffs:
+            print("erro: identidade do substituto mudou desde a fase 1; "
+                  "preservando os dois panes: " + "; ".join(new_diffs),
+                  file=sys.stderr)
+            sys.exit(1)
+
+    # Dialogues reais continuam sendo bloqueio. Para papéis headless, texto
+    # residual de composição é ignorado explicitamente.
+
     # Ultima leitura do pane antigo antes de matar. Nao prova que esta seguro
     # (o humano pode digitar entre a leitura e o close), mas pular isso foi
     # exatamente como um dos dois incidentes de 2026-08 aconteceu.
@@ -698,7 +1204,13 @@ def finalizar(args, name, handoff_dir):
     # direto num `if` recusava todo swap incondicionalmente. O --finalizar nunca
     # conseguiu rodar ate isto ser corrigido, e o pior e' que a mensagem culpava
     # o pane por uma condicao que nunca chegou a ser avaliada.
-    busy, why = core.pane_looks_busy_with_human_input(old_pane)
+    headless_reviewer = getattr(args, "role", "") in {"rev-1", "rev-2", "scout"}
+    if headless_reviewer:
+        busy, why = core.pane_looks_busy_with_human_input(
+            old_pane, check_composition=False
+        )
+    else:
+        busy, why = core.pane_looks_busy_with_human_input(old_pane)
     if busy and not args.forcar_fechamento:
         print(f"erro: {old_pane} aparenta ter texto humano nao enviado ou dialogo "
               f"pendente: {why}", file=sys.stderr)
@@ -710,22 +1222,99 @@ def finalizar(args, name, handoff_dir):
     if busy:
         print(f"aviso: --forcar-fechamento passado por cima de: {why}")
 
+    # A verificação de transferência precisa ocorrer enquanto o antigo ainda
+    # está vivo. Rodadas antigas sem arquivo de teste permanecem compatíveis;
+    # uma fase nova registra verification_required e falha fechada quando o
+    # teste foi solicitado mas não pôde ser executado.
+    if st.get("verification_required"):
+        verif_path = st.get("verificacao")
+        if not verif_path or not os.path.isfile(verif_path):
+            print("erro: verificação pendente não está disponível; nenhum pane "
+                  "será fechado.", file=sys.stderr)
+            sys.exit(1)
+        verification = rodar_verificacao(
+            temp_name, verif_path, st.get("handoff", verif_path),
+            getattr(args, "timeout", 180), None,
+        )
+        if verification is False:
+            print("erro: a verificação do handoff não passou; os dois panes "
+                  "continuam vivos.", file=sys.stderr)
+            sys.exit(1)
+        if verification is None:
+            print("aviso: a verificação não produziu uma conclusão; seguindo "
+                  "com o handoff já confirmado.", file=sys.stderr)
+
+    # Uma última leitura, depois da verificação, fecha a janela entre a guarda
+    # de identidade e o close. A comparação ignora apenas lifecycle/status:
+    # o novo pode ter assentado durante a prova; sessão/pane/projeto não podem.
+    try:
+        old_final = get_agent(name)
+        new_final = get_agent(temp_name)
+    except RuntimeError as exc:
+        print(f"erro: identidade não pôde ser confirmada imediatamente antes do "
+              f"close ({exc}); nenhum pane será fechado.", file=sys.stderr)
+        sys.exit(1)
+    if expected_old:
+        d = _identity_snapshot(old_final)
+        changed = [k for k in ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                               "foreground_cwd", "agent_session", "revision",
+                               "state_change_seq")
+                   if expected_old.get(k) is not None and expected_old.get(k) != d.get(k)]
+        if changed:
+            print("erro: identidade do antigo mudou na última checagem; abortando.",
+                  file=sys.stderr)
+            sys.exit(1)
+    if expected_new:
+        d = _identity_snapshot(new_final)
+        changed = [k for k in ("agent", "pane_id", "workspace_id", "tab_id", "cwd",
+                               "foreground_cwd", "agent_session")
+                   if expected_new.get(k) is not None and expected_new.get(k) != d.get(k)]
+        if changed:
+            print("erro: identidade do substituto mudou na última checagem; abortando.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    if old_final.get("agent_status") not in ("idle", "done"):
+        print("erro: o antigo voltou a trabalhar antes do close "
+              f"({old_final.get('agent_status')!r}); nenhum pane será fechado.",
+              file=sys.stderr)
+        sys.exit(1)
+    headless_reviewer = getattr(args, "role", "") in {"rev-1", "rev-2", "scout"}
+    busy, why = core.pane_looks_busy_with_human_input(
+        old_final.get("pane_id", old_pane), check_composition=not headless_reviewer
+    )
+    if busy and not args.forcar_fechamento:
+        print(f"erro: o antigo tem diálogo ou texto humano pendente antes do "
+              f"close: {why}; nenhum pane será fechado.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"fechando o antigo ({old_pane}) e promovendo '{temp_name}' -> '{name}'...")
     api("pane", "close", old_pane)
     time.sleep(1)
     api("agent", "rename", temp_name, name)
 
     # Traz o pane de volta pro tab original. Se falhar, NAO e' fatal: o agent
-    # ja e' o certo, com o nome certo -- so esta no tab errado, e
-    # `herdr-fix-layout` resolve isso depois.
+    # ja e' o certo, com o nome certo -- so esta no tab errado. O fix-layout
+    # exige o trio no mesmo tab, entao o retorno precisa acontecer antes dele.
     try:
         print(f"trazendo {novo_pane} de volta pro tab {tab_alvo}...")
-        api("pane", "move", novo_pane, "--tab", tab_alvo)
-        api("tab", "close", tab_temp)
+        movido = api("pane", "move", novo_pane, "--tab", tab_alvo, "--split", "right")
     except RuntimeError as exc:
         print(f"aviso: nao consegui mover o pane de volta ({exc}). O agent esta certo e "
-              f"vivo em {novo_pane}, tab {tab_temp} — rode bin/herdr-fix-layout.",
+              f"vivo em {novo_pane}, tab {tab_temp} — rode "
+              f"herdr pane move {novo_pane} --tab {tab_alvo} --split right; "
+              f"depois rode bin/herdr-fix-layout.",
               file=sys.stderr)
+    else:
+        # Mover o ultimo pane ja fecha o tab de origem; fechar de novo daria
+        # um erro de tab inexistente mesmo com o retorno concluido.
+        if movido.get("move_result", {}).get("closed_tab_id") != tab_temp:
+            try:
+                api("tab", "close", tab_temp)
+            except RuntimeError as exc:
+                print(f"aviso: pane {novo_pane} ja esta no tab {tab_alvo}, mas nao "
+                      f"consegui fechar o tab temporario {tab_temp} ({exc}).",
+                      file=sys.stderr)
 
     try:
         os.unlink(st_path)
@@ -807,7 +1396,7 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
     if not (positivas and negativas):
         print("aviso: " + os.path.basename(verif_path) + " nao tem as duas secoes no "
               "formato esperado - faca a verificacao na mao.", file=sys.stderr)
-        return
+        return None
 
     print("")
     print("verificando a transferencia (" + str(len(positivas)) + " positivas, "
@@ -819,24 +1408,39 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
                  + FIM_DA_INSTRUCAO + ".")
     perguntas = chr(10).join(positivas + negativas)
     try:
-        api("agent", "prompt", name, instrucao + chr(10) + chr(10) + perguntas,
-            "--wait", "--until", "idle", "--until", "done", "--timeout", str(timeout_s * 1000))
+        expected = get_agent(name)
+        headless_reviewer = name.endswith(("-rev-1", "-rev-2", "-scout"))
+        status, wait_info = dispatch_and_wait(
+            name, instrucao + chr(10) + chr(10) + perguntas,
+            timeout_s, expected_info=expected,
+            check_composition=not headless_reviewer,
+        )
+        if status not in ("idle", "done"):
+            print("aviso: verificacao terminou sem estado terminal (" +
+                  str(status) + ") — confira manualmente.", file=sys.stderr)
+            return None
         out = subprocess.run(
             core.herdr_argv("agent", "read", name, "--source", "recent-unwrapped",
                             "--lines", "120"),
             capture_output=True, text=True, timeout=CLI_TIMEOUT_S,
         ).stdout
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-        print("aviso: verificacao nao concluiu (" + str(exc) + ") - o swap esta feito; "
-              "teste na mao com " + verif_path, file=sys.stderr)
-        return
+        print("aviso: verificacao nao concluiu (" + str(exc) + ") — "
+              "o handoff foi confirmado; confira manualmente " + verif_path,
+              file=sys.stderr)
+        return None
 
     # So as NEGATIVAS dao pra conferir sozinho: a resposta certa e' uma forma de
     # "nao sei". As positivas exigem julgamento, entao ficam pro humano comparar
     # com o GABARITO do arquivo.
     admitiu = conta_recusas(out)
-    # `>` seria contagem impossivel (mais recusas que perguntas) -- sinal de que
-    # o corte do eco falhou. Nesse caso nao afirmo OK: mando conferir na mao.
+    # Mais recusas que perguntas é uma contagem impossível: pode ser eco mal
+    # cortado ou uma positiva legitimamente recusada. É indeterminado, não uma
+    # reprovação automática que descarte o substituto confirmado.
+    if admitiu > len(negativas):
+        print("  contagem impossivel: resultado indeterminado; confira "
+              "manualmente antes de decidir.")
+        return None
     ok = admitiu == len(negativas)
     print("  negativas: " + str(admitiu) + "/" + str(len(negativas))
           + " admitiram desconhecimento" + ("  OK" if ok else "  ATENCAO"))
@@ -878,6 +1482,7 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
             print("  historico da sessao anterior nao localizado; leia o pane na mao.")
     print("  positivas: confira as respostas contra o GABARITO em " + verif_path)
     print("  respostas: herdr agent read " + name + " --source recent-unwrapped --lines 120")
+    return ok
 
 if __name__ == "__main__":
     main()

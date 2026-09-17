@@ -8,12 +8,13 @@ herdr-bootstrap e deixa o bootstrap criar tudo.
 NAO cria workspace/panes/agents por conta propria. Escreve a entrada na tabela
 e chama `herdr-bootstrap`, que ja e' idempotente, ja deriva os revisores do
 slug (REV_EFFORT/REV_OVERRIDES), ja lida com a migracao rev->rev-1 e ja arma o
-notify-watch do exec. Um caminho paralelo criaria spaces que a tabela nao
+notify-watch do exec. Os perfis pinados de exec/scout sao reutilizados da
+tabela; um caminho paralelo criaria spaces que a tabela nao
 conhece - orfaos que ninguem recria depois.
 
 A tabela vale pelos comentarios: e' la que esta escrito por que o llm-gateway
-tem slug "llm", por que o HomeHub nao tem scout, por que o cwd do
-claude-bridge e' o repo e nao o dir de runtime. Por isso --note existe e por
+tem slug "llm", por que o cwd do claude-bridge e' o repo e nao o dir de
+runtime, e qual e' o perfil padrao de cada papel. Por isso --note existe e por
 isso a ausencia dele deixa um TODO visivel em vez de uma entrada muda.
 """
 import argparse
@@ -102,10 +103,26 @@ def render_entry(label, cwd, slug, exec_kind, scout_kind, note):
     # HOME as an f-string, matching every other row in the table.
     cwd_expr = f'f"{{HOME}}{cwd[len(HOME):]}"' if cwd.startswith(HOME + "/") else repr(cwd)
     exec_name = f"{slug}-exec"
-    scout_part = f'("{slug}-scout", "{scout_kind}", [])' if scout_kind else "None"
+
+    # Reuse the pinned profiles already declared at the top of
+    # herdr-bootstrap. Emitting [] here would make a newly registered space
+    # inherit a mutable global model/effort, defeating the table's purpose.
+    def profile_expr(kind, role):
+        if kind == "codex":
+            return "SCOUT_ARGS" if role == "scout" else "EXEC_ARGS_CODEX"
+        if kind == "claude":
+            return "EXEC_ARGS"
+        # Kinds without a shared model/effort profile (for example grok) keep
+        # their native defaults; they are not silently given flags from a
+        # different CLI family.
+        return "[]"
+
+    exec_args = profile_expr(exec_kind, "exec")
+    scout_part = (f'("{slug}-scout", "{scout_kind}", '
+                  f'{profile_expr(scout_kind, "scout")})' if scout_kind else "None")
     slug_part = f', "{slug}"' if slug != label.lower() else ""
 
-    lines.append(f'    ("{label}", {cwd_expr}, ("{exec_name}", "{exec_kind}", []),')
+    lines.append(f'    ("{label}", {cwd_expr}, ("{exec_name}", "{exec_kind}", {exec_args}),')
     lines.append(f"        {scout_part}{slug_part}),")
     return "\n".join(lines) + "\n"
 

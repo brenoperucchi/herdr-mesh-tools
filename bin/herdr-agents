@@ -350,6 +350,24 @@ def do_cache(nome, agora_model, agora_effort, agora_origem, c=None):
     return agora_model, agora_effort, agora_origem
 
 
+def status_curto(status):
+    """`working` ocupa 7 colunas e nao diz nada que o operador ja nao saiba
+    pelo nome do agent -- comprime pra `job` (sem id numerico: a API do
+    Herdr nao expoe job/task id nenhum, so agent_status)."""
+    return "job" if status == "working" else status
+
+
+def cwd_relativo(cwd):
+    """So imprime o CWD quando ele esta FORA do $HOME -- dentro e' o caso
+    comum e nao precisa ocupar coluna nenhuma. Fora, mostra relativo ao
+    $HOME em vez de realpath absoluto."""
+    if not cwd or cwd == "?":
+        return ""
+    if cwd == HOME or cwd.startswith(HOME + "/"):
+        return ""
+    return cwd
+
+
 def sem_prefixo_do_kind(modelo, kind):
     """Tira o prefixo redundante com a coluna KIND: `claude-sonnet-5` vira
     `sonnet-5`, porque a linha ja diz `claude` do lado. Os ids do Codex nao
@@ -455,10 +473,11 @@ def main():
         kind = a.get("agent", "?")
         model, effort, origem = do_cache(a.get("name") or "", model, effort, origem,
                                          cache_atual)
+        nome = a.get("name") or ""
         linhas.append([
-            a.get("agent_status", "?"), a.get("cwd", "?"), kind,
+            status_curto(a.get("agent_status", "?")), cwd_relativo(a.get("cwd", "?")), kind,
             sem_prefixo_do_kind(model, kind), effort, origem,
-            a.get("name") or "", a.get("pane_id", "?"), a.get("tab_id", "?"),
+            nome, a.get("pane_id", "?"), a.get("tab_id", "?"),
             a.get("workspace_id", ""),   # so pra ordenar; nao e' impressa
         ])
     # workspace na ordem do Herdr; dentro dele, papel na ordem do layout
@@ -475,7 +494,7 @@ def main():
     linhas.sort(key=lambda r: (r[6] == "", ordem_ws.get(r[9], 999),
                                peso_papel(r[6]), r[6]))
 
-    head = ["AGENT", "CWD", "KIND", "MODEL", "EFFORT", "SRC", "NAME", "PANE_ID", "TAB_ID"]
+    head = ["STATUS", "CWD", "KIND", "MODEL", "EFFORT", "SRC", "NAME", "PANE_ID", "TAB_ID"]
     larguras = [max(len(str(r[i])) for r in [head] + linhas) for i in range(len(head))]
     for r in [head] + linhas:
         print("  ".join(str(c).ljust(w) for c, w in zip(r[:len(head)], larguras)).rstrip())

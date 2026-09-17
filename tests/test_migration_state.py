@@ -227,6 +227,21 @@ class MigrationStateTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.migration.resolve_reviewer_name(self.cwd, "foo")
 
+    def test_resolve_reviewer_name_can_return_phase_expected_missing_name(self):
+        """O dispatcher precisa chegar ao bootstrap quando os dois nomes
+        sumiram; o modo normal continua fail-closed (teste acima)."""
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info(set())):
+            self.assertEqual(
+                self.migration.resolve_reviewer_name(self.cwd, "foo", allow_missing=True),
+                "foo-rev",
+            )
+        self.migration.write_migration_state_atomic(self.cwd, {"phase": "migrated"})
+        with patch.object(self.core, "get_agent_info", side_effect=self._fake_get_agent_info(set())):
+            self.assertEqual(
+                self.migration.resolve_reviewer_name(self.cwd, "foo", allow_missing=True),
+                "foo-rev-1",
+            )
+
     def test_resolve_reviewer_name_infra_failure_propagates(self):
         # Achado P1 herdr-13: um timeout consultando UM dos dois nomes não
         # pode virar "não existe" silenciosamente — precisa propagar, não
@@ -433,7 +448,7 @@ class MigrationStateTests(unittest.TestCase):
         # profundidade no segundo revisor. Ver extra_args_for_rev2.
         self.assertEqual(
             self.migration.extra_args_for_rev2("claude"),
-            ["--model", "opus", "--effort", "low"],
+            ["--model", "opus-5", "--effort", "low"],
         )
 
     def test_extra_args_for_rev2_grok_gets_no_flags(self):
@@ -518,7 +533,7 @@ class BootstrapRevAgentsTests(unittest.TestCase):
         agents = self.bootstrap.build_rev_agents("foo", self.cwd)
         rev2 = next(a for a in agents if a[0] == "foo-rev-2")
         self.assertEqual(rev2[1], "claude")
-        self.assertEqual(rev2[2], ["--model", "opus", "--effort", "low"])
+        self.assertEqual(rev2[2], ["--model", "opus-5", "--effort", "low"])
 
 
 class MigrateRevGiveUpTests(unittest.TestCase):

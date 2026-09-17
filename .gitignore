@@ -12,3 +12,7 @@ venv/
 # nao versionar, so o protocolo em si (reviewer.md)
 .herdr/*
 !.herdr/reviewer.md
+
+# dagr runtime state and local swap copies are machine/session artifacts.
+.dagr/
+bin/herdr-swap.backup-*

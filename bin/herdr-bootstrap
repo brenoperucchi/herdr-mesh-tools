@@ -2,18 +2,23 @@
 """herdr-bootstrap — garante spaces, panes e agents do ambiente de trabalho.
 
 Idempotente: só cria o que falta e só inicia agent em pane que ainda não tem.
-Uso: herdr-bootstrap [--dry-run]
+Uso: herdr-bootstrap [--dry-run] [--space LABEL | --slug SLUG]
+
+Quando chamado pelos dispatchers com ``--slug``, limita a operação a um único
+space. Isso permite recuperar um papel obrigatório ausente no meio de uma
+revisão sem tocar nos demais workspaces.
 """
+import argparse
 import json
 import os
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _herdr_dispatch as core
 import _herdr_migration as migration
 
-HERDR = os.path.expanduser("~/.local/bin/herdr")
+HERDR = core.HERDR  # compatibilidade para consumidores que importam o módulo
 HOME = os.path.expanduser("~")
 DRY = "--dry-run" in sys.argv
 
@@ -37,6 +42,16 @@ DRY = "--dry-run" in sys.argv
 # original, nunca a configuracao real.
 REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"]
 
+# Matriz normativa: a seleção de um papel depende somente do modelo. O
+# reasoning_effort continua explícito quando a CLI é iniciada, mas não cria
+# uma variante de perfil nem autoriza promoção para outro modelo.
+ALLOWED_MODELS_BY_ROLE = {
+    "rev-1": ("gpt-5.6-luna", "gpt-6-astra"),
+    "rev-2": ("opus-5",),
+    "scout": ("gpt-6-astra", "fable-5", "opus-5"),
+    "exec": ("sonnet-5", "opus-5", "gpt-5.6-luna"),
+}
+
 # Achado 2026-09-09 (consulta herdr-8, os dois revisores + pesquisa de preco):
 # "nao pinar" nunca foi neutro - todo papel sem --model/--effort explicito
 # herdava ~/.claude/settings.json ou ~/.codex/config.toml, e esses arquivos sao
@@ -44,17 +59,21 @@ REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"]
 # de todos os rev-2 do mesh, e foi assim que dois revisores acordaram em Fable
 # 5.1 (o modelo MAIS caro do catalogo, $10/$50 - o dobro do Opus pretendido).
 # Dai a regra: model E effort explicitos em TODO papel, sempre.
-EXEC_ARGS = ["--model", "sonnet", "--effort", "high"]
+EXEC_ARGS = ["--model", "sonnet-5", "--effort", "high"]
 
-# Execs migrados pra Codex (2026-09-12). Motivo declarado pelo usuario: limite
-# semanal da Anthropic em 87% contra 99% LIVRE na OpenAI -- e' realocacao de
-# orcamento entre contas, nao julgamento de qualidade dos modelos.
+# Perfil explícito do DRE após o swap de 2026-09-15. O ID completo evita que
+# uma restauração futura dependa do alias/default global do Claude Code.
+EXEC_ARGS_SONNET_5 = ["--model", "claude-sonnet-5", "--effort", "high"]
+
+# Execs migrados pra Codex (2026-09-12). A matriz normativa de exec permite
+# `gpt-5.6-luna`; o esforço abaixo continua explícito apenas como parâmetro de
+# inicialização e não participa da seleção do modelo.
 #
 # Esta constante existe porque os swaps foram feitos AO VIVO com herdr-swap e o
 # arquivo de policy ficou pra tras: por ~1h o bootstrap teria recriado os cinco
 # em Claude/Sonnet, desfazendo a migracao em silencio. Quem trocar um exec
 # adiante tem que mexer AQUI tambem, senao o proximo bootstrap reverte.
-EXEC_ARGS_CODEX = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"]
+EXEC_ARGS_CODEX = ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high"]
 
 # scout: Astra @ max (decisao do usuario 2026-09-10, revisando o Terra que
 # tinha sido escolhido no dia anterior). E' a combinacao mais cara do catalogo
@@ -65,7 +84,7 @@ EXEC_ARGS_CODEX = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=high"
 SCOUT_ARGS = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=max"]
 
 # Override pontual de model/effort dos revisores, por slug - a maioria dos
-# spaces usa REV_EFFORT/rev2_kind (default "claude", sem effort explicito) e
+# spaces usa REV_EFFORT/rev2_kind (default "claude") e
 # nao precisa entrar aqui. So existe quando o usuario pede explicitamente um
 # par mais caro que o default pra um space especifico (achado 2026-09-02,
 # pedido explicito pro space "llm": Codex gpt-5.6-luna @ max e Claude Opus @
@@ -76,16 +95,15 @@ SCOUT_ARGS = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=max"]
 REV_OVERRIDES = {
     "llm": {
         "rev_extra_args": ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max"],
-        "rev2_extra_args": ["--model", "opus", "--effort", "max"],
+        "rev2_extra_args": ["--model", "opus-5", "--effort", "max"],
     },
-    # Pedido explicito 2026-09-05: rev-2 aqui e' so "--model opus" (sem
-    # effort explicito, ao contrario do "llm" acima) porque o usuario nao
-    # pediu nenhum - extra_args_for_rev2("claude") ja daria exatamente isso
-    # por default, mas mantido aqui por completude/legibilidade lado a lado
-    # com o rev_extra_args customizado.
+    # Perfil do HomeHub: Opus @ low, igual ao perfil explicito de
+    # extra_args_for_rev2("claude"). O override antigo tinha somente
+    # "--model opus", deixando o raciocínio cair no settings.json global
+    # quando o papel precisasse ser inicializado sem pane-base.
     "homehub": {
         "rev_extra_args": ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"],
-        "rev2_extra_args": ["--model", "opus"],
+        "rev2_extra_args": ["--model", "opus-5", "--effort", "low"],
     },
 }
 
@@ -104,7 +122,7 @@ REV_OVERRIDES = {
 # "-rev-1", e o "-rev-2" sempre subindo hardcoded como Claude/Opus mesmo com
 # a policy viva sendo Grok (rev2_kind por space).
 SPACES = [
-    ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "claude", EXEC_ARGS),
+    ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "codex", EXEC_ARGS_CODEX),
         ("omabackup-scout", "codex", SCOUT_ARGS)),
     ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "codex", EXEC_ARGS_CODEX),
         ("mfc-scout", "codex", SCOUT_ARGS)),
@@ -112,8 +130,10 @@ SPACES = [
         None),
     # DRE: analise financeira (Demonstrativo de Resultado), nao um repo git -
     # herdr-bootstrap nao exige git, so migration.read_migration_state()
-    # cai no fallback "phase=legacy" de sempre.
-    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "codex", EXEC_ARGS_CODEX),
+    # cai no fallback "phase=legacy" de sempre. O exec foi trocado para
+    # Claude Sonnet 5 em 2026-09-15; manter o perfil aqui evita que uma
+    # restauração sem pane-base reverta o swap.
+    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", EXEC_ARGS_SONNET_5),
         ("dre-scout", "codex", SCOUT_ARGS)),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
@@ -155,9 +175,16 @@ SPACES = [
         ("llm-bench-scout", "codex", SCOUT_ARGS)),
     # HomeHub: workspace e exec ja existiam na mao (homehub-exec ja com o
     # nome certo, slug=label.lower() sem divergencia). rev/rev-2 com custo
-    # customizado (ver REV_OVERRIDES) - pedido explicito do usuario
-    # 2026-09-05. Sem scout - decisao explicita do usuario, nao esquecimento.
-    ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "claude", EXEC_ARGS), None),
+    # customizado (ver REV_OVERRIDES). Em 2026-09-15, Breno reclassificou o
+    # scout como papel obrigatorio deste space (a ausencia anterior era uma
+    # entrada stale, nao uma decisao vigente). O scout e' um papel obrigatorio da
+    # tabela: quando o registro/pane some, o dispatcher pode chamar este
+    # bootstrap direcionado para recria-lo. Como nao ha' um pane-base para um
+    # scout ausente, SCOUT_ARGS e' o perfil de inicializacao correto; limpeza,
+    # restauracao ou swap de um pane que ja' existe preserva o perfil observado
+    # nele, nunca substitui por estes defaults.
+    ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "codex", EXEC_ARGS_CODEX),
+        ("homehub-scout", "codex", SCOUT_ARGS)),
     # omasession: plugin Omarchy de restauracao de sessao grafica (janelas e
     # workspaces de volta apos reboot/queda). Workspace wS e os 4 agents foram
     # criados na mao em 2026-09-08 antes desta entrada existir - registrado
@@ -217,7 +244,7 @@ def build_rev_agents(slug, cwd):
 
 
 def api(*args):
-    out = subprocess.run([HERDR, *args], capture_output=True, text=True)
+    out = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
     return json.loads(out.stdout)["result"]
@@ -230,7 +257,7 @@ def run(*args):
     return api(*args)
 
 
-def ensure_notify_watchers():
+def ensure_notify_watchers(workspace_ids=None):
     """Arma um herdr-notify-watch pra cada agent '*-exec' vivo.
 
     Nao checa se ja tem um rodando por fora (pgrep e' fragil e ja duplicou
@@ -242,6 +269,8 @@ def ensure_notify_watchers():
     for a in api("agent", "list")["agents"]:
         name = a.get("name", "")
         if not name.endswith("-exec"):
+            continue
+        if workspace_ids is not None and a.get("workspace_id") not in workspace_ids:
             continue
         print(f"  notify-watch {name}: armando (flock evita duplicar)")
         if DRY:
@@ -256,7 +285,9 @@ def ensure_notify_watchers():
 def start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings):
     """Sobe (name, kind) no pane_id e, se subir de verdade, manda o reforço de
     papel — usado tanto pro loop de split da tab 1 quanto pra tab do scout,
-    pra não duplicar a mesma lógica dos dois lugares."""
+    pra não duplicar a mesma lógica dos dois lugares. Os argumentos de model e
+    effort são passados explicitamente na criação; os resets posteriores de
+    `herdr-review-dispatch`/`herdr-ask` verificam que esse perfil não mudou."""
     full_extra = list(extra_args)
     if kind == "codex":
         # desliga o sistema nativo de sub-agentes do Codex - ver
@@ -288,14 +319,67 @@ def start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings)
             print(f"  {pane_id}: aviso — falhei mandando reforço de papel pra {name}: {exc}")
 
 
+def find_unnamed_role_base(agents, workspace_id, tab1_id, expected_kind=None):
+    """Encontra um pane de papel headless que perdeu apenas o registro de nome.
+
+    Um processo vivo sem ``name`` é uma base de restauração, não uma pane
+    vazia. Para o scout, a própria tab fora da tab 1 identifica o papel; a
+    família observada vence a da tabela quando há exatamente um candidato.
+    Agentes com outro nome nunca são tomados à força.
+    """
+    candidates = [
+        a for a in agents
+        if a.get("workspace_id") == workspace_id
+        and a.get("tab_id") != tab1_id
+        and not a.get("name")
+        and (expected_kind is None or a.get("agent") == expected_kind)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def find_unnamed_reviewer_base(agents, workspace_id, tab1_id, missing_names, existing_names):
+    """Retorna uma base anônima de revisor somente quando a associação é única.
+
+    A ordem de ``pane list`` não é evidência de papel. Restauramos um nome
+    apenas se há exatamente um revisor esperado ausente e exatamente um agent
+    anônimo na tab 1, com o nome ainda livre; caso contrário, deixamos a
+    recuperação falhar fechada para não carimbar o papel errado.
+    """
+    missing = [name for name in missing_names if name not in existing_names]
+    candidates = [
+        a for a in agents
+        if a.get("workspace_id") == workspace_id
+        and a.get("tab_id") == tab1_id
+        and not a.get("name")
+    ]
+    if len(missing) == 1 and len(candidates) == 1:
+        return candidates[0], missing[0]
+    return None
+
+
 def main():
+    global DRY
+    ap = argparse.ArgumentParser(description="garante os agents definidos na tabela SPACES")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="mostra o plano sem criar workspace, pane, tab ou agent")
+    alvo = ap.add_mutually_exclusive_group()
+    alvo.add_argument("--space", metavar="LABEL",
+                      help="processa somente o workspace com este label")
+    alvo.add_argument("--slug", metavar="SLUG",
+                      help="processa somente a entrada cujo prefixo de agents é este slug")
+    args = ap.parse_args()
+    DRY = args.dry_run
+
     workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
     panes_by_ws = {}
     for p in api("pane", "list")["panes"]:
-        panes_by_ws.setdefault(p["workspace_id"], []).append(p["pane_id"])
-    busy = {a["pane_id"] for a in api("agent", "list")["agents"]}
-    existing_agent_names = {a.get("name") for a in api("agent", "list")["agents"] if a.get("name")}
+        panes_by_ws.setdefault(p["workspace_id"], []).append(p)
+    agents = api("agent", "list")["agents"]
+    busy = {a["pane_id"] for a in agents}
+    existing_agent_names = {a.get("name") for a in agents if a.get("name")}
 
+    matched_target = args.space is None and args.slug is None
+    processed_workspace_ids = set()
     for entry in SPACES:
         label, cwd, exec_agent, scout = entry[:4]
         # 5o elemento opcional: slug explicito, quando o label do workspace
@@ -307,6 +391,11 @@ def main():
         # (que da nome a llm-rev/llm-rev-2/llm-scout) precisa ficar
         # desacoplado do label "llm-gateway" so pra este space.
         slug = entry[4] if len(entry) > 4 else label.lower()
+        if args.space is not None and label != args.space:
+            continue
+        if args.slug is not None and slug != args.slug:
+            continue
+        matched_target = True
         # project_root(), não o cwd cru da tupla — achado P3-1 herdr-7: o
         # mesmo path pode ser lido de formas diferentes por herdr-migrate-rev
         # (que usa o cwd real do agent vivo) e por aqui (valor estático de
@@ -342,12 +431,16 @@ def main():
             if DRY:
                 continue
             ws_id = res["workspace"]["workspace_id"]
-            panes_by_ws[ws_id] = [res["root_pane"]["pane_id"]]
+            panes_by_ws[ws_id] = [{"pane_id": res["root_pane"]["pane_id"], "tab_id": f"{ws_id}:t1"}]
         else:
             ws_id = ws["workspace_id"]
             print(f"space {label}: já existe ({ws_id})")
+        processed_workspace_ids.add(ws_id)
 
-        panes = panes_by_ws.get(ws_id, [])
+        # `pane list` includes panes from every tab. Reviewers belong to tab 1;
+        # never let a scout/board pane from another tab fill a reviewer slot.
+        tab1_id = f"{ws_id}:t1"
+        panes = [p["pane_id"] for p in panes_by_ws.get(ws_id, []) if p.get("tab_id") == tab1_id]
         while len(panes) < len(tab1_agents):
             # 1o pane extra abre a direita (wide->right); os seguintes empilham
             # para baixo a partir do ultimo, para nao virar colunas apertadas.
@@ -359,9 +452,42 @@ def main():
             panes.append(res["pane"]["pane_id"])
 
         all_names = [n for (n, _, _) in tab1_agents] + ([scout[0]] if scout else [])
+        missing_reviewer_names = [name for name, _kind, _args in tab1_agents if name.endswith(("-rev-1", "-rev-2")) and name not in existing_agent_names]
+        unnamed_reviewer = find_unnamed_reviewer_base(agents, ws_id, tab1_id, missing_reviewer_names, existing_agent_names)
+        if unnamed_reviewer is not None:
+            # `pane list` não é ordenado pela tabela de papéis. Coloque o pane
+            # anônimo na posição do papel ausente antes do zip abaixo; assim a
+            # associação única encontrada pelo helper é aplicada ao pane real,
+            # mesmo depois de swaps/rearranjos.
+            unnamed_pane, unnamed_name = unnamed_reviewer
+            target_index = next(
+                (i for i, (name, _kind, _args) in enumerate(tab1_agents)
+                 if name == unnamed_name),
+                None,
+            )
+            candidate_index = next(
+                (i for i, pane_id in enumerate(panes)
+                 if pane_id == unnamed_pane.get("pane_id")),
+                None,
+            )
+            if target_index is not None and candidate_index is not None:
+                panes[target_index], panes[candidate_index] = (
+                    panes[candidate_index], panes[target_index]
+                )
         for pane_id, (name, kind, extra_args) in zip(panes, tab1_agents):
             if pane_id in busy:
-                print(f"  {pane_id}: já tem agent, pulando")
+                occupant = next((a for a in agents if a.get("pane_id") == pane_id), None)
+                if (unnamed_reviewer is not None and occupant is unnamed_reviewer[0]
+                        and name == unnamed_reviewer[1]):
+                    # The process is the existing base; restore only its
+                    # volatile registry name and keep its observed family/model.
+                    print(f"  {pane_id}: revisor sem nome encontrado; restaurando '{name}' sem reiniciar")
+                    if not DRY:
+                        run("agent", "rename", pane_id, name)
+                        existing_agent_names.add(name)
+                        unnamed_reviewer = None
+                else:
+                    print(f"  {pane_id}: já tem agent, pulando")
                 continue
             siblings = [n for n in all_names if n != name]
             start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings)
@@ -371,15 +497,31 @@ def main():
             if scout_name in existing_agent_names:
                 print(f"  {scout_name}: já existe (tab própria), pulando")
             else:
-                print(f"  {label}: scout precisa de tab própria, criando...")
-                res = run("tab", "create", "--workspace", ws_id, "--cwd", cwd, "--label", "scout", "--no-focus")
-                if not DRY:
-                    scout_pane_id = res["root_pane"]["pane_id"]
-                    siblings = [n for n in all_names if n != scout_name]
-                    start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, label, cwd, siblings)
+                base = find_unnamed_role_base(agents, ws_id, tab1_id)
+                if base is not None:
+                    # O processo já existe e pode ter um perfil escolhido à
+                    # mão. Só restauramos o metadado de nome; não reiniciamos
+                    # nem aplicamos os defaults da tabela por cima dele.
+                    print(f"  {base['pane_id']}: scout sem nome encontrado; restaurando '{scout_name}' sem reiniciar")
+                    if not DRY:
+                        run("agent", "rename", base["pane_id"], scout_name)
+                        existing_agent_names.add(scout_name)
+                else:
+                    print(f"  {label}: scout precisa de tab própria, criando...")
+                    res = run("tab", "create", "--workspace", ws_id, "--cwd", cwd, "--label", "scout", "--no-focus")
+                    if not DRY:
+                        scout_pane_id = res["root_pane"]["pane_id"]
+                        siblings = [n for n in all_names if n != scout_name]
+                        start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, label, cwd, siblings)
 
-    ensure_notify_watchers()
+    if not matched_target:
+        alvo_texto = args.space or args.slug
+        print(f"erro: nenhum space na tabela SPACES corresponde a {alvo_texto!r}", file=sys.stderr)
+        return 1
+
+    ensure_notify_watchers(processed_workspace_ids if not (args.space is None and args.slug is None) else None)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

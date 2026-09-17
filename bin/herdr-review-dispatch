@@ -17,7 +17,9 @@ Modo sem git — revisa arquivos específicos em vez de um diff (útil pra scrip
 soltos, tipo os do próprio ~/.local/bin, que não vivem num repo):
   herdr-review-dispatch <slug> --description "..." --files /caminho/a /caminho/b
 
-Sai com 0 só se os dois revisores produziram veredito utilizável. Qualquer
+Sai com 0 só se os dois revisores produziram veredito utilizável. O lifecycle
+`idle`/`done` só fecha a espera depois de `verdict.md`; se o artefato não
+aparecer no prazo, o status é `artifact_missing`. Qualquer
 BLOCKED/TIMEOUT/veredito ausente ou vazio sai com 1.
 """
 import argparse
@@ -40,6 +42,9 @@ validate_agent_project = core.validate_agent_project
 get_agent_info = core.get_agent_info
 freeze_files = core.freeze_files
 dispatch_and_wait_all = core.dispatch_and_wait_all
+skipped_reset_info = core.skipped_reset_info
+runtime_profile_evidence = core.runtime_profile_evidence
+write_json_atomic = core.write_json_atomic
 
 PROTOCOL = """# Protocolo de revisão (herdr review-cycle)
 
@@ -90,7 +95,8 @@ isso, e se parecer que pede, é engano seu, não regra do arquivo. Leia o
 material e escreva o veredito você mesmo. Antes de continuar, releia
 `AGENTS.md` e `.herdr/reviewer.md`. Os colegas são fixos: não crie pane/agent
 novo para contornar travamento ou discordância; uma discordância factual
-genuína segue pela rota aprovada de `herdr-ask`.
+genuína, depois de no máximo duas rodadas, segue pela terceira análise
+automática do scout via `herdr-ask`.
 """
 
 VERIFY_PROTOCOL = """# Verificação (herdr review-cycle) — pergunta fechada, não revisão nova
@@ -300,11 +306,22 @@ def main():
         sys.exit(1)
 
     try:
-        rev_name = migration.resolve_reviewer_name(cwd, args.slug)
+        rev_name = migration.resolve_reviewer_name(cwd, args.slug, allow_missing=True)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
     rev2_name = f"{args.slug}-rev-2"
+
+    # O registro de um papel pode desaparecer após reset do daemon, reboot ou
+    # troca de pane. Antes de validar cwd, criar snapshots ou resetar contexto,
+    # tente a recuperação idempotente a partir da tabela do bootstrap. Um pane
+    # já ocupado não é reiniciado; a tabela só fornece defaults para a
+    # inicialização sem uma base existente.
+    try:
+        agent_restore = core.ensure_required_agents(args.slug, cwd, (rev_name, rev2_name))
+    except core.AgentRestoreError as exc:
+        print(f"erro: recuperação automática dos revisores obrigatórios falhou: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         for name in (rev_name, rev2_name):
@@ -388,14 +405,28 @@ def main():
         shutil.rmtree(round_dir, ignore_errors=True)
         sys.exit(1)
 
+    # O dispatcher não limpa mais contexto automaticamente. Isso evita que
+    # `/new`/`/clear` troque o modelo ou o reasoning e invalide a rodada. Para
+    # começar um pane de novo, use `herdr-swap`, que transfere o handoff antes
+    # de fechar o processo antigo. O monitor `herdr-context-watch` observa o
+    # tamanho da conversa e só recomenda uma ação.
+    reset_info = skipped_reset_info(target_names)
+    print(
+        "reset automático desativado para "
+        + ", ".join(target_names)
+        + "; use herdr-swap para recriar um pane e transferir o contexto"
+    )
+
     verb = "disparando" if len(target_names) > 1 else "disparando (verificação, revisor único)"
     print(f"{verb} {', '.join(target_names)}...")
     dispatch_ts = {name: now_iso() for name in target_names}
     pre_info = {}
+    runtime_before = {}
     dispatched = {}
     for name in target_names:
         try:
             pre_info[name] = get_agent_info(name)
+            runtime_before[name] = runtime_profile_evidence(name, pre_info[name])
             dispatched[name] = True
         except RuntimeError as exc:
             print(f"  aviso: falha checando '{name}' antes de disparar: {exc}", file=sys.stderr)
@@ -415,7 +446,33 @@ def main():
         for name in active_names
     }
     prompts = {name: prompt_text(verdict_dirs[name]) for name in active_names}
-    result, wait_info, settle_ts = dispatch_and_wait_all(prompts, args.timeout)
+    required_artifacts = {
+        name: os.path.join(verdict_dirs[name], "verdict.md")
+        for name in active_names
+    }
+    try:
+        result, wait_info, settle_ts = dispatch_and_wait_all(
+            prompts,
+            args.timeout,
+            required_artifacts=required_artifacts,
+            expected_agents={name: pre_info[name] for name in active_names},
+            check_composition=False,
+        )
+    except core.DispatchPreflightError as exc:
+        print(f"erro: preflight dos revisores abortou o dispatch: {exc}", file=sys.stderr)
+        write_json_atomic(os.path.join(round_dir, "metrics.json"), {
+            "round_dir": round_dir,
+            "slug": args.slug,
+            "mode": "verify" if args.verify else ("files" if args.files else "diff"),
+            "head_sha": head_sha,
+            "agent_restore": agent_restore,
+            "reset": reset_info,
+            "runtime_before": runtime_before,
+            "dispatch": False,
+            "preflight_error": str(exc),
+            "preflight": exc.as_dict(),
+        })
+        sys.exit(1)
 
     print("\nresultado da rodada:")
     ok_count = 0
@@ -424,6 +481,10 @@ def main():
         "slug": args.slug,
         "mode": "verify" if args.verify else ("files" if args.files else "diff"),
         "head_sha": head_sha,
+        "agent_restore": agent_restore,
+        "reset": reset_info,
+        "runtime_before": runtime_before,
+        "runtime_after": {},
         "reviewers": {},
     }
     if args.verify:
@@ -434,6 +495,11 @@ def main():
             metrics["reviewers"][name] = {"dispatched": False}
             continue
         status = result[name]
+        try:
+            post_info = get_agent_info(name)
+        except RuntimeError:
+            post_info = None
+        metrics["runtime_after"][name] = runtime_profile_evidence(name, post_info)
         verdict_path = os.path.join(verdict_dirs[name], "verdict.md")
         size = os.path.getsize(verdict_path) if os.path.isfile(verdict_path) else 0
         di = dispatch_info[name]
@@ -441,17 +507,46 @@ def main():
             "dispatched": True,
             "kind": di["kind"],
             "agent_session": di["agent_session"],
+            "runtime_before": runtime_before.get(name),
+            "runtime_after": metrics["runtime_after"].get(name),
             "dispatch_ts": di["dispatch_ts"],
             "settle_ts": settle_ts.get(name),
             "status": status,
             "verdict_bytes": size,
         }
+        wait_detail = wait_info.get(name)
+        if isinstance(wait_detail, dict):
+            if status == "preflight_aborted":
+                # O retry pode ser abortado depois que o primeiro prompt já
+                # devolveu `agent_prompt_stalled`; preserve a decisão e a
+                # leitura efetiva (pane/status/sessão) no metrics, em vez de
+                # deixar só o status sem causa observável.
+                metrics["reviewers"][name]["preflight"] = wait_detail
+            if wait_detail.get("dispatch_preflight"):
+                metrics["reviewers"][name]["dispatch_preflight"] = wait_detail["dispatch_preflight"]
+            if wait_detail.get("retry_preflight"):
+                metrics["reviewers"][name]["retry_preflight"] = wait_detail["retry_preflight"]
+            if wait_detail.get("resend_suppressed"):
+                metrics["reviewers"][name]["resend_suppressed"] = wait_detail["resend_suppressed"]
+            if wait_detail.get("lifecycle_settle_ts"):
+                metrics["reviewers"][name]["lifecycle_settle_ts"] = wait_detail["lifecycle_settle_ts"]
+            if wait_detail.get("required_artifact"):
+                metrics["reviewers"][name]["artifact"] = wait_detail["required_artifact"]
+            elif status == "artifact_missing":
+                metrics["reviewers"][name]["artifact"] = {
+                    "path": wait_detail.get("artifact_path"),
+                    "ready": False,
+                }
         if status == "blocked":
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem verdict.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é veredito" + (f" (verdict.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "artifact_missing":
+            print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas verdict.md não foi publicado" + (f" (verdict.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":
             print(f"  {name}: STALLED — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado")
+        elif status == "preflight_aborted":
+            print(f"  {name}: PREFLIGHT_ABORTED — alvo mudou antes de qualquer reenvio ({wait_info.get(name)})")
         elif status == "error":
             print(f"  {name}: ERRO esperando assentar ({wait_info.get(name)})")
         elif size == 0:
@@ -460,8 +555,7 @@ def main():
             print(f"  {name}: {status}, veredito em {verdict_path} ({size}b)")
             ok_count += 1
 
-    with open(os.path.join(round_dir, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
+    write_json_atomic(os.path.join(round_dir, "metrics.json"), metrics)
 
     print(f"\nround dir: {round_dir}")
     sys.exit(0 if ok_count == len(target_names) else 1)
