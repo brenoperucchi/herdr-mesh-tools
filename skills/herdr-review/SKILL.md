@@ -115,11 +115,10 @@ seu próprio revisor (`<round_dir>/<slug>-rev-1/verdict.md`,
 revisores pra isso — é scrape de tela, lossy; os arquivos são a fonte de
 verdade.
 
-Cada achado deve trazer não só o problema, mas também **solução proposta**,
-**validação** e eventual **decisão necessária**. “Não determinada”, com a
-lacuna e a pergunta explícitas, é válido quando não houver base segura; um
-achado sem nenhuma dessas formas de encaminhamento é um veredito incompleto.
-`APPROVE` deve declarar **ação necessária: nenhuma**.
+O contrato canônico dos campos de encaminhamento fica em
+`bin/_herdr_dispatch.py:SOLUTION_CONTRACT_REVIEWER`; o dispatcher o insere no
+request de cada rodada. Use esse contrato literalmente para que um achado não
+seja entregue sem solução/validação ou uma declaração explícita de lacuna.
 
 Monte uma tabela por achado, em três classes:
 
@@ -160,17 +159,9 @@ não puder ser executado, pare e reporte o bloqueio.
 
 ## Corrigir e ciclar
 
-Antes de corrigir ou responder ao Breno, o `<slug>-exec` transforma os dois
-vereditos em uma síntese explícita. Para cada achado, mostre:
-
-| Campo | Conteúdo |
-|---|---|
-| **Achado e impacto** | O problema confirmado, único ou em conflito e por que importa |
-| **Solução proposta** | A recomendação do revisor, ou a solução formulada pelo exec quando o revisor não pôde determiná-la |
-| **Decisão do exec** | Corrigir, descartar, escalar ao scout ou consultar o Breno |
-| **Próximo passo e validação** | A ação imediata e como saberemos que terminou |
-
-Não entregue somente a lista de P0–P3. O revisor propõe; o exec decide,
+Antes de corrigir ou responder ao Breno, o `<slug>-exec` usa o contrato
+canônico `SOLUTION_CONTRACT_EXEC` de `bin/_herdr_dispatch.py` para transformar
+os vereditos em uma síntese explícita. O revisor propõe; o exec decide,
 coordena a correção e comunica a síntese ao Breno. Se a recomendação do
 revisor for insuficiente, o exec deve completar a proposta ou declarar a
 incerteza — nunca deixar o usuário descobrir a solução perguntando de novo.

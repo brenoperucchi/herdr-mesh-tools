@@ -286,7 +286,7 @@ def ensure_notify_watchers(workspace_ids=None):
         )
 
 
-def start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings):
+def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings):
     """Sobe (name, kind) no pane_id e, se subir de verdade, manda o reforço de
     papel — usado tanto pro loop de split da tab 1 quanto pra tab do scout,
     pra não duplicar a mesma lógica dos dois lugares. Os argumentos de model e
@@ -316,7 +316,7 @@ def start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings)
             raise
 
     if started_ok:
-        prompt = core.role_reinforcement_prompt(name, label, cwd, siblings)
+        prompt = core.role_reinforcement_prompt(name, slug, cwd, siblings)
         try:
             run("agent", "prompt", name, prompt)
         except RuntimeError as exc:
@@ -494,7 +494,7 @@ def main():
                     print(f"  {pane_id}: já tem agent, pulando")
                 continue
             siblings = [n for n in all_names if n != name]
-            start_agent_with_role(pane_id, name, kind, extra_args, label, cwd, siblings)
+            start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings)
 
         if scout is not None:
             scout_name, scout_kind, scout_extra = scout
@@ -516,7 +516,7 @@ def main():
                     if not DRY:
                         scout_pane_id = res["root_pane"]["pane_id"]
                         siblings = [n for n in all_names if n != scout_name]
-                        start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, label, cwd, siblings)
+                        start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, slug, cwd, siblings)
 
     if not matched_target:
         alvo_texto = args.space or args.slug

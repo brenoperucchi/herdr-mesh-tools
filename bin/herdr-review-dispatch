@@ -84,22 +84,10 @@ Formato do veredito — uma lista de achados, cada um com:
 - **arquivo:linha**
 - **descrição** do problema
 - **evidência** (por que isso é real, não hipotético)
-- **solução proposta**: a correção concreta recomendada, com o menor escopo
-  que resolve a causa. Diga o que deve mudar; não escreva apenas “corrigir”.
-- **validação**: teste, comando ou observação que demonstrará que a correção
-  funciona e não regride o comportamento existente.
-- **decisão necessária**: se a recomendação exigir escolha do exec/Breno,
-  declare exatamente qual escolha está pendente e quais são as alternativas.
+{solution_contract_reviewer}
 
-O achado não está completo sem uma solução. Se não houver base para propor uma
-correção segura, escreva **solução proposta: não determinada**, explique o que
-falta observar e formule a pergunta que o `<slug>-exec` deve resolver. Isso é
-uma resposta explícita, não uma omissão. O revisor recomenda; não implementa,
-não faz commit e não decide pelo space.
-
-Se não achar nada, escreva `APPROVE`, o porquê (o que você verificou) e
-**ação necessária: nenhuma**. Assim o executor não precisa inferir se faltou
-uma recomendação.
+Se não achar nada, escreva `APPROVE` e o porquê (o que você verificou), além
+de **ação necessária: nenhuma**.
 
 VOCÊ é o revisor — a revisão em si não é delegável. Não use AgentRelay, o
 sistema nativo de sub-agentes do seu CLI (ex: `agents`/`pipeline_reviewer`
@@ -135,6 +123,7 @@ coordenador delegado.
 - **solução remanescente** — para `não corrigido` ou `parcial`, descreva a
   correção concreta que ainda deve ser aplicada; para `corrigido`, registre
   **ação necessária: nenhuma** ou a validação adicional pendente.
+{solution_contract_reviewer}
 - Achado **novo** só se estiver dentro das linhas que mudaram no diff abaixo
   (não vá procurar em arquivo que não mudou).
 
@@ -207,7 +196,7 @@ def write_request(cwd, verdict_dir, sibling_dir, description, head_sha, base_ref
     diff_instruction = (
         f"Leia o diff em `diff.patch` (na pasta acima desta, `{os.path.dirname(verdict_dir)}`)."
     )
-    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT)}
+    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT, solution_contract_reviewer=core.SOLUTION_CONTRACT_REVIEWER)}
 
 ## Invariantes do projeto
 
@@ -228,6 +217,7 @@ def write_verify_request(verdict_dir, prior_verdict, head_sha, base_ref):
     content = VERIFY_PROTOCOL.format(
         verdict_dir=verdict_dir, prior_verdict=prior_verdict, head_sha=head_sha, base_ref=base_ref,
         interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT,
+        solution_contract_reviewer=core.SOLUTION_CONTRACT_REVIEWER,
     )
     with open(os.path.join(verdict_dir, "request.md"), "w") as f:
         f.write(content)
@@ -251,7 +241,7 @@ def write_request_files(cwd, verdict_dir, sibling_dir, description, files, snaps
         "cópia CONGELADA no path indicado, não do path original: o original "
         "pode ter mudado desde o disparo desta rodada."
     )
-    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT)}
+    content = f"""{PROTOCOL.format(diff_instruction=diff_instruction, verdict_dir=verdict_dir, sibling_dir=sibling_dir, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT, solution_contract_reviewer=core.SOLUTION_CONTRACT_REVIEWER)}
 
 ## Invariantes do projeto
 
@@ -519,6 +509,9 @@ def main():
         metrics["runtime_after"][name] = runtime_profile_evidence(name, post_info)
         verdict_path = os.path.join(verdict_dirs[name], "verdict.md")
         size = os.path.getsize(verdict_path) if os.path.isfile(verdict_path) else 0
+        solution_contract = core.solution_contract_status(verdict_path, "review")
+        if status in ("done", "idle") and size > 0 and not solution_contract["ok"]:
+            status = "artifact_invalid"
         di = dispatch_info[name]
         metrics["reviewers"][name] = {
             "dispatched": True,
@@ -526,10 +519,15 @@ def main():
             "agent_session": di["agent_session"],
             "runtime_before": runtime_before.get(name),
             "runtime_after": metrics["runtime_after"].get(name),
+            "runtime_summary": core.runtime_profile_summary({
+                "runtime_before": runtime_before.get(name),
+                "runtime_preserved": None,
+            }),
             "dispatch_ts": di["dispatch_ts"],
             "settle_ts": settle_ts.get(name),
             "status": status,
             "verdict_bytes": size,
+            "solution_contract": solution_contract,
         }
         wait_detail = wait_info.get(name)
         if isinstance(wait_detail, dict):
@@ -558,6 +556,11 @@ def main():
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem verdict.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é veredito" + (f" (verdict.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "artifact_invalid":
+            print(
+                f"  {name}: ARTIFACT_INVALID — verdict.md não cumpre o contrato de solução "
+                f"({', '.join(solution_contract['missing'])})"
+            )
         elif status == "artifact_missing":
             print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas verdict.md não foi publicado" + (f" (verdict.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":
@@ -570,6 +573,11 @@ def main():
             print(f"  {name}: {status}, mas verdict.md {'não existe' if not os.path.isfile(verdict_path) else 'está vazio'} — falha operacional")
         else:
             print(f"  {name}: {status}, veredito em {verdict_path} ({size}b)")
+            if not solution_contract["ok"]:
+                print(
+                    f"    aviso: contrato de solução incompleto ({', '.join(solution_contract['missing'])})",
+                    file=sys.stderr,
+                )
             ok_count += 1
 
     write_json_atomic(os.path.join(round_dir, "metrics.json"), metrics)

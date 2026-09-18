@@ -145,10 +145,11 @@ questão ao Breno.
 
 Leia os `answer.md` de cada consultor (`<round_dir>/<slug>-rev-1/answer.md`,
 `<round_dir>/<slug>-rev-2/answer.md`) — cada resposta tem: a decisão numa
-frase, as premissas explícitas que a sustentam, o argumento, uma recomendação
-executável, a validação e o próximo passo. `ação necessária: nenhuma` ou
-`recomendação: não determinada`, com a lacuna e a pergunta explícitas, também
-são respostas completas.
+frase, as premissas explícitas que a sustentam e o argumento. Os campos de
+recomendação, validação e próximo passo são definidos pelo contrato canônico
+`SOLUTION_CONTRACT_ASK` em `bin/_herdr_dispatch.py` e entram automaticamente
+no request. `ação necessária: nenhuma` ou `recomendação: não determinada`, com
+a lacuna e a pergunta explícitas, também são respostas completas.
 
 O `<slug>-exec` deve devolver ao Breno uma síntese com posição, recomendação,
 decisão do exec, próximo passo e critério de conclusão. Não basta repetir a

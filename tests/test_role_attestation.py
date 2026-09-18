@@ -6,6 +6,7 @@ the latter an explicit protocol requirement for every role.
 """
 import importlib.util
 import os
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -91,20 +92,28 @@ class RoleAttestationTests(unittest.TestCase):
 
     def test_review_and_ask_require_actionable_recommendation(self):
         for required in (
+            "{solution_contract_reviewer}",
+        ):
+            self.assertIn(required, self.review.PROTOCOL)
+        for required in (
             "solução proposta",
             "validação",
             "decisão necessária",
             "não determinada",
             "ação necessária: nenhuma",
         ):
-            self.assertIn(required, self.review.PROTOCOL.lower())
+            self.assertIn(required, self.core.SOLUTION_CONTRACT_REVIEWER.lower())
+        for required in (
+            "{solution_contract_ask}",
+        ):
+            self.assertIn(required, self.ask.ASK_PROTOCOL)
         for required in (
             "recomendação executável",
             "validação e próximo passo",
             "recomendação: não determinada",
             "ação necessária: nenhuma",
         ):
-            self.assertIn(required, self.ask.ASK_PROTOCOL.lower())
+            self.assertIn(required, self.core.SOLUTION_CONTRACT_ASK.lower())
 
     def test_exec_hydration_requires_user_facing_solution_summary(self):
         prompt = self.core.exec_hydration_prompt(
@@ -119,6 +128,23 @@ class RoleAttestationTests(unittest.TestCase):
             "pergunta exata",
         ):
             self.assertIn(required, prompt.lower())
+
+    def test_solution_contract_status_distinguishes_complete_and_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            review_path = os.path.join(directory, "verdict.md")
+            with open(review_path, "w", encoding="utf-8") as stream:
+                stream.write("P2 — solução proposta: usar lock.\nValidação: teste de regressão.\n")
+            self.assertTrue(self.core.solution_contract_status(review_path, "review")["ok"])
+            with open(review_path, "w", encoding="utf-8") as stream:
+                stream.write("P2 — achado sem recomendação.\n")
+            result = self.core.solution_contract_status(review_path, "review")
+            self.assertFalse(result["ok"])
+            self.assertIn("solução proposta", result["missing"])
+
+            ask_path = os.path.join(directory, "answer.md")
+            with open(ask_path, "w", encoding="utf-8") as stream:
+                stream.write("Recomendação executável: aplicar o patch.\nValidação e próximo passo: rodar testes.\n")
+            self.assertTrue(self.core.solution_contract_status(ask_path, "ask")["ok"])
 
     def test_interactive_ready_caveat_is_shared_not_duplicated(self):
         """Achado 2026-09-06: o mesmo texto sobre interactive_ready ausente
@@ -150,12 +176,21 @@ class RoleAttestationTests(unittest.TestCase):
         review_request = self.review.PROTOCOL.format(
             diff_instruction="x", verdict_dir="/x", sibling_dir="/y",
             interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
+            solution_contract_reviewer=self.core.SOLUTION_CONTRACT_REVIEWER,
         )
         self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, review_request)
+
+        verify_request = self.review.VERIFY_PROTOCOL.format(
+            verdict_dir="/x", prior_verdict="x", head_sha="h", base_ref="b",
+            interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
+            solution_contract_reviewer=self.core.SOLUTION_CONTRACT_REVIEWER,
+        )
+        self.assertIn(self.core.SOLUTION_CONTRACT_REVIEWER, verify_request)
 
         ask_request = self.ask.ASK_PROTOCOL.format(
             verdict_dir="/x", isolation_note="", context_instruction="",
             interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
+            solution_contract_ask=self.core.SOLUTION_CONTRACT_ASK,
         )
         self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, ask_request)
 

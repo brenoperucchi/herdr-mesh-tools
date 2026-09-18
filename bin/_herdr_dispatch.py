@@ -91,6 +91,43 @@ def _artifact_changed_and_ready(path, baseline):
     return current
 
 
+def solution_contract_status(path, mode):
+    """Check the presence of the response contract without judging quality.
+
+    Reviewers remain responsible for the substance of a recommendation. This
+    small check catches the operational failure where a non-empty artifact
+    contains only a finding/position and gives the exec a visible metric and
+    warning. Dispatchers mark an otherwise terminal turn ``artifact_invalid``
+    when the required fields are absent; this keeps the artifact visible while
+    preventing a malformed response from being reported as a successful turn.
+    """
+    try:
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError as exc:
+        return {"ok": False, "missing": ["artifact_read"], "error": str(exc)}
+    lowered = text.casefold()
+    if mode == "review":
+        approve = bool(re.search(r"(?im)^\s*approve\b", text))
+        if approve:
+            markers = ("ação necessária", "acao necessaria")
+            ok = any(marker in lowered and "nenhuma" in lowered[lowered.find(marker):lowered.find(marker) + 80] for marker in markers)
+            return {"ok": ok, "missing": [] if ok else ["ação necessária: nenhuma"]}
+        requirements = {
+            "solução proposta": ("solução proposta", "solucao proposta", "correção proposta", "correcao proposta"),
+            "validação": ("validação", "validacao", "teste", "verificação", "verificacao"),
+        }
+    elif mode == "ask":
+        requirements = {
+            "recomendação executável": ("recomendação executável", "recomendacao executavel", "recomendação", "recomendacao"),
+            "validação e próximo passo": ("validação e próximo passo", "validacao e proximo passo", "próximo passo", "proximo passo"),
+        }
+    else:
+        raise ValueError(f"modo de contrato desconhecido: {mode!r}")
+    missing = [label for label, markers in requirements.items() if not any(marker in lowered for marker in markers)]
+    return {"ok": not missing, "missing": missing}
+
+
 def herdr_argv(*args):
     """[HERDR, ...args], com `--session <nome>` na frente quando HERDR_SESSION
     estiver setada.
@@ -484,6 +521,38 @@ INTERACTIVE_READY_CAVEAT = (
     "outros campos também divergir."
 )
 
+# These contracts are inserted into every generated request/policy prompt from
+# one source. Keeping the wording canonical prevents the reviewer, consultant
+# and exec obligations from drifting apart as happened in herdr-26.
+SOLUTION_CONTRACT_REVIEWER = """Contrato de encaminhamento do revisor — cada achado deve conter:
+- **solução proposta**: correção concreta e de menor escopo que resolve a causa;
+- **validação**: teste, comando ou observação que comprovará a correção;
+- **decisão necessária**: escolha pendente do exec/Breno, se houver.
+
+O revisor recomenda, não implementa, não faz commit e não decide pelo space.
+Sem base suficiente, escreva **solução proposta: não determinada**, explique a
+lacuna e formule a pergunta exata. `APPROVE` deve declarar **ação necessária: nenhuma**."""
+
+SOLUTION_CONTRACT_ASK = """Contrato de encaminhamento do consultor — a resposta deve conter:
+- **recomendação executável**: ação concreta, ordem dos passos e escopo;
+- **validação e próximo passo**: como confirmar a decisão e qual ação vem agora.
+
+Se nenhuma ação for necessária, escreva **ação necessária: nenhuma**. Sem base
+suficiente, escreva **recomendação: não determinada**, explique a lacuna e
+formule a pergunta exata ao Breno. O consultor recomenda, não implementa, não
+faz commit e não decide pelo space."""
+
+SOLUTION_CONTRACT_EXEC = """Contrato de transparência do executor — depois de ler os artefatos, a síntese
+entregue ao Breno deve conter, para cada item:
+- **problema/impacto**;
+- **solução proposta**;
+- **decisão do exec**;
+- **próximo passo e validação**;
+- **critério de conclusão**.
+
+Se a solução não puder ser determinada, registre a lacuna e a pergunta exata;
+nunca espere que o Breno peça a solução em uma segunda mensagem."""
+
 ROLE_REINFORCEMENT_PROMPT = """Reforço de papel — mandatório a cada início ou troca de agent neste space,
 não é um FYI opcional.
 
@@ -679,11 +748,7 @@ usuário, e não decide nem faz commit. Se o scout registrar divergência ou
 incerteza, ou se este exec ainda julgar necessária outra análise, pare e leve a
 questão ao Breno. Registre a decisão final antes de qualquer commit.
 
-Contrato de transparência: depois de ler cada `verdict.md`/`answer.md`, nunca
-apresente somente o achado. Para cada item, registre problema/impacto, solução proposta,
-decisão do exec, próximo passo, validação e critério de conclusão.
-Se a solução não puder ser determinada, registre a lacuna e a pergunta exata
-ao Breno; não espere que ele peça a solução em uma segunda mensagem.
+{SOLUTION_CONTRACT_EXEC}
 
 Não edite arquivos nesta hidratação. Confirme somente com:
 `{EXEC_HYDRATION_MARKER} ACK`.
@@ -937,6 +1002,7 @@ class DispatchLockBusyError(RuntimeError):
 
     def __init__(self, name, message):
         self.name = name
+        self.runtime_before = None
         super().__init__(message)
 
 
@@ -1065,18 +1131,32 @@ _STATUS_CONTEXT_RE = re.compile(
 )
 
 
+def _status_context_near(text, match, radius=2):
+    """Require a context label in the same small rendered status block.
+
+    A large character window let a later prose paragraph authenticate an old
+    ``Model:`` line.  Status output is line-oriented, so keep the correlation
+    bounded by neighbouring lines instead of arbitrary buffer byte offsets.
+    """
+    lines = (text or "").splitlines()
+    if not lines:
+        return False
+    line_no = (text or "")[:match.start()].count("\n")
+    start = max(0, line_no - radius)
+    end = min(len(lines), line_no + radius + 1)
+    return any(_STATUS_CONTEXT_RE.search(line) for line in lines[start:end])
+
+
 def _status_runtime(text):
     """Return a complete runtime pair from an explicit labelled status block.
 
     A partial block is deliberately ignored.  The caller may then retain the
     process/legacy-banner evidence, but must not call it an effective profile.
     """
-    models = [
-        match for match in _CLAUDE_STATUS_MODEL_RE.finditer(text or "")
-        if _STATUS_CONTEXT_RE.search(
-            (text or "")[max(0, match.start() - 1600):match.end() + 2400]
-        )
-    ]
+    all_models = list(_CLAUDE_STATUS_MODEL_RE.finditer(text or ""))
+    if not all_models or not _status_context_near(text, all_models[-1]):
+        return None
+    models = [all_models[-1]]
     efforts = list(_CLAUDE_STATUS_EFFORT_RE.finditer(text or ""))
     if not models:
         return None
@@ -1097,7 +1177,10 @@ def _status_runtime(text):
             # Model and effort must belong to the same compact status render;
             # a whole handoff or verdict can contain both labels thousands of
             # characters apart and must never become an effective profile.
-            if model_match.end() <= effort_match.start() <= model_match.end() + 400:
+            if (
+                model_match.end() <= effort_match.start()
+                and (text or "")[model_match.end():effort_match.start()].count("\n") <= 2
+            ):
                 pair = (model_match, effort_match)
                 break
     if pair is None:
@@ -1121,13 +1204,7 @@ def _status_runtime(text):
 def _status_model(text):
     """Return the last model label even when a CLI omits reasoning in status."""
     matches = list(_CLAUDE_STATUS_MODEL_RE.finditer(text or ""))
-    matches = [
-        match for match in matches
-        if _STATUS_CONTEXT_RE.search(
-            (text or "")[max(0, match.start() - 1600):match.end() + 2400]
-        )
-    ]
-    if not matches:
+    if not matches or not _status_context_near(text, matches[-1]):
         return None
     raw = matches[-1].group("model").strip()
     resolved = re.search(r"\((?P<model>claude[-a-z0-9.\[\]]+)", raw, re.I)
@@ -1360,7 +1437,12 @@ def runtime_profile_summary(reset_info):
     effort = profile.get("reasoning_effort") or "?"
     source = profile.get("source") or "?"
     preserved = reset_info.get("runtime_preserved")
-    label = "não confirmados" if preserved is False else "preservados"
+    if preserved is True:
+        label = "preservados"
+    elif preserved is False:
+        label = "não preservados"
+    else:
+        label = "não confirmados"
     return f"model={model} reasoning_effort={effort} {label} ({source})"
 
 
@@ -1384,6 +1466,34 @@ def _probe_answer(text, probe_token):
         if stripped in answers:
             return stripped
     return None
+
+
+def _seed_answer(text, seed_token):
+    """Extract the exact acknowledgement of the reset seed."""
+    start = text.rfind(seed_token)
+    if start < 0:
+        return None
+    for line in text[start:].splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("❯", "›")):
+            continue
+        stripped = re.sub(r"^[•●]\s*", "", stripped).strip().rstrip(".")
+        stripped = re.sub(r"^\[\d{1,2}:\d{2}:\d{2}\]\s*", "", stripped)
+        if stripped == "HERDR_RESET_SEED_OK":
+            return stripped
+    return None
+
+
+def _wait_for_seed_answer(name, seed_token, timeout_s=30):
+    """Wait for the seed acknowledgement before issuing a native reset."""
+    deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    while True:
+        answer = _seed_answer(_read_agent_recent(name), seed_token)
+        if answer is not None:
+            return answer
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
 
 
 def _wait_for_probe_answer(name, probe_token, timeout_s=30):
@@ -1441,7 +1551,7 @@ def _prompt_native_headless(name, pane_id, text):
         ) from exc
 
 
-def _discard_headless_composition(pane_id, timeout_s=3):
+def _discard_headless_composition(pane_id):
     """Discard residual headless draft text before the next official prompt.
 
     A pane read cannot distinguish a historical prompt from the current draft
@@ -1463,7 +1573,7 @@ def _discard_headless_composition(pane_id, timeout_s=3):
         ) from exc
     # Give the terminal one frame to consume Escape; no visual absence claim is
     # made because detection includes historical prompt lines.
-    time.sleep(min(0.1, max(0.0, float(timeout_s))))
+    time.sleep(0.1)
 
 
 def _herdr_allow_empty(*args):
@@ -1507,7 +1617,9 @@ def _runtime_identity_changes(expected, observed, *, allow_session_change=False)
     return changes
 
 
-def _observe_effective_runtime(name, info, timeout_s, *, allow_session_change=False):
+def _observe_effective_runtime(
+    name, info, timeout_s, *, allow_session_change=False, fence=False
+):
     """Ask the live CLI for its current profile and return fresh metadata.
 
     Process argv and a footer are useful fallbacks, but they cannot prove an
@@ -1516,6 +1628,37 @@ def _observe_effective_runtime(name, info, timeout_s, *, allow_session_change=Fa
     is best-effort: inability to observe the pair is recorded as unknown and
     never turns cleanup into a model/reasoning permission gate.
     """
+    if fence and _is_headless_reviewer(name):
+        # Reserve the target while the native status probe and its identity
+        # revalidation run. Without this fence a swap can replace the pane in
+        # the gap between the initial get and the final status read.
+        passive_before = _runtime_profile(name, info, recent_lines=120)
+        try:
+            with _dispatch_submission_locks({name: info}):
+                observed = get_agent_info(name)
+                identity_changes = _runtime_identity_changes(
+                    info, observed, allow_session_change=allow_session_change
+                )
+                if identity_changes:
+                    raise ContextResetError(
+                        "identidade mudou antes da sonda /status: "
+                        + "; ".join(identity_changes)
+                    )
+                if observed.get("agent_status") not in ("idle", "done"):
+                    raise ContextResetError(
+                        f"'{name}' ficou '{observed.get('agent_status')}' antes da sonda /status"
+                    )
+                return _observe_effective_runtime(
+                    name,
+                    observed,
+                    timeout_s,
+                    allow_session_change=allow_session_change,
+                    fence=False,
+                )
+        except DispatchLockBusyError as exc:
+            exc.runtime_before = passive_before
+            raise
+
     passive = _runtime_profile(name, info, recent_lines=120)
     if not _is_headless_reviewer(name):
         return passive, info, {"attempted": False}
@@ -1548,7 +1691,15 @@ def _observe_effective_runtime(name, info, timeout_s, *, allow_session_change=Fa
             )
         confirmed = _runtime_profile(name, refreshed, recent_lines=160)
         if confirmed.get("source") in ("status", "status+argv", "status_model") and confirmed.get("model_observed"):
-            return confirmed, refreshed, {"attempted": True, "verified": True}
+            runtime_probe_verified = bool(
+                confirmed.get("observed") and confirmed.get("reasoning_observed")
+            )
+            return confirmed, refreshed, {
+                "attempted": True,
+                "verified": runtime_probe_verified,
+                "model_probe_verified": True,
+                "runtime_probe_verified": runtime_probe_verified,
+            }
         passive["observed"] = False
         passive["model_observed"] = False
         passive["reasoning_observed"] = False
@@ -1679,7 +1830,7 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
         raise ContextResetError(f"kind '{kind}' não tem comando de reset conhecido")
     _evidence["phase"] = "runtime_before"
     before_profile, before_runtime_info, before_probe = _observe_effective_runtime(
-        name, before, timeout_s
+        name, before, timeout_s, fence=True
     )
     if before_runtime_info is not before:
         # Keep the identity returned by the status probe for the subsequent
@@ -1712,6 +1863,13 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
         raise ContextResetError(
             f"seed do reset não assentou para '{name}': {seed_result.get(name)}"
         )
+    _evidence["phase"] = "seed_ack"
+    seed_answer = _wait_for_seed_answer(name, token, timeout_s=min(timeout_s, 30))
+    if seed_answer != "HERDR_RESET_SEED_OK":
+        raise ContextResetError(
+            f"seed do reset não foi confirmado para '{name}': "
+            "não encontrei HERDR_RESET_SEED_OK"
+        )
 
     # O seed foi enviado pelo canal oficial. Em reviewer/scout headless,
     # composição residual continua sendo descartável; só um diálogo pendente
@@ -1727,6 +1885,8 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
         native_lock = _dispatch_submission_locks({name: before})
     else:
         native_lock = nullcontext()
+    if _is_headless_reviewer(name):
+        _evidence["phase"] = "native_lock"
     with native_lock:
         if _is_headless_reviewer(name):
             try:
@@ -1820,7 +1980,7 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     except RuntimeError as exc:
         raise ContextResetError(f"não consegui confirmar '{name}' após a sonda: {exc}") from exc
     after_profile, after_runtime_info, after_probe = _observe_effective_runtime(
-        name, after, timeout_s, allow_session_change=True
+        name, after, timeout_s, allow_session_change=True, fence=True
     )
     if after_runtime_info is not after:
         after = after_runtime_info
@@ -1857,6 +2017,14 @@ def reset_reviewer_context(name, timeout_s=1200):
     evidence = {"runtime_before": None, "runtime_after": None, "phase": "start"}
     try:
         return _reset_reviewer_context(name, timeout_s, _evidence=evidence)
+    except DispatchLockBusyError as exc:
+        raise ContextResetError(
+            str(exc),
+            agent=name,
+            phase=evidence.get("phase"),
+            runtime_before=getattr(exc, "runtime_before", None) or evidence.get("runtime_before"),
+            runtime_after=evidence.get("runtime_after"),
+        ) from exc
     except ContextResetError as exc:
         exc.attach_runtime(
             agent=name,

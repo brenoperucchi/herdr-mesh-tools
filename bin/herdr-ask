@@ -86,16 +86,7 @@ leia o artifact do colega cego.
 3. **O argumento** — pode discordar de uma sub-pergunta específica se houver
    mais de uma, pode dizer "não vale a pena", pode ter baixa confiança — diga
    isso explicitamente em vez de forçar uma posição.
-4. **A recomendação executável** — traduza a posição em uma ação concreta:
-   desenho/arquivos a alterar, ordem dos passos e o que fica fora de escopo.
-   Se nenhuma ação for necessária, escreva **ação necessária: nenhuma**.
-5. **Validação e próximo passo** — informe como o `<slug>-exec` deve testar ou
-   confirmar a recomendação e qual é o próximo passo imediato. Se não houver
-   base suficiente, escreva **recomendação: não determinada**, explique a
-   lacuna e formule a pergunta que o exec deve levar ao Breno.
-
-Uma resposta sem recomendação explícita não está completa. Você recomenda e
-registra incertezas; não implementa, não faz commit e não decide pelo space.
+{solution_contract_ask}
 
 Antes de responder, releia `AGENTS.md` e `.herdr/reviewer.md`. Este é o aviso
 operacional obrigatório: não use AgentRelay nem subagentes nativos, não crie
@@ -120,6 +111,8 @@ explícita e devolva-a ao `{exec_name}` junto com a recomendação executável q
 é segura sob cada interpretação (ou **recomendação: não determinada**, com a
 pergunta exata). Se o exec ainda julgar necessária outra análise depois da sua
 resposta, ou se você devolver INCERTEZA/DIVERGÊNCIA, ele é quem consulta o Breno.
+
+{solution_contract_ask}
 """
 
 
@@ -147,8 +140,11 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
 
     isolation_note = ISOLATION_NOTE.format(sibling_dir=sibling_dir) if sibling_dir else ""
 
-    scout_note = SCOUT_ESCALATION_NOTE.format(exec_name=scout_exec) if scout_exec else ""
-    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT)}
+    scout_note = SCOUT_ESCALATION_NOTE.format(
+        exec_name=scout_exec,
+        solution_contract_ask=core.SOLUTION_CONTRACT_ASK,
+    ) if scout_exec else ""
+    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT, solution_contract_ask=core.SOLUTION_CONTRACT_ASK)}
 {scout_note}
 {invariants_section}
 ## Pergunta
@@ -382,6 +378,9 @@ def main():
         metrics["runtime_after"][name] = runtime_profile_evidence(name, post_info)
         answer_path = os.path.join(verdict_dirs[name], "answer.md")
         size = os.path.getsize(answer_path) if os.path.isfile(answer_path) else 0
+        solution_contract = core.solution_contract_status(answer_path, "ask")
+        if status in ("done", "idle") and size > 0 and not solution_contract["ok"]:
+            status = "artifact_invalid"
         di = dispatch_info[name]
         metrics["reviewers"][name] = {
             "dispatched": True,
@@ -389,10 +388,15 @@ def main():
             "agent_session": di["agent_session"],
             "runtime_before": runtime_before.get(name),
             "runtime_after": metrics["runtime_after"].get(name),
+            "runtime_summary": core.runtime_profile_summary({
+                "runtime_before": runtime_before.get(name),
+                "runtime_preserved": None,
+            }),
             "dispatch_ts": di["dispatch_ts"],
             "settle_ts": settle_ts.get(name),
             "status": status,
             "answer_bytes": size,
+            "solution_contract": solution_contract,
         }
         wait_detail = wait_info.get(name)
         if isinstance(wait_detail, dict):
@@ -421,6 +425,11 @@ def main():
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem answer.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é resposta" + (f" (answer.md existe, {size}b — pode estar incompleto)" if size else ""))
+        elif status == "artifact_invalid":
+            print(
+                f"  {name}: ARTIFACT_INVALID — answer.md não cumpre o contrato de recomendação "
+                f"({', '.join(solution_contract['missing'])})"
+            )
         elif status == "artifact_missing":
             print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas answer.md não foi publicado" + (f" (answer.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":
@@ -433,6 +442,11 @@ def main():
             print(f"  {name}: {status}, mas answer.md {'não existe' if not os.path.isfile(answer_path) else 'está vazio'} — falha operacional")
         else:
             print(f"  {name}: {status}, resposta em {answer_path} ({size}b)")
+            if not solution_contract["ok"]:
+                print(
+                    f"    aviso: contrato de recomendação incompleto ({', '.join(solution_contract['missing'])})",
+                    file=sys.stderr,
+                )
             ok_count += 1
 
     write_json_atomic(os.path.join(round_dir, "metrics.json"), metrics)

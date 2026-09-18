@@ -73,9 +73,19 @@ class ReviewerContextResetTests(unittest.TestCase):
             "agent_session": {"value": "new-session"},
         }
 
-    def _run(self, kind="codex", answer="HERDR_RESET_MARKER_ABSENT", get_infos=None):
+    def _run(
+        self,
+        kind="codex",
+        answer="HERDR_RESET_MARKER_ABSENT",
+        get_infos=None,
+        seed_answer="HERDR_RESET_SEED_OK",
+    ):
         before = {**self.before, "agent": kind}
-        infos = get_infos or [before, {**before}, {**before, "agent_session": {"value": "new-session"}}]
+        infos = get_infos or [
+            before,
+            {**before, "agent_session": {"value": "new-session"}},
+            {**before, "agent_session": {"value": "new-session"}},
+        ]
         profile = {
             "observed": True,
             "kind": kind,
@@ -94,6 +104,7 @@ class ReviewerContextResetTests(unittest.TestCase):
              mock.patch.object(self.core, "api", return_value={}) as api_call, \
              mock.patch.object(self.core, "_runtime_profile", side_effect=[profile, profile]), \
              mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value=seed_answer), \
              mock.patch.object(self.core, "_probe_answer", return_value=answer), \
              mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("rev")
@@ -121,7 +132,7 @@ class ReviewerContextResetTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args_list[0].args[0][-3:], ["run", "wY:p3", "/clear"])
 
-    def test_discard_headless_composition_polls_until_draft_is_gone(self):
+    def test_discard_headless_composition_sends_one_escape(self):
         with mock.patch.object(
             self.core, "pane_looks_busy_with_human_input",
             return_value=(False, None),
@@ -160,6 +171,7 @@ class ReviewerContextResetTests(unittest.TestCase):
             ]
         ), mock.patch.object(self.core, "_prompt_native_headless") as native, \
              mock.patch.object(self.core, "_herdr_allow_empty", return_value=None) as raw, \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"), \
              mock.patch.object(self.core, "_wait_for_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"), \
              mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("sim-rev-2")
@@ -199,7 +211,9 @@ class ReviewerContextResetTests(unittest.TestCase):
         native.assert_called_once_with("sim-rev-2", "wY:p3", "/status")
         self.assertIs(refreshed, info)
         self.assertEqual(profile["source"], "status+argv")
-        self.assertTrue(probe["verified"])
+        self.assertFalse(probe["verified"])
+        self.assertTrue(probe["model_probe_verified"])
+        self.assertFalse(probe["runtime_probe_verified"])
 
     def test_headless_runtime_probe_without_status_is_unverified(self):
         info = {
@@ -268,6 +282,32 @@ class ReviewerContextResetTests(unittest.TestCase):
         self.assertIsNone(error.runtime_after)
         self.assertEqual(error.as_dict()["runtime_before"]["model"], "gpt-6-astra")
 
+    def test_seed_ack_is_required_before_native_reset(self):
+        with self.assertRaisesRegex(self.core.ContextResetError, "HERDR_RESET_SEED_OK"):
+            self._run(seed_answer=None)
+
+    def test_lock_failure_keeps_runtime_before_evidence(self):
+        profile = {
+            "observed": True,
+            "kind": "claude",
+            "model": "opus-5",
+            "reasoning_effort": "low",
+            "source": "argv",
+        }
+        info = {**self.before, "agent": "claude", "workspace_id": "wY", "tab_id": "wY:t1"}
+        with mock.patch.object(self.core, "get_agent_info", return_value=info), \
+             mock.patch.object(self.core, "pane_looks_busy_with_human_input", return_value=(False, None)), \
+             mock.patch.object(self.core, "_runtime_profile", return_value=profile), \
+             mock.patch.object(
+                 self.core,
+                 "_dispatch_submission_locks",
+                 side_effect=self.core.DispatchLockBusyError("rev", "busy"),
+             ):
+            with self.assertRaises(self.core.ContextResetError) as caught:
+                self.core.reset_reviewer_context("sim-rev-2")
+        self.assertEqual(caught.exception.phase, "runtime_before")
+        self.assertEqual(caught.exception.runtime_before["model"], "opus-5")
+
     def test_unknown_reasoning_is_evidence_and_does_not_block_seed(self):
         profile = {
             "observed": False,
@@ -286,6 +326,7 @@ class ReviewerContextResetTests(unittest.TestCase):
              ]) as dispatch, \
              mock.patch.object(self.core, "api", return_value={}), \
              mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"), \
              mock.patch.object(self.core, "_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"), \
              mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("rev")
@@ -313,6 +354,7 @@ class ReviewerContextResetTests(unittest.TestCase):
                  "observed": True, "model": "gpt-6-astra", "reasoning_effort": "medium",
              }), \
              mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"), \
              mock.patch.object(self.core, "_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"), \
              mock.patch.object(self.core.time, "sleep"):
             self.core.reset_reviewer_context("rev")
@@ -360,6 +402,7 @@ class ReviewerContextResetTests(unittest.TestCase):
              mock.patch.object(self.core, "api", return_value={}), \
              mock.patch.object(self.core, "_runtime_profile", side_effect=[profile, profile]), \
              mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"), \
              mock.patch.object(self.core, "_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"), \
              mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("rev")
@@ -404,6 +447,8 @@ class ReviewerContextResetTests(unittest.TestCase):
                 "reasoning_effort": "medium",
             },
         ), mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), mock.patch.object(
+            self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"
+        ), mock.patch.object(
             self.core, "_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"
         ), mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("rev")
@@ -440,6 +485,7 @@ class ReviewerContextResetTests(unittest.TestCase):
                  {"observed": True, "model": "gpt-6-astra", "reasoning_effort": "medium"},
                  {"observed": True, "model": "gpt-5.6-luna", "reasoning_effort": "max"},
              ]), mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
+             mock.patch.object(self.core, "_wait_for_seed_answer", return_value="HERDR_RESET_SEED_OK"), \
              mock.patch.object(self.core, "_probe_answer", return_value="HERDR_RESET_MARKER_ABSENT"), \
              mock.patch.object(self.core.time, "sleep"):
             result = self.core.reset_reviewer_context("rev")
@@ -555,6 +601,17 @@ class ReviewerContextResetTests(unittest.TestCase):
             ),
             ("gpt-6-astra", "high"),
         )
+
+    def test_newer_untrusted_model_line_cannot_reuse_older_status_pair(self):
+        text = (
+            "Session ID: abc\n"
+            "Model: gpt-6-astra\n"
+            "Effort: high\n"
+            "Discussed in the handoff:\n"
+            "Model: gpt-5.6-luna\n"
+        )
+        self.assertIsNone(self.core._status_runtime(text))
+        self.assertIsNone(self.core._status_model(text))
 
     def test_status_model_beats_argv_even_without_argv_effort(self):
         info = {"agent": "claude", "pane_id": "w:p1"}
@@ -721,6 +778,7 @@ class ReviewerContextResetTests(unittest.TestCase):
 
     def test_runtime_profile_summary_exposes_preserved_pair(self):
         summary = self.core.runtime_profile_summary({
+            "runtime_preserved": True,
             "runtime_before": {
                 "model": "sonnet-5",
                 "reasoning_effort": "low",

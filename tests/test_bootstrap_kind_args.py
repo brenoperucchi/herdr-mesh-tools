@@ -88,6 +88,11 @@ def _papel(nome):
 
 
 class BootstrapKindArgsTests(unittest.TestCase):
+    def test_role_reinforcement_uses_slug_not_workspace_label(self):
+        with open(os.path.join(BIN_DIR, "herdr-bootstrap"), encoding="utf-8") as stream:
+            source = stream.read()
+        self.assertIn("role_reinforcement_prompt(name, slug, cwd, siblings)", source)
+
     def test_nenhum_papel_mistura_flags_de_cli(self):
         for nome, kind, args in _papeis():
             with self.subTest(papel=nome, kind=kind):
