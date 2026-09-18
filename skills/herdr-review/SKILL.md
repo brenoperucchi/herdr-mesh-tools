@@ -115,6 +115,12 @@ seu próprio revisor (`<round_dir>/<slug>-rev-1/verdict.md`,
 revisores pra isso — é scrape de tela, lossy; os arquivos são a fonte de
 verdade.
 
+Cada achado deve trazer não só o problema, mas também **solução proposta**,
+**validação** e eventual **decisão necessária**. “Não determinada”, com a
+lacuna e a pergunta explícitas, é válido quando não houver base segura; um
+achado sem nenhuma dessas formas de encaminhamento é um veredito incompleto.
+`APPROVE` deve declarar **ação necessária: nenhuma**.
+
 Monte uma tabela por achado, em três classes:
 
 | Classe | Quando | Quem trata |
@@ -153,6 +159,21 @@ INCERTEZA/DIVERGÊNCIA, pare e consulte o Breno. Se o caminho de `herdr-ask`
 não puder ser executado, pare e reporte o bloqueio.
 
 ## Corrigir e ciclar
+
+Antes de corrigir ou responder ao Breno, o `<slug>-exec` transforma os dois
+vereditos em uma síntese explícita. Para cada achado, mostre:
+
+| Campo | Conteúdo |
+|---|---|
+| **Achado e impacto** | O problema confirmado, único ou em conflito e por que importa |
+| **Solução proposta** | A recomendação do revisor, ou a solução formulada pelo exec quando o revisor não pôde determiná-la |
+| **Decisão do exec** | Corrigir, descartar, escalar ao scout ou consultar o Breno |
+| **Próximo passo e validação** | A ação imediata e como saberemos que terminou |
+
+Não entregue somente a lista de P0–P3. O revisor propõe; o exec decide,
+coordena a correção e comunica a síntese ao Breno. Se a recomendação do
+revisor for insuficiente, o exec deve completar a proposta ou declarar a
+incerteza — nunca deixar o usuário descobrir a solução perguntando de novo.
 
 Aplique as correções dos achados CONFIRMADO (e ÚNICO que procedam) você mesmo.
 Para CONFLITO ou qualquer achado que você considere descartar, use a terceira

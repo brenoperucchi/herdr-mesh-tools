@@ -63,6 +63,16 @@ perfil observado antes/depois de uma troca é evidência, não guarda de execuç
 Reasoning não escolhe o perfil; quando não for observável, registre `unknown` e
 nunca invente um default.
 
+Revisão só fica transparente quando termina com encaminhamento. Revisores e
+scout devem registrar a solução proposta, a validação e a decisão necessária
+para cada achado ou pergunta; quando não houver base, devem registrar
+explicitamente `não determinada` e a lacuna. O executor de cada space é o
+responsável por ler os artefatos, decidir o próximo passo e apresentar ao
+Breno uma síntese de **problema, impacto, solução, decisão, validação e
+critério de conclusão**. Nunca entregue somente os achados nem espere que o
+Breno pergunte novamente qual é a solução. O revisor recomenda; o exec decide
+e coordena; o scout não implementa nem fala diretamente com o usuário.
+
 ## Papéis obrigatórios ausentes e perfil de restauração
 
 `<slug>-exec`, os dois revisores e `<slug>-scout` quando a tabela do space o

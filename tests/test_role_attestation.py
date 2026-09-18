@@ -89,6 +89,37 @@ class RoleAttestationTests(unittest.TestCase):
         self.assertIn("attestation", self.review.PROTOCOL.lower())
         self.assertIn("attestation", self.ask.ASK_PROTOCOL.lower())
 
+    def test_review_and_ask_require_actionable_recommendation(self):
+        for required in (
+            "solução proposta",
+            "validação",
+            "decisão necessária",
+            "não determinada",
+            "ação necessária: nenhuma",
+        ):
+            self.assertIn(required, self.review.PROTOCOL.lower())
+        for required in (
+            "recomendação executável",
+            "validação e próximo passo",
+            "recomendação: não determinada",
+            "ação necessária: nenhuma",
+        ):
+            self.assertIn(required, self.ask.ASK_PROTOCOL.lower())
+
+    def test_exec_hydration_requires_user_facing_solution_summary(self):
+        prompt = self.core.exec_hydration_prompt(
+            "foo-exec", "foo", "/repo/foo", ["foo-rev-1", "foo-rev-2", "foo-scout"],
+        )
+        for required in (
+            "problema/impacto",
+            "solução proposta",
+            "decisão do exec",
+            "próximo passo",
+            "critério de conclusão",
+            "pergunta exata",
+        ):
+            self.assertIn(required, prompt.lower())
+
     def test_interactive_ready_caveat_is_shared_not_duplicated(self):
         """Achado 2026-09-06: o mesmo texto sobre interactive_ready ausente
         já existiu copiado a mao em 4 lugares (ROLE_REINFORCEMENT_PROMPT,

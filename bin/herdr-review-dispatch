@@ -84,8 +84,22 @@ Formato do veredito — uma lista de achados, cada um com:
 - **arquivo:linha**
 - **descrição** do problema
 - **evidência** (por que isso é real, não hipotético)
+- **solução proposta**: a correção concreta recomendada, com o menor escopo
+  que resolve a causa. Diga o que deve mudar; não escreva apenas “corrigir”.
+- **validação**: teste, comando ou observação que demonstrará que a correção
+  funciona e não regride o comportamento existente.
+- **decisão necessária**: se a recomendação exigir escolha do exec/Breno,
+  declare exatamente qual escolha está pendente e quais são as alternativas.
 
-Se não achar nada, escreva `APPROVE` e o porquê (o que você verificou).
+O achado não está completo sem uma solução. Se não houver base para propor uma
+correção segura, escreva **solução proposta: não determinada**, explique o que
+falta observar e formule a pergunta que o `<slug>-exec` deve resolver. Isso é
+uma resposta explícita, não uma omissão. O revisor recomenda; não implementa,
+não faz commit e não decide pelo space.
+
+Se não achar nada, escreva `APPROVE`, o porquê (o que você verificou) e
+**ação necessária: nenhuma**. Assim o executor não precisa inferir se faltou
+uma recomendação.
 
 VOCÊ é o revisor — a revisão em si não é delegável. Não use AgentRelay, o
 sistema nativo de sub-agentes do seu CLI (ex: `agents`/`pipeline_reviewer`
@@ -118,6 +132,9 @@ coordenador delegado.
 
 - **corrigido** / **não corrigido** / **parcial** — com a linha atual como
   evidência.
+- **solução remanescente** — para `não corrigido` ou `parcial`, descreva a
+  correção concreta que ainda deve ser aplicada; para `corrigido`, registre
+  **ação necessária: nenhuma** ou a validação adicional pendente.
 - Achado **novo** só se estiver dentro das linhas que mudaram no diff abaixo
   (não vá procurar em arquivo que não mudou).
 

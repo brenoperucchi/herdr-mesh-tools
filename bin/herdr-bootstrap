@@ -220,6 +220,10 @@ SPACES = [
     # PROPOSITO: e' a sessao interativa com humano atras, nao um agent
     # bootstrapado.
     ("herdr", HOME, None, ("herdr-scout", "codex", SCOUT_ARGS)),
+    # herdr-simulation: Space isolado para simulacoes de revisao e cleanup
+    # Registrado por herdr-add-space em 2026-09-17.
+    ("herdr-simulation", f"{HOME}/Devs/herdr-simulation", ("herdr-sim-exec", "claude", EXEC_ARGS),
+        ("herdr-sim-scout", "codex", SCOUT_ARGS), "herdr-sim"),
 ]
 
 

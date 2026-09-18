@@ -86,6 +86,16 @@ leia o artifact do colega cego.
 3. **O argumento** — pode discordar de uma sub-pergunta específica se houver
    mais de uma, pode dizer "não vale a pena", pode ter baixa confiança — diga
    isso explicitamente em vez de forçar uma posição.
+4. **A recomendação executável** — traduza a posição em uma ação concreta:
+   desenho/arquivos a alterar, ordem dos passos e o que fica fora de escopo.
+   Se nenhuma ação for necessária, escreva **ação necessária: nenhuma**.
+5. **Validação e próximo passo** — informe como o `<slug>-exec` deve testar ou
+   confirmar a recomendação e qual é o próximo passo imediato. Se não houver
+   base suficiente, escreva **recomendação: não determinada**, explique a
+   lacuna e formule a pergunta que o exec deve levar ao Breno.
+
+Uma resposta sem recomendação explícita não está completa. Você recomenda e
+registra incertezas; não implementa, não faz commit e não decide pelo space.
 
 Antes de responder, releia `AGENTS.md` e `.herdr/reviewer.md`. Este é o aviso
 operacional obrigatório: não use AgentRelay nem subagentes nativos, não crie
@@ -106,7 +116,10 @@ pergunta e o material fornecido, e escreva a resposta em `answer.md` para o
 Não comunique diretamente com o usuário, não tome a decisão pelo space e não
 faça commit. Se a evidência continuar insuficiente, ou se houver mais de uma
 interpretação defensável, registre **INCERTEZA** ou **DIVERGÊNCIA** de forma
-explícita e devolva-a ao `{exec_name}`. Se o exec ainda julgar necessária outra análise depois da sua resposta, ou se você devolver INCERTEZA/DIVERGÊNCIA, ele é quem consulta o Breno.
+explícita e devolva-a ao `{exec_name}` junto com a recomendação executável que
+é segura sob cada interpretação (ou **recomendação: não determinada**, com a
+pergunta exata). Se o exec ainda julgar necessária outra análise depois da sua
+resposta, ou se você devolver INCERTEZA/DIVERGÊNCIA, ele é quem consulta o Breno.
 """
 
 

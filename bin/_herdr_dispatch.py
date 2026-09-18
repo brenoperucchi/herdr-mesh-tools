@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 
 HERDR = os.path.expanduser("~/.local/bin/herdr")
@@ -679,6 +679,12 @@ usuário, e não decide nem faz commit. Se o scout registrar divergência ou
 incerteza, ou se este exec ainda julgar necessária outra análise, pare e leve a
 questão ao Breno. Registre a decisão final antes de qualquer commit.
 
+Contrato de transparência: depois de ler cada `verdict.md`/`answer.md`, nunca
+apresente somente o achado. Para cada item, registre problema/impacto, solução proposta,
+decisão do exec, próximo passo, validação e critério de conclusão.
+Se a solução não puder ser determinada, registre a lacuna e a pergunta exata
+ao Breno; não espere que ele peça a solução em uma segunda mensagem.
+
 Não edite arquivos nesta hidratação. Confirme somente com:
 `{EXEC_HYDRATION_MARKER} ACK`.
 """
@@ -935,7 +941,44 @@ class DispatchLockBusyError(RuntimeError):
 
 
 class ContextResetError(RuntimeError):
-    """Falha operacional do helper de reset legado (fora do dispatch normal)."""
+    """Falha operacional do helper de reset legado (fora do dispatch normal).
+
+    A operação de reset tem várias fronteiras (seed, comando nativo, sonda e
+    leitura final). Quando uma delas falha, o erro precisa carregar as leituras
+    que já foram obtidas; sem isso o caller publica apenas ``reset_error`` e a
+    próxima investigação perde justamente o perfil que poderia explicar a
+    divergência.
+    """
+
+    def __init__(self, message, *, agent=None, phase=None,
+                 runtime_before=None, runtime_after=None):
+        super().__init__(message)
+        self.agent = agent
+        self.phase = phase
+        self.runtime_before = runtime_before
+        self.runtime_after = runtime_after
+
+    def attach_runtime(self, *, agent=None, phase=None,
+                       runtime_before=None, runtime_after=None):
+        """Completa a evidência sem substituir uma leitura já registrada."""
+        if self.agent is None:
+            self.agent = agent
+        if self.phase is None:
+            self.phase = phase
+        if self.runtime_before is None and runtime_before is not None:
+            self.runtime_before = runtime_before
+        if self.runtime_after is None and runtime_after is not None:
+            self.runtime_after = runtime_after
+        return self
+
+    def as_dict(self):
+        return {
+            "error": str(self),
+            "agent": self.agent,
+            "phase": self.phase,
+            "runtime_before": self.runtime_before,
+            "runtime_after": self.runtime_after,
+        }
 
 
 # Revisores e scout não são mais resetados automaticamente pelo dispatcher.
@@ -983,15 +1026,21 @@ def _read_agent_recent(name, lines=80):
 
 
 _RUNTIME_EFFORTS = "minimal|low|medium|high|xhigh|max"
+# The Codex footer is a line of its own (for example
+# ``gpt-5.6-luna max · ~/repo``).  Requiring the line boundary and the footer
+# separator prevents a handoff sentence such as ``use gpt-6-astra low for ...``
+# from becoming an effective runtime reading.
+_RUNTIME_MODEL = r"(?:gpt[-a-z0-9.]*[a-z0-9]|o[0-9][a-z0-9.-]*|claude[-a-z0-9.]*[a-z0-9]|sonnet[-a-z0-9.]*[a-z0-9]|opus[-a-z0-9.]*[a-z0-9])"
 _RUNTIME_FOOTER_RE = re.compile(
-    rf"(?:^|\s)(?P<model>(?:gpt[-a-z0-9.]*[a-z0-9]|o[0-9][a-z0-9.-]*|claude[-a-z0-9.]*[a-z0-9]|sonnet[-a-z0-9.]*[a-z0-9]|opus[-a-z0-9.]*[a-z0-9]))\s+"
-    rf"(?P<effort>{_RUNTIME_EFFORTS})\b",
-    re.I,
+    rf"^\s*(?:[•●]\s*)?(?P<model>{_RUNTIME_MODEL})\s+"
+    rf"(?P<effort>{_RUNTIME_EFFORTS})"
+    rf"(?=\s*(?:[·•|]|(?:~?/)|$))",
+    re.I | re.M,
 )
 _CLAUDE_HEADER_RE = re.compile(
-    rf"\b(?P<model>(?:opus|sonnet|claude)[-a-z0-9. ]*[a-z0-9])\s+"
+    rf"^\s*(?P<model>(?:opus|sonnet|claude)[-a-z0-9. ]*[a-z0-9])\s+"
     rf"(?:\([^\n)]*\)\s+)?with\s+(?P<effort>{_RUNTIME_EFFORTS})\s+effort\b",
-    re.I,
+    re.I | re.M,
 )
 # Claude's startup banner is historical display text: after an interactive
 # `/model`, it can continue showing the model with which the process started.
@@ -999,52 +1048,105 @@ _CLAUDE_HEADER_RE = re.compile(
 # the labels so prose such as "Model: ..." in a handoff cannot become a
 # runtime reading.
 _CLAUDE_STATUS_MODEL_RE = re.compile(
-    r"^\s*(?:Current\s+)?Model:\s*(?P<model>[^\n·|]+?)"
-    rf"(?:\s+\(reasoning\s+(?P<inline_effort>{_RUNTIME_EFFORTS})\b[^\n)]*\))?\s*$",
-    re.I | re.M,
+    r"^\s*[│|]?\s*(?:Current\s+)?Model:\s*(?P<model>[^\n·|│]+?)\s*[│|]?\s*$",
+    # Keep the label's case: Codex's startup card uses ``model:`` in lower
+    # case, while its explicit `/status` block uses ``Model:``. Treating both
+    # as the same status source reintroduced the stale-startup bug.
+    re.M,
 )
 _CLAUDE_STATUS_EFFORT_RE = re.compile(
-    rf"^\s*(?:Reasoning\s+)?Effort:\s*(?P<effort>{_RUNTIME_EFFORTS})\b",
+    rf"^\s*[│|]?\s*(?:Reasoning\s+)?Effort:\s*(?P<effort>{_RUNTIME_EFFORTS})\b",
+    re.I | re.M,
+)
+_STATUS_CONTEXT_RE = re.compile(
+    r"^\s*[│|]?\s*(?:Directory|cwd|Session(?:\s+(?:ID|name|kind))?|"
+    r"Model\s+provider|Setting\s+sources):",
     re.I | re.M,
 )
 
 
-def _claude_status_runtime(text):
-    """Return a complete runtime pair from an explicit Claude status block.
+def _status_runtime(text):
+    """Return a complete runtime pair from an explicit labelled status block.
 
     A partial block is deliberately ignored.  The caller may then retain the
     process/legacy-banner evidence, but must not call it an effective profile.
     """
-    models = list(_CLAUDE_STATUS_MODEL_RE.finditer(text or ""))
+    models = [
+        match for match in _CLAUDE_STATUS_MODEL_RE.finditer(text or "")
+        if _STATUS_CONTEXT_RE.search(
+            (text or "")[max(0, match.start() - 1600):match.end() + 2400]
+        )
+    ]
     efforts = list(_CLAUDE_STATUS_EFFORT_RE.finditer(text or ""))
     if not models:
         return None
     # Pair labels from the same recent status rendering.  Do not combine a
     # stale `Model:` line with an unrelated `Effort:` mention from prose.
-    pair = None
-    inline_effort = None
-    for model_match in reversed(models):
-        inline_effort = model_match.groupdict().get("inline_effort")
-        if inline_effort:
-            pair = (model_match, None)
-            break
+    # Only the newest Model label is eligible. If that newest status render is
+    # partial, do not fall back to an older complete block and report stale
+    # model/reasoning as if it were current.
+    model_match = models[-1]
+    inline_match = re.search(
+        rf"\breasoning\s+(?P<effort>{_RUNTIME_EFFORTS})\b",
+        model_match.group("model"), re.I,
+    )
+    inline_effort = inline_match.group("effort") if inline_match else None
+    pair = (model_match, None) if inline_effort else None
+    if pair is None:
         for effort_match in reversed(efforts):
-            if abs(model_match.start() - effort_match.start()) <= 2000:
+            # Model and effort must belong to the same compact status render;
+            # a whole handoff or verdict can contain both labels thousands of
+            # characters apart and must never become an effective profile.
+            if model_match.end() <= effort_match.start() <= model_match.end() + 400:
                 pair = (model_match, effort_match)
                 break
-        if pair:
-            break
     if pair is None:
         return None
     model = pair[0].group("model").strip()
     # Some Claude builds append context/billing metadata to the label, e.g.
     # ``Opus 5 (1M context)``.  Keep only the model identifier for a future
     # explicit `--model` launch flag.
-    model = re.split(r"\s+(?:\(|·|\|)", model, maxsplit=1)[0].strip()
+    resolved = re.search(r"\((?P<model>claude[-a-z0-9.\[\]]+)", model, re.I)
+    if resolved:
+        model = resolved.group("model")
+    else:
+        model = re.split(r"\s+(?:\(|·|\|)", model, maxsplit=1)[0].strip()
+    model = re.sub(r"\[[^\]]+\]", "", model).strip()
     effort = (inline_effort or pair[1].group("effort")).casefold()
     if not model or effort not in _RUNTIME_EFFORTS.split("|"):
         return None
     return model, effort
+
+
+def _status_model(text):
+    """Return the last model label even when a CLI omits reasoning in status."""
+    matches = list(_CLAUDE_STATUS_MODEL_RE.finditer(text or ""))
+    matches = [
+        match for match in matches
+        if _STATUS_CONTEXT_RE.search(
+            (text or "")[max(0, match.start() - 1600):match.end() + 2400]
+        )
+    ]
+    if not matches:
+        return None
+    raw = matches[-1].group("model").strip()
+    resolved = re.search(r"\((?P<model>claude[-a-z0-9.\[\]]+)", raw, re.I)
+    model = resolved.group("model") if resolved else re.split(r"\s+(?:\(|·|\|)", raw, maxsplit=1)[0]
+    return re.sub(r"\[[^\]]+\]", "", model).strip()
+
+
+# Kept as a compatibility alias for callers/tests that named the old family-
+# specific helper.  The status format is the same for Codex and Claude.
+_claude_status_runtime = _status_runtime
+
+
+def _footer_runtime(text):
+    """Return the last complete, line-anchored CLI footer pair."""
+    matches = list(_RUNTIME_FOOTER_RE.finditer(text or ""))
+    if not matches:
+        return None
+    match = matches[-1]
+    return match.group("model"), match.group("effort").casefold()
 
 
 def _agent_foreground_argv(pane_id, kind):
@@ -1128,30 +1230,44 @@ def _runtime_profile(name, info, *, recent_lines=40):
     # effective pair is observable.
     pane_model = pane_effort = None
     recent = _read_agent_recent(name, lines=recent_lines)
-    if kind == "claude":
-        status_pair = _claude_status_runtime(recent)
-        if status_pair:
-            pane_model, pane_effort = status_pair
-            status_source = "status"
-        else:
-            status_source = None
+    # A labelled `/status` pair is the only authoritative interactive reading
+    # for either CLI.  In particular, it must beat the startup banner and the
+    # launch argv after a user has changed `/model` or reasoning in the UI.
+    status_pair = _status_runtime(recent)
+    if status_pair:
+        pane_model, pane_effort = status_pair
+        status_source = "status"
     else:
         status_source = None
-    patterns = [_RUNTIME_FOOTER_RE]
-    if kind == "claude":
-        patterns.insert(0, _CLAUDE_HEADER_RE)
-    # An explicit `/status` pair has priority over every banner/footer match.
-    # Otherwise retain the previous passive parsing for Codex and for old
-    # Claude panes that have no status block in their recent output.
-    if not status_source:
-        matches = [match for pattern in patterns for match in pattern.finditer(recent)]
-        matches.sort(key=lambda match: match.start())
-        if matches:
-            match = matches[-1]
-            pane_model = match.group("model")
-            pane_effort = match.group("effort")
-    if pane_model and pane_effort:
-        model, effort, source = pane_model, pane_effort, (status_source or "pane")
+        labelled_model = _status_model(recent)
+        if labelled_model:
+            pane_model = labelled_model
+            # Claude's `/status` currently omits reasoning.  Keep an explicit
+            # process setting as separate evidence rather than inventing a
+            # default; the source records that this is a mixed observation.
+            if argv_effort:
+                pane_effort = argv_effort
+                status_source = "status+argv"
+            else:
+                status_source = "status_model"
+        if kind == "codex":
+            footer_pair = _footer_runtime(recent)
+            if footer_pair and not pane_model:
+                pane_model, pane_effort = footer_pair
+        # A Claude startup banner is retained only as diagnostic evidence. It
+        # is never promoted to an effective profile: the banner is known to be
+        # stale after an interactive `/model` change.
+        if kind == "claude" and not pane_model:
+            banner_matches = list(_CLAUDE_HEADER_RE.finditer(recent or ""))
+            if banner_matches:
+                banner = banner_matches[-1]
+                pane_model = banner.group("model")
+                pane_effort = banner.group("effort")
+                status_source = "banner"
+    if pane_model:
+        model = pane_model
+        effort = pane_effort or "unknown"
+        source = status_source or "pane"
     else:
         model, effort, source = argv_model, argv_effort, ("argv" if argv_model and argv_effort else None)
     if model:
@@ -1167,9 +1283,14 @@ def _runtime_profile(name, info, *, recent_lines=40):
         # A Claude banner is historical UI text and may predate `/model`.
         # Only an explicit status pair (or a complete launch argv when no
         # banner was found) counts as an effective profile for inheritance.
-        "observed": bool(
-            model and effort and effort != "unknown"
-            and (kind != "claude" or source in ("status", "argv"))
+        # `argv` is launch intent for both fields and never an effective
+        # observation. A mixed Claude reading observes the model only; its
+        # reasoning remains unknown until a CLI status exposes it.
+        "observed": bool(model and effort and effort != "unknown"
+                         and source in ("status", "pane")),
+        "model_observed": bool(model and source in ("status", "status+argv", "status_model", "pane")),
+        "reasoning_observed": bool(
+            effort and effort != "unknown" and source in ("status", "pane")
         ),
         "kind": kind,
         "model": model,
@@ -1238,7 +1359,9 @@ def runtime_profile_summary(reset_info):
     model = profile.get("model") or "?"
     effort = profile.get("reasoning_effort") or "?"
     source = profile.get("source") or "?"
-    return f"model={model} reasoning_effort={effort} preservados ({source})"
+    preserved = reset_info.get("runtime_preserved")
+    label = "não confirmados" if preserved is False else "preservados"
+    return f"model={model} reasoning_effort={effort} {label} ({source})"
 
 
 def _probe_answer(text, probe_token):
@@ -1292,6 +1415,166 @@ def _prompt_now(name, text):
         raise ContextResetError(f"falha enviando comando de reset: {exc}") from exc
 
 
+def _prompt_native_headless(name, pane_id, text):
+    """Executa um comando nativo slash na caixa do CLI headless.
+
+    ``agent prompt`` é o canal certo para conteúdo de trabalho, mas Claude
+    trata ``/clear`` recebido por essa API como uma mensagem comum em algumas
+    versões. Para a fronteira nativa usamos ``pane run``, que entrega o texto
+    literal e o Enter como uma operação única. O caller descarta composição
+    residual antes desta função; qualquer erro fecha o reset.
+    """
+    try:
+        # `pane run` submits the literal slash command and Enter as one Herdr
+        # operation. Separate send-text/send-keys calls had a real race in
+        # Codex: the next official seed could concatenate with `/status`.
+        return _herdr_allow_empty("pane", "run", pane_id, text)
+    except RuntimeError as exc:
+        # If the native operation failed, never leave a slash command in the
+        # compose box for the next official prompt.
+        try:
+            _herdr_allow_empty("pane", "send-keys", pane_id, "esc")
+        except RuntimeError:
+            pass
+        raise ContextResetError(
+            f"falha enviando comando nativo de reset: {exc}"
+        ) from exc
+
+
+def _discard_headless_composition(pane_id, timeout_s=3):
+    """Discard residual headless draft text before the next official prompt.
+
+    A pane read cannot distinguish a historical prompt from the current draft
+    reliably, so this helper does not make absence of a draft a gate. It only
+    rejects a real dialogue and sends Escape as best effort. The native command
+    itself uses atomic ``pane run`` submission. This is deliberately limited to
+    reviewer/scout panes, never the human-operated exec pane.
+    """
+    blocked, why = pane_looks_busy_with_human_input(
+        pane_id, check_composition=False
+    )
+    if blocked:
+        raise ContextResetError(f"pane headless tem diálogo pendente: {why}")
+    try:
+        _herdr_allow_empty("pane", "send-keys", pane_id, "esc")
+    except RuntimeError as exc:
+        raise ContextResetError(
+            f"não consegui descartar composição residual: {exc}"
+        ) from exc
+    # Give the terminal one frame to consume Escape; no visual absence claim is
+    # made because detection includes historical prompt lines.
+    time.sleep(min(0.1, max(0.0, float(timeout_s))))
+
+
+def _herdr_allow_empty(*args):
+    """Run a mutating pane primitive; older Herdr versions emit no JSON.
+
+    An empty success is transport-level evidence only; it does not prove that
+    the key was applied. Recovery callers therefore treat this as best-effort
+    cleanup and still rely on the subsequent identity/status boundary.
+    """
+    try:
+        out = subprocess.run(
+            herdr_argv(*args), capture_output=True, text=True, timeout=CLI_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{' '.join(args)}: sem resposta em {CLI_TIMEOUT_S}s") from exc
+    if out.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
+    if not out.stdout.strip():
+        return None
+    try:
+        return json.loads(out.stdout).get("result")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{' '.join(args)}: resposta inválida do Herdr") from exc
+
+
+def _is_headless_reviewer(name):
+    return name.endswith(("-rev-1", "-rev-2", "-scout"))
+
+
+def _runtime_identity_changes(expected, observed, *, allow_session_change=False):
+    """Compare target identity while allowing the session rollover of reset."""
+    fields = ("agent", "pane_id", "workspace_id", "tab_id", "cwd", "foreground_cwd")
+    if not allow_session_change:
+        fields += ("agent_session",)
+    changes = []
+    for field in fields:
+        before = _agent_session_value(expected) if field == "agent_session" else expected.get(field)
+        after = _agent_session_value(observed) if field == "agent_session" else observed.get(field)
+        if before is not None and before != after:
+            changes.append(f"{field}: {before!r} -> {after!r}")
+    return changes
+
+
+def _observe_effective_runtime(name, info, timeout_s, *, allow_session_change=False):
+    """Ask the live CLI for its current profile and return fresh metadata.
+
+    Process argv and a footer are useful fallbacks, but they cannot prove an
+    interactive `/model` change.  A real ``/status`` is therefore sent for
+    reviewer/scout panes immediately before and after a reset.  The operation
+    is best-effort: inability to observe the pair is recorded as unknown and
+    never turns cleanup into a model/reasoning permission gate.
+    """
+    passive = _runtime_profile(name, info, recent_lines=120)
+    if not _is_headless_reviewer(name):
+        return passive, info, {"attempted": False}
+    pane_id = info.get("pane_id")
+    if not pane_id:
+        passive["observed"] = False
+        passive["source"] = "probe_failed"
+        passive["probe_error"] = "pane_id ausente"
+        return passive, info, {"attempted": True, "verified": False, "error": "pane_id ausente"}
+    try:
+        # Native slash commands need a real terminal Enter for both CLIs. The
+        # agent prompt surface is reserved for review content; in Codex it can
+        # leave the lifecycle idle and report ``stalled`` even though the
+        # command was accepted, while Claude may treat the slash as prose.
+        _discard_headless_composition(pane_id)
+        _prompt_native_headless(name, pane_id, "/status")
+        # Claude renders the labelled status panel asynchronously; half a
+        # second was short enough to fall back to argv even when `/status` had
+        # been accepted. This remains a bounded observation delay, not a
+        # lifecycle wait.
+        time.sleep(1.5)
+        first = get_agent_info(name)
+        refreshed = _wait_for_reset_settle(name, first, pane_id, timeout_s)
+        identity_changes = _runtime_identity_changes(
+            info, refreshed, allow_session_change=allow_session_change
+        )
+        if identity_changes:
+            raise ContextResetError(
+                "identidade mudou durante a sonda /status: " + "; ".join(identity_changes)
+            )
+        confirmed = _runtime_profile(name, refreshed, recent_lines=160)
+        if confirmed.get("source") in ("status", "status+argv", "status_model") and confirmed.get("model_observed"):
+            return confirmed, refreshed, {"attempted": True, "verified": True}
+        passive["observed"] = False
+        passive["model_observed"] = False
+        passive["reasoning_observed"] = False
+        passive["source"] = "probe_unverified"
+        passive["probe_error"] = "/status não apresentou par Model/Effort ancorado"
+        return passive, info, {
+            "attempted": True,
+            "verified": False,
+            "error": passive["probe_error"],
+        }
+    except ContextResetError:
+        # Identity/dialogue failures are control-flow errors. Do not turn
+        # them into a passive profile and continue with a later seed.
+        raise
+    except Exception as exc:
+        passive = dict(passive)
+        passive["observed"] = False
+        passive["source"] = "probe_failed"
+        passive["probe_error"] = str(exc)
+        return passive, info, {
+            "attempted": True,
+            "verified": False,
+            "error": str(exc),
+        }
+
+
 def _wait_for_reset_settle(name, first_observed, pane_id, timeout_s):
     """Espera o CLI terminar ``/new``/``/clear`` antes da sonda.
 
@@ -1302,6 +1585,11 @@ def _wait_for_reset_settle(name, first_observed, pane_id, timeout_s):
     identidade observada e só aceitamos a transição de lifecycle para
     ``idle``/``done``.
     """
+    if first_observed.get("pane_id") != pane_id:
+        raise ContextResetError(
+            f"'{name}' mudou de pane antes de assentar o reset: "
+            f"{first_observed.get('pane_id')!r} -> {pane_id!r}"
+        )
     deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
     observed = first_observed
     while True:
@@ -1331,9 +1619,16 @@ def _wait_for_reset_settle(name, first_observed, pane_id, timeout_s):
             raise ContextResetError(
                 f"não consegui acompanhar '{name}' depois do reset: {exc}"
             ) from exc
-        differences = _dispatch_differences(
-            first_observed, next_observed, include_lifecycle=False
+        # Native reset legitimately advances revision/session metadata while
+        # the same pane settles. Fence the stable identity fields only; a
+        # pane/workspace/cwd/family swap remains a hard error.
+        differences = _runtime_identity_changes(
+            first_observed, next_observed, allow_session_change=True
         )
+        if next_observed.get("pane_id") != pane_id:
+            differences.append(
+                f"pane_id: {next_observed.get('pane_id')!r} -> {pane_id!r}"
+            )
         if differences:
             raise ContextResetError(
                 "metadata mudou enquanto o reset assentava ("
@@ -1343,7 +1638,7 @@ def _wait_for_reset_settle(name, first_observed, pane_id, timeout_s):
         observed = next_observed
 
 
-def reset_reviewer_context(name, timeout_s=1200):
+def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     """Reseta e comprova o contexto de um revisor antes de uma rodada.
 
     O Herdr não possui um verbo `agent reset`; cada CLI tem seu comando nativo.
@@ -1357,6 +1652,8 @@ def reset_reviewer_context(name, timeout_s=1200):
     handoff. Esses três papéis são headless: texto residual na composição é
     ignorado; somente um diálogo real do CLI impede o reset.
     """
+    if _evidence is None:
+        _evidence = {"runtime_before": None, "runtime_after": None, "phase": "start"}
     try:
         before = get_agent_info(name)
     except RuntimeError as exc:
@@ -1380,7 +1677,15 @@ def reset_reviewer_context(name, timeout_s=1200):
     reset_command = _RESET_COMMANDS.get(kind)
     if not reset_command:
         raise ContextResetError(f"kind '{kind}' não tem comando de reset conhecido")
-    before_profile = _runtime_profile(name, before)
+    _evidence["phase"] = "runtime_before"
+    before_profile, before_runtime_info, before_probe = _observe_effective_runtime(
+        name, before, timeout_s
+    )
+    if before_runtime_info is not before:
+        # Keep the identity returned by the status probe for the subsequent
+        # seed preflight; it is the snapshot that was actually observed.
+        before = before_runtime_info
+    _evidence["runtime_before"] = before_profile
 
     token = f"HERDR_RESET_SENTINEL_{uuid.uuid4().hex}"
     seed_delivery_marker = f"/tmp/.herdr/{token}"
@@ -1389,6 +1694,12 @@ def reset_reviewer_context(name, timeout_s=1200):
         "Memorize este token arbitrário apenas para a sonda seguinte. "
         "Responda exatamente HERDR_RESET_SEED_OK."
     )
+    if _is_headless_reviewer(name):
+        # A native `/status` can leave its last command rendered as a draft
+        # for one extra frame.  Clear that residual before the official seed
+        # prompt so it cannot be concatenated with the next delivery.
+        _discard_headless_composition(pane_id)
+    _evidence["phase"] = "seed"
     try:
         seed_result, _, _ = dispatch_and_wait_all(
             {name: seed}, timeout_s,
@@ -1405,16 +1716,69 @@ def reset_reviewer_context(name, timeout_s=1200):
     # O seed foi enviado pelo canal oficial. Em reviewer/scout headless,
     # composição residual continua sendo descartável; só um diálogo pendente
     # precisa impedir o comando nativo.
-    busy, why = pane_looks_busy_with_human_input(pane_id, check_composition=False)
-    if busy:
-        raise ContextResetError(f"'{name}' ganhou diálogo antes do reset: {why}")
+    if _is_headless_reviewer(name):
+        _discard_headless_composition(pane_id)
 
-    _prompt_now(name, reset_command)
-    time.sleep(1)
-    try:
-        after_reset = get_agent_info(name)
-    except RuntimeError as exc:
-        raise ContextResetError(f"revisor sumiu depois de {reset_command}: {exc}") from exc
+    # The seed dispatch lock ends when `dispatch_and_wait_all` returns.  Fence
+    # the native reset separately: re-read identity under a new lock immediately
+    # before the command, and keep it through the first post-reset snapshot so a
+    # concurrent swap cannot turn that snapshot into a new, unverified baseline.
+    if _is_headless_reviewer(name):
+        native_lock = _dispatch_submission_locks({name: before})
+    else:
+        native_lock = nullcontext()
+    with native_lock:
+        if _is_headless_reviewer(name):
+            try:
+                native_before = get_agent_info(name)
+            except RuntimeError as exc:
+                raise ContextResetError(
+                    f"revisor sumiu antes de {reset_command}: {exc}"
+                ) from exc
+            # A seed may roll the CLI session before the native reset (Codex
+            # does this intermittently); session ids are evidence, while pane,
+            # workspace, tab, cwd and family remain the hard fence.
+            identity_changes = _runtime_identity_changes(
+                before, native_before, allow_session_change=True
+            )
+            if identity_changes:
+                raise ContextResetError(
+                    "identidade mudou antes do reset nativo: "
+                    + "; ".join(identity_changes)
+                )
+            if native_before.get("agent_status") not in ("idle", "done"):
+                raise ContextResetError(
+                    f"'{name}' ficou '{native_before.get('agent_status')}' antes do reset nativo"
+                )
+            busy, why = pane_looks_busy_with_human_input(
+                pane_id, check_composition=False
+            )
+            if busy:
+                raise ContextResetError(f"'{name}' ganhou diálogo antes do reset: {why}")
+
+        _evidence["phase"] = "native_reset"
+        if kind == "claude" and _is_headless_reviewer(name):
+            _prompt_native_headless(name, pane_id, reset_command)
+        else:
+            _prompt_now(name, reset_command)
+        # Claude may acknowledge `/clear` before the new conversation is
+        # visible to the next prompt. Give the native command a short quiet
+        # window; Codex needs only the usual one second.
+        time.sleep(2.0 if kind == "claude" else 1.0)
+        _evidence["phase"] = "probe"
+        try:
+            after_reset = get_agent_info(name)
+        except RuntimeError as exc:
+            raise ContextResetError(f"revisor sumiu depois de {reset_command}: {exc}") from exc
+        if _is_headless_reviewer(name):
+            identity_changes = _runtime_identity_changes(
+                before, after_reset, allow_session_change=True
+            )
+            if identity_changes:
+                raise ContextResetError(
+                    "identidade mudou depois do reset nativo: "
+                    + "; ".join(identity_changes)
+                )
     after_reset = _wait_for_reset_settle(
         name, after_reset, pane_id, timeout_s
     )
@@ -1428,6 +1792,8 @@ def reset_reviewer_context(name, timeout_s=1200):
         "caso contrário responda exatamente HERDR_RESET_MARKER_ABSENT. "
         "Não infira a resposta a partir desta mensagem."
     )
+    if _is_headless_reviewer(name):
+        _discard_headless_composition(pane_id)
     try:
         probe_result, _, _ = dispatch_and_wait_all(
             {name: probe}, timeout_s,
@@ -1448,11 +1814,17 @@ def reset_reviewer_context(name, timeout_s=1200):
             detail = "não encontrei uma resposta inequívoca da sonda"
         raise ContextResetError(f"reset de '{name}' não comprovado: {detail}")
 
+    _evidence["phase"] = "runtime_after"
     try:
         after = get_agent_info(name)
     except RuntimeError as exc:
         raise ContextResetError(f"não consegui confirmar '{name}' após a sonda: {exc}") from exc
-    after_profile = _runtime_profile(name, after)
+    after_profile, after_runtime_info, after_probe = _observe_effective_runtime(
+        name, after, timeout_s, allow_session_change=True
+    )
+    if after_runtime_info is not after:
+        after = after_runtime_info
+    _evidence["runtime_after"] = after_profile
     runtime_evidence = _assert_runtime_preserved(
         name, before_profile, after_profile
     )
@@ -1467,9 +1839,32 @@ def reset_reviewer_context(name, timeout_s=1200):
         "session_changed": bool(session_before and session_after and session_before != session_after),
         "runtime_before": before_profile,
         "runtime_after": after_profile,
+        "runtime_probe_before": before_probe,
+        "runtime_probe_after": after_probe,
         "runtime_preserved": runtime_evidence["preserved"],
         "runtime_evidence": runtime_evidence,
     }
+
+
+def reset_reviewer_context(name, timeout_s=1200):
+    """Run the legacy native reset and retain partial evidence on failure.
+
+    Callers may safely serialize ``exc.as_dict()`` into metrics.  The wrapper
+    deliberately does not turn a model/reasoning mismatch into a failure; it
+    records that comparison as evidence, preserving the operational behavior
+    that avoids the old cleanup-induced aborts.
+    """
+    evidence = {"runtime_before": None, "runtime_after": None, "phase": "start"}
+    try:
+        return _reset_reviewer_context(name, timeout_s, _evidence=evidence)
+    except ContextResetError as exc:
+        exc.attach_runtime(
+            agent=name,
+            phase=evidence.get("phase"),
+            runtime_before=evidence.get("runtime_before"),
+            runtime_after=evidence.get("runtime_after"),
+        )
+        raise
 
 
 def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
