@@ -376,6 +376,30 @@ class ReviewerContextResetTests(unittest.TestCase):
             answer = self.core._wait_for_probe_answer("rev", "HERDR_RESET_PROBE_abc", timeout_s=1)
         self.assertEqual(answer, "HERDR_RESET_MARKER_ABSENT")
 
+    def test_seed_wait_tolerates_transient_agent_read_failure(self):
+        with mock.patch.object(
+            self.core,
+            "_read_agent_recent",
+            side_effect=[
+                self.core.ContextResetError("agent_not_idle"),
+                "HERDR_RESET_SENTINEL_abc\n• HERDR_RESET_SEED_OK\n",
+            ],
+        ), mock.patch.object(self.core.time, "sleep"):
+            answer = self.core._wait_for_seed_answer("rev", "HERDR_RESET_SENTINEL_abc", 1)
+        self.assertEqual(answer, "HERDR_RESET_SEED_OK")
+
+    def test_probe_wait_tolerates_transient_agent_read_failure(self):
+        with mock.patch.object(
+            self.core,
+            "_read_agent_recent",
+            side_effect=[
+                self.core.ContextResetError("agent_not_idle"),
+                "HERDR_RESET_PROBE_abc\n• HERDR_RESET_MARKER_ABSENT\n",
+            ],
+        ), mock.patch.object(self.core.time, "sleep"):
+            answer = self.core._wait_for_probe_answer("rev", "HERDR_RESET_PROBE_abc", 1)
+        self.assertEqual(answer, "HERDR_RESET_MARKER_ABSENT")
+
     def test_reset_waits_for_working_snapshot_before_probe(self):
         working = {**self.before, "agent_status": "working", "state_change_seq": 11}
         settled = {**self.before, "agent_status": "done", "state_change_seq": 12}
@@ -612,6 +636,14 @@ class ReviewerContextResetTests(unittest.TestCase):
         )
         self.assertIsNone(self.core._status_runtime(text))
         self.assertIsNone(self.core._status_model(text))
+
+    def test_status_pair_accepts_effort_before_model_in_same_block(self):
+        self.assertEqual(
+            self.core._status_runtime(
+                "Session ID: abc\nReasoning Effort: high\nModel: gpt-6-astra\n"
+            ),
+            ("gpt-6-astra", "high"),
+        )
 
     def test_status_model_beats_argv_even_without_argv_effort(self):
         info = {"agent": "claude", "pane_id": "w:p1"}

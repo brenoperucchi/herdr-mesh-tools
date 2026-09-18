@@ -97,9 +97,9 @@ def solution_contract_status(path, mode):
     Reviewers remain responsible for the substance of a recommendation. This
     small check catches the operational failure where a non-empty artifact
     contains only a finding/position and gives the exec a visible metric and
-    warning. Dispatchers mark an otherwise terminal turn ``artifact_invalid``
-    when the required fields are absent; this keeps the artifact visible while
-    preventing a malformed response from being reported as a successful turn.
+    warning. The dispatchers keep the artifact and lifecycle result separate:
+    they report the missing fields in metrics/stdout but do not turn free-form
+    wording into an operational failure.
     """
     try:
         with open(path, encoding="utf-8") as stream:
@@ -108,7 +108,9 @@ def solution_contract_status(path, mode):
         return {"ok": False, "missing": ["artifact_read"], "error": str(exc)}
     lowered = text.casefold()
     if mode == "review":
-        approve = bool(re.search(r"(?im)^\s*approve\b", text))
+        approve = bool(
+            re.search(r"(?im)^\s*(?:[#>*`_]+\s*)?approve\s*(?:[*_`]+)?\s*$", text)
+        )
         if approve:
             markers = ("ação necessária", "acao necessaria")
             ok = any(marker in lowered and "nenhuma" in lowered[lowered.find(marker):lowered.find(marker) + 80] for marker in markers)
@@ -1173,16 +1175,23 @@ def _status_runtime(text):
     inline_effort = inline_match.group("effort") if inline_match else None
     pair = (model_match, None) if inline_effort else None
     if pair is None:
-        for effort_match in reversed(efforts):
+        candidates = []
+        for effort_match in efforts:
             # Model and effort must belong to the same compact status render;
             # a whole handoff or verdict can contain both labels thousands of
             # characters apart and must never become an effective profile.
-            if (
-                model_match.end() <= effort_match.start()
-                and (text or "")[model_match.end():effort_match.start()].count("\n") <= 2
-            ):
-                pair = (model_match, effort_match)
-                break
+            if not _status_context_near(text, effort_match):
+                continue
+            if model_match.end() <= effort_match.start():
+                distance = (text or "")[model_match.end():effort_match.start()].count("\n")
+            elif effort_match.end() <= model_match.start():
+                distance = (text or "")[effort_match.end():model_match.start()].count("\n")
+            else:
+                continue
+            if distance <= 2:
+                candidates.append((distance, effort_match))
+        if candidates:
+            pair = (model_match, min(candidates, key=lambda item: item[0])[1])
     if pair is None:
         return None
     model = pair[0].group("model").strip()
@@ -1487,11 +1496,23 @@ def _seed_answer(text, seed_token):
 def _wait_for_seed_answer(name, seed_token, timeout_s=30):
     """Wait for the seed acknowledgement before issuing a native reset."""
     deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    last_error = None
     while True:
-        answer = _seed_answer(_read_agent_recent(name), seed_token)
+        try:
+            answer = _seed_answer(_read_agent_recent(name), seed_token)
+        except ContextResetError as exc:
+            # Herdr cannot read alternate-screen history while a CLI is
+            # briefly working. Keep polling; the lifecycle settle gate below
+            # already provides the hard deadline for the operation.
+            last_error = exc
+            answer = None
         if answer is not None:
             return answer
         if time.monotonic() >= deadline:
+            if last_error is not None:
+                raise ContextResetError(
+                    f"falha lendo a confirmação do seed: {last_error}"
+                ) from last_error
             return None
         time.sleep(0.25)
 
@@ -1508,11 +1529,20 @@ def _wait_for_probe_answer(name, probe_token, timeout_s=30):
     fechado.
     """
     deadline = time.monotonic() + max(0.1, min(float(timeout_s), 30.0))
+    last_error = None
     while True:
-        answer = _probe_answer(_read_agent_recent(name), probe_token)
+        try:
+            answer = _probe_answer(_read_agent_recent(name), probe_token)
+        except ContextResetError as exc:
+            last_error = exc
+            answer = None
         if answer is not None:
             return answer
         if time.monotonic() >= deadline:
+            if last_error is not None:
+                raise ContextResetError(
+                    f"falha lendo a resposta da sonda: {last_error}"
+                ) from last_error
             return None
         time.sleep(0.25)
 
@@ -1839,9 +1869,8 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     _evidence["runtime_before"] = before_profile
 
     token = f"HERDR_RESET_SENTINEL_{uuid.uuid4().hex}"
-    seed_delivery_marker = f"/tmp/.herdr/{token}"
     seed = (
-        f"{token}. Delivery marker: {seed_delivery_marker}. Não leia arquivos nem edite nada. "
+        f"{token}. Não leia arquivos nem edite nada. "
         "Memorize este token arbitrário apenas para a sonda seguinte. "
         "Responda exatamente HERDR_RESET_SEED_OK."
     )
@@ -1944,9 +1973,8 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     )
 
     probe_token = f"HERDR_RESET_PROBE_{uuid.uuid4().hex}"
-    probe_delivery_marker = f"/tmp/.herdr/{probe_token}"
     probe = (
-        f"{probe_token}. Delivery marker: {probe_delivery_marker}. Não leia arquivos nem edite nada. Responda em uma única linha "
+        f"{probe_token}. Não leia arquivos nem edite nada. Responda em uma única linha "
         "exatamente HERDR_RESET_MARKER_PRESENT se você ainda lembra o token "
         "arbitrário que recebeu no turno imediatamente anterior ao reset; "
         "caso contrário responda exatamente HERDR_RESET_MARKER_ABSENT. "

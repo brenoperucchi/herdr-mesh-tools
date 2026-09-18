@@ -510,8 +510,6 @@ def main():
         verdict_path = os.path.join(verdict_dirs[name], "verdict.md")
         size = os.path.getsize(verdict_path) if os.path.isfile(verdict_path) else 0
         solution_contract = core.solution_contract_status(verdict_path, "review")
-        if status in ("done", "idle") and size > 0 and not solution_contract["ok"]:
-            status = "artifact_invalid"
         di = dispatch_info[name]
         metrics["reviewers"][name] = {
             "dispatched": True,
@@ -521,7 +519,6 @@ def main():
             "runtime_after": metrics["runtime_after"].get(name),
             "runtime_summary": core.runtime_profile_summary({
                 "runtime_before": runtime_before.get(name),
-                "runtime_preserved": None,
             }),
             "dispatch_ts": di["dispatch_ts"],
             "settle_ts": settle_ts.get(name),
@@ -556,11 +553,6 @@ def main():
             print(f"  {name}: BLOCKED — precisa de decisão humana no pane" + (f" (já tem verdict.md de {size}b, confira antes de assumir que é lixo)" if size else ""))
         elif status == "timeout":
             print(f"  {name}: TIMEOUT ({args.timeout}s) — falha operacional, não é veredito" + (f" (verdict.md existe, {size}b — pode estar incompleto)" if size else ""))
-        elif status == "artifact_invalid":
-            print(
-                f"  {name}: ARTIFACT_INVALID — verdict.md não cumpre o contrato de solução "
-                f"({', '.join(solution_contract['missing'])})"
-            )
         elif status == "artifact_missing":
             print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas verdict.md não foi publicado" + (f" (verdict.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":

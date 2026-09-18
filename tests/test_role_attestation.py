@@ -140,6 +140,12 @@ class RoleAttestationTests(unittest.TestCase):
             result = self.core.solution_contract_status(review_path, "review")
             self.assertFalse(result["ok"])
             self.assertIn("solução proposta", result["missing"])
+            with open(review_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "# Veredito\nAPPROVE não se aplica: há achados.\n"
+                    "solução proposta: X\nvalidação: pytest\n"
+                )
+            self.assertTrue(self.core.solution_contract_status(review_path, "review")["ok"])
 
             ask_path = os.path.join(directory, "answer.md")
             with open(ask_path, "w", encoding="utf-8") as stream:

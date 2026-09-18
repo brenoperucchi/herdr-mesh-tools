@@ -14,6 +14,7 @@ import importlib.util
 import os
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 
@@ -89,9 +90,21 @@ def _papel(nome):
 
 class BootstrapKindArgsTests(unittest.TestCase):
     def test_role_reinforcement_uses_slug_not_workspace_label(self):
-        with open(os.path.join(BIN_DIR, "herdr-bootstrap"), encoding="utf-8") as stream:
-            source = stream.read()
-        self.assertIn("role_reinforcement_prompt(name, slug, cwd, siblings)", source)
+        prompts = []
+
+        def fake_run(*args):
+            if args[:2] == ("agent", "prompt"):
+                prompts.append(args[2:])
+            return {}
+
+        with mock.patch.object(boot, "run", side_effect=fake_run):
+            boot.start_agent_with_role(
+                "wX:p1", "herdr-sim-rev-2", "claude", [],
+                "herdr-sim", "/home/brenoperucchi/Devs/herdr-simulation", [],
+            )
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("no space `herdr-sim`", prompts[0][1])
+        self.assertNotIn("no space `herdr-simulation`", prompts[0][1])
 
     def test_nenhum_papel_mistura_flags_de_cli(self):
         for nome, kind, args in _papeis():
