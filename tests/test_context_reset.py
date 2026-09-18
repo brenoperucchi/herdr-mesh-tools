@@ -308,6 +308,30 @@ class ReviewerContextResetTests(unittest.TestCase):
         self.assertEqual(caught.exception.phase, "runtime_before")
         self.assertEqual(caught.exception.runtime_before["model"], "opus-5")
 
+    def test_identity_change_keeps_runtime_before_evidence(self):
+        info = {
+            **self.before,
+            "agent": "claude",
+            "workspace_id": "wY",
+            "tab_id": "wY:t1",
+            "cwd": "/tmp",
+            "foreground_cwd": "/tmp",
+        }
+        swapped = {**info, "pane_id": "wY:p9"}
+        profile = {
+            "observed": True,
+            "kind": "claude",
+            "model": "opus-5",
+            "reasoning_effort": "low",
+            "source": "argv",
+        }
+        with mock.patch.object(self.core, "get_agent_info", side_effect=[info, swapped]), \
+             mock.patch.object(self.core, "pane_looks_busy_with_human_input", return_value=(False, None)), \
+             mock.patch.object(self.core, "_runtime_profile", return_value=profile):
+            with self.assertRaisesRegex(self.core.ContextResetError, "identidade mudou") as caught:
+                self.core.reset_reviewer_context("sim-rev-2")
+        self.assertEqual(caught.exception.runtime_before["model"], "opus-5")
+
     def test_unknown_reasoning_is_evidence_and_does_not_block_seed(self):
         profile = {
             "observed": False,
@@ -637,12 +661,18 @@ class ReviewerContextResetTests(unittest.TestCase):
         self.assertIsNone(self.core._status_runtime(text))
         self.assertIsNone(self.core._status_model(text))
 
-    def test_status_pair_accepts_effort_before_model_in_same_block(self):
-        self.assertEqual(
+    def test_status_pair_rejects_effort_before_model_without_real_render_evidence(self):
+        self.assertIsNone(
             self.core._status_runtime(
                 "Session ID: abc\nReasoning Effort: high\nModel: gpt-6-astra\n"
-            ),
-            ("gpt-6-astra", "high"),
+            )
+        )
+
+    def test_partial_new_model_does_not_inherit_previous_effort(self):
+        self.assertIsNone(
+            self.core._status_runtime(
+                "Model: opus 5\nEffort: xhigh\nDirectory: ~/repo\nModel: sonnet 5\n"
+            )
         )
 
     def test_status_model_beats_argv_even_without_argv_effort(self):

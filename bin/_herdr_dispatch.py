@@ -108,9 +108,23 @@ def solution_contract_status(path, mode):
         return {"ok": False, "missing": ["artifact_read"], "error": str(exc)}
     lowered = text.casefold()
     if mode == "review":
-        approve = bool(
-            re.search(r"(?im)^\s*(?:[#>*`_]+\s*)?approve\s*(?:[*_`]+)?\s*$", text)
-        )
+        approve = False
+        for raw_line in text.splitlines():
+            line = re.sub(r"^\s*[#>*`_]+\s*", "", raw_line.strip())
+            line = re.sub(r"\s*[*_`]+\s*$", "", line).strip()
+            match = re.match(r"(?i)^approve(?:\s+(?P<rest>.*))?$", line)
+            if not match:
+                continue
+            rest = (match.group("rest") or "").strip()
+            if not rest:
+                approve = True
+                break
+            if re.match(
+                r"(?i)^(?:[-:–—]\s*)?(?:ação necessária|acao necessaria)\s*[:=-]\s*nenhuma[.!]?$",
+                rest,
+            ):
+                approve = True
+                break
         if approve:
             markers = ("ação necessária", "acao necessaria")
             ok = any(marker in lowered and "nenhuma" in lowered[lowered.find(marker):lowered.find(marker) + 80] for marker in markers)
@@ -1177,19 +1191,15 @@ def _status_runtime(text):
     if pair is None:
         candidates = []
         for effort_match in efforts:
-            # Model and effort must belong to the same compact status render;
-            # a whole handoff or verdict can contain both labels thousands of
-            # characters apart and must never become an effective profile.
+            # The supported status rendering is Model followed by Effort.
+            # An Effort above the newest Model may belong to the previous
+            # render; treating it as the current pair would invent reasoning.
             if not _status_context_near(text, effort_match):
                 continue
             if model_match.end() <= effort_match.start():
                 distance = (text or "")[model_match.end():effort_match.start()].count("\n")
-            elif effort_match.end() <= model_match.start():
-                distance = (text or "")[effort_match.end():model_match.start()].count("\n")
-            else:
-                continue
-            if distance <= 2:
-                candidates.append((distance, effort_match))
+                if distance <= 2:
+                    candidates.append((distance, effort_match))
         if candidates:
             pair = (model_match, min(candidates, key=lambda item: item[0])[1])
     if pair is None:
@@ -1688,6 +1698,13 @@ def _observe_effective_runtime(
         except DispatchLockBusyError as exc:
             exc.runtime_before = passive_before
             raise
+        except ContextResetError as exc:
+            exc.attach_runtime(
+                agent=name,
+                phase="runtime_before",
+                runtime_before=passive_before,
+            )
+            raise
 
     passive = _runtime_profile(name, info, recent_lines=120)
     if not _is_headless_reviewer(name):
@@ -1869,8 +1886,9 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     _evidence["runtime_before"] = before_profile
 
     token = f"HERDR_RESET_SENTINEL_{uuid.uuid4().hex}"
+    seed_delivery_marker = f"/tmp/.herdr/{token}"
     seed = (
-        f"{token}. Não leia arquivos nem edite nada. "
+        f"{token}. Delivery marker: {seed_delivery_marker}. Não leia arquivos nem edite nada. "
         "Memorize este token arbitrário apenas para a sonda seguinte. "
         "Responda exatamente HERDR_RESET_SEED_OK."
     )
@@ -1973,8 +1991,9 @@ def _reset_reviewer_context(name, timeout_s=1200, *, _evidence=None):
     )
 
     probe_token = f"HERDR_RESET_PROBE_{uuid.uuid4().hex}"
+    probe_delivery_marker = f"/tmp/.herdr/{probe_token}"
     probe = (
-        f"{probe_token}. Não leia arquivos nem edite nada. Responda em uma única linha "
+        f"{probe_token}. Delivery marker: {probe_delivery_marker}. Não leia arquivos nem edite nada. Responda em uma única linha "
         "exatamente HERDR_RESET_MARKER_PRESENT se você ainda lembra o token "
         "arbitrário que recebeu no turno imediatamente anterior ao reset; "
         "caso contrário responda exatamente HERDR_RESET_MARKER_ABSENT. "

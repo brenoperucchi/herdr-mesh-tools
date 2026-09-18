@@ -146,6 +146,9 @@ class RoleAttestationTests(unittest.TestCase):
                     "solução proposta: X\nvalidação: pytest\n"
                 )
             self.assertTrue(self.core.solution_contract_status(review_path, "review")["ok"])
+            with open(review_path, "w", encoding="utf-8") as stream:
+                stream.write("APPROVE — ação necessária: nenhuma.\n")
+            self.assertTrue(self.core.solution_contract_status(review_path, "review")["ok"])
 
             ask_path = os.path.join(directory, "answer.md")
             with open(ask_path, "w", encoding="utf-8") as stream:
