@@ -190,6 +190,56 @@ def conta_recusas(out):
     resposta = out[corte:] if corte != -1 else out
     return len(re.findall(r"n[ao]{1,2}\s+est[aá]\s+no\s+handoff", resposta, re.I))
 
+
+def respostas_verificacao_path(verif_path):
+    """Return the durable transcript path for a verification run.
+
+    ``.verificacao.md`` deliberately contains only the questions and positive
+    answer key.  The agent's actual answers live in the terminal buffer, so
+    they must be copied before a failed swap closes the provisional pane.
+    """
+    base, _ = os.path.splitext(verif_path)
+    return base + ".respostas.md"
+
+
+def persistir_respostas_verificacao(path, *, name, verif_path, status,
+                                    admitiu, negativas, out):
+    """Persist the raw verification transcript atomically before cleanup.
+
+    A failed verification still carries useful evidence. Keeping it in the
+    handoff directory makes the result inspectable after the provisional pane
+    is closed, and avoids presenting a stale ``agent read`` command that points
+    at a pane which no longer exists.
+    """
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(
+        parent, f".{os.path.basename(path)}.{os.getpid()}.tmp"
+    )
+    texto = (
+        "# Respostas da verificação de handoff\n\n"
+        f"- agent: `{name}`\n"
+        f"- perguntas: `{verif_path}`\n"
+        f"- estado do dispatch: `{status}`\n"
+        f"- negativas admitidas: `{admitiu}/{len(negativas)}`\n\n"
+        "## Buffer capturado\n\n"
+        "--- INÍCIO DO BUFFER ---\n"
+        f"{out.rstrip()}\n"
+        "--- FIM DO BUFFER ---\n"
+    )
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(texto)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def dispatch_and_wait(name, prompt_text, timeout_s, expected_info=None,
                       check_composition=True, allow_working=False):
     """Manda o prompt e espera o agent assentar via `agent prompt --wait` —
@@ -979,7 +1029,8 @@ def main():
                                           args.timeout, historico_anterior)
         if verification is False:
             print("erro: a verificação do handoff não passou; antigo preservado e "
-                  "provisório fechado.", file=sys.stderr)
+                  "provisório fechado. Respostas preservadas em "
+                  f"{respostas_verificacao_path(verif_path)}.", file=sys.stderr)
             try:
                 api("pane", "close", new_pane_id)
             except RuntimeError:
@@ -1238,7 +1289,8 @@ def finalizar(args, name, handoff_dir):
         )
         if verification is False:
             print("erro: a verificação do handoff não passou; os dois panes "
-                  "continuam vivos.", file=sys.stderr)
+                  "continuam vivos. Respostas preservadas em "
+                  f"{respostas_verificacao_path(verif_path)}.", file=sys.stderr)
             sys.exit(1)
         if verification is None:
             print("aviso: a verificação não produziu uma conclusão; seguindo "
@@ -1382,7 +1434,8 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
     trading isso decide se da pra deixa-lo operar sozinho."""
     import re as _re
 
-    texto = open(verif_path, encoding="utf-8", errors="ignore").read()
+    with open(verif_path, encoding="utf-8", errors="ignore") as fh:
+        texto = fh.read()
 
     def extrai(secao):
         padrao = r"##\s*" + secao + r"(.*?)(?=\n##\s|\Z)"
@@ -1434,6 +1487,17 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
     # "nao sei". As positivas exigem julgamento, entao ficam pro humano comparar
     # com o GABARITO do arquivo.
     admitiu = conta_recusas(out)
+    transcript_path = respostas_verificacao_path(verif_path)
+    persistir_respostas_verificacao(
+        transcript_path,
+        name=name,
+        verif_path=verif_path,
+        status=status,
+        admitiu=admitiu,
+        negativas=negativas,
+        out=out,
+    )
+    print("  respostas preservadas em " + transcript_path)
     # Mais recusas que perguntas é uma contagem impossível: pode ser eco mal
     # cortado ou uma positiva legitimamente recusada. É indeterminado, não uma
     # reprovação automática que descarte o substituto confirmado.

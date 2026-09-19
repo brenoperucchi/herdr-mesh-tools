@@ -8,8 +8,11 @@ caso, e 5/5 num caso cuja verdade era 4/5, mascarando uma confabulacao real.
 
 import importlib.util
 import os
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from types import SimpleNamespace
+from unittest import mock
 
 BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 
@@ -66,6 +69,56 @@ class ContaRecusasTests(unittest.TestCase):
         """Duas verificacoes no mesmo pane: so a ultima conta."""
         out = ECO + "1. nao esta no handoff\n" + ECO + "1. nao esta no handoff\n2. boa\n"
         self.assertEqual(swap.conta_recusas(out), 1)
+
+
+class PersistenciaRespostasTests(unittest.TestCase):
+    def test_transcript_eh_atomico_e_preserva_buffer(self):
+        with tempfile.TemporaryDirectory() as d:
+            verif = os.path.join(d, "swap.verificacao.md")
+            destino = swap.respostas_verificacao_path(verif)
+            swap.persistir_respostas_verificacao(
+                destino,
+                name="homehub-exec",
+                verif_path=verif,
+                status="done",
+                admitiu=2,
+                negativas=["1.", "2.", "3."],
+                out="1. resposta do agente\n2. nao esta no handoff\n",
+            )
+
+            with open(destino, encoding="utf-8") as fh:
+                conteudo = fh.read()
+            self.assertIn("homehub-exec", conteudo)
+            self.assertIn("negativas admitidas: `2/3`", conteudo)
+            self.assertIn("resposta do agente", conteudo)
+            self.assertFalse(any(nome.endswith(".tmp") for nome in os.listdir(d)))
+
+    def test_falha_de_verificacao_deixa_respostas_apos_o_dispatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            verif = os.path.join(d, "swap.verificacao.md")
+            with open(verif, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "## POSITIVAS\n1. Qual decisao?\n   GABARITO: X\n\n"
+                    "## NEGATIVAS\n1. Qual seed?\n2. Qual porta?\n"
+                )
+            saida = "1. X\n2. uma invencao\n3. outra invencao\n"
+            with mock.patch.object(
+                swap, "get_agent", return_value={"agent_status": "idle"}
+            ), mock.patch.object(
+                swap, "dispatch_and_wait", return_value=("done", {})
+            ), mock.patch.object(
+                swap.subprocess, "run",
+                return_value=SimpleNamespace(stdout=saida),
+            ):
+                resultado = swap.rodar_verificacao(
+                    "tmp-agent", verif, verif, 30, historico=None
+                )
+
+            self.assertFalse(resultado)
+            transcript = swap.respostas_verificacao_path(verif)
+            self.assertTrue(os.path.isfile(transcript))
+            with open(transcript, encoding="utf-8") as fh:
+                self.assertIn("uma invencao", fh.read())
 
 
 if __name__ == "__main__":
