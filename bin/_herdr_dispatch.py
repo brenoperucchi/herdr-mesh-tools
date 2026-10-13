@@ -23,6 +23,17 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 
+# Modulo irmao: garante a pasta bin no caminho de busca mesmo quando este arquivo e' carregado
+# por outro lugar que nao um script de bin/ (teste isolado, importlib).
+_AQUI = os.path.dirname(os.path.abspath(__file__))
+if _AQUI not in sys.path:
+    sys.path.insert(0, _AQUI)
+from _herdr_codex_status import inferir_idle  # noqa: E402
+
+# Consultas seguidas (uma a cada ~2s) com artefato pronto E tela ociosa para um
+# Codex assentar sem o idle/done do Herdr. Ver o laco de espera de dispatch.
+CODEX_SETTLE_POLLS = 3
+
 HERDR = os.path.expanduser("~/.local/bin/herdr")
 CLI_TIMEOUT_S = 30  # teto por chamada individual ao binario herdr, nao pelo ciclo inteiro
 BLOCKED_GRACE_S = 15  # quanto tempo em blocked sustentado ate reportar sem esperar o --timeout inteiro
@@ -303,6 +314,12 @@ def _ensure_required_agents_locked(slug, cwd, required_names):
 
     bootstrap = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
     command = [sys.executable, bootstrap, "--slug", slug]
+    # Sobe so o que falta: spaces enxutos (`lean`) ignoram o papel que nao for ligado
+    # explicitamente, e o scout NAO deve subir quando so um revisor foi requisitado.
+    if any(n.endswith(("-rev", "-rev-1", "-rev-2")) for n in missing):
+        command.append("--with-reviewers")
+    if any(n.endswith("-scout") for n in missing):
+        command.append("--with-scout")
     try:
         out = subprocess.run(
             command,
@@ -351,6 +368,26 @@ def _ensure_required_agents_locked(slug, cwd, required_names):
 
 def agent_status(name):
     return get_agent_info(name)["agent_status"]
+
+
+def _read_detection_screen(info, lines=15):
+    """Buffer de deteccao do pane (o que o proprio Herdr le). PASSIVO."""
+    out = subprocess.run(
+        herdr_argv("pane", "read", info["pane_id"], "--source", "detection", "--lines", str(lines)),
+        capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    return out.stdout if out.returncode == 0 else ""
+
+
+def effective_status(info):
+    """agent_status pra decidir se PODE disparar. Igual ao do Herdr, exceto Codex
+    `unknown` pronto com tela ociosa, que vale `idle` (ver _herdr_codex_status)."""
+    if inferir_idle(info, _read_detection_screen):
+        return "idle"
+    return info.get("agent_status")
+
+
+def effective_agent_status(name):
+    return effective_status(get_agent_info(name))
 
 
 def agent_status_safe(name):
@@ -518,6 +555,25 @@ def freeze_files(files, round_dir):
 # `max_depth=0` consegue o mesmo efeito (nenhum sub-agente pode ser
 # spawnado, profundidade zero) sem bater nesse piso.
 CODEX_NO_NATIVE_AGENTS = ["-c", "agents.max_depth=0"]
+
+# 2026-10-13 (Herdr 0.9.4, #4756): o Codex so reporta o fim de cada turno ao Herdr (hook) quando
+# roda com `--no-daemon`; com o daemon compartilhado o hook pode cair no pane errado, e desligar
+# so o auto-start nao mata um daemon que ja existe. Sem a flag o agent fica em `unknown` depois
+# de cada turno. `codex` e `codex resume` aceitam a flag.
+CODEX_NO_DAEMON = ["--no-daemon"]
+
+
+def codex_launch_flags(extra):
+    """`extra` + as flags fixas de todo lancamento Codex do mesh, sem duplicar o que ja' esta la.
+
+    Unico ponto que sabe quais sao (bootstrap, swap e agent-restart usam este)."""
+    out = list(extra or [])
+    if not any("agents.max_depth" in a for a in out):
+        out += CODEX_NO_NATIVE_AGENTS
+    for flag in CODEX_NO_DAEMON:
+        if flag not in out:
+            out.append(flag)
+    return out
 
 # Achado 2026-09-06 (relato cruzado mfc-exec + claude-bridge-exec,
 # investigado ao vivo): `interactive_ready` some de `herdr agent get`/`list`
@@ -712,12 +768,26 @@ def _infer_role(name):
     return None
 
 
-def role_reinforcement_prompt(name, slug, cwd, siblings):
+LEAN_EXEC_NOTE = """
+
+Space ENXUTO (decisão do Breno, 2026-10-03): neste space só o exec fica ligado. Os
+revisores (`{slug}-rev-1`, `{slug}-rev-2`) e o scout (`{slug}-scout`) continuam
+declarados na tabela do bootstrap, mas NÃO estão rodando agora, e isso é o esperado,
+não uma falha. Quando você usar `herdr-review` ou `herdr-ask`, o dispatcher sobe o que
+faltar sozinho (leva alguns segundos). Não crie, restaure nem renomeie esses agents à
+mão, e não os trate como indisponíveis: peça a revisão pelo caminho normal.
+"""
+
+
+def role_reinforcement_prompt(name, slug, cwd, siblings, lean=False):
     """siblings: lista de nomes dos outros agents do mesmo space (`<slug>-exec`,
     `<slug>-rev`, `<slug>-rev-2`), já sem o próprio `name`. Formata como texto
     corrido pro prompt; lista vazia (space sem colegas, ex. "herdr" sem exec)
     vira uma frase dizendo isso explicitamente, não um "{siblings}" vazio."""
     sib_text = ", ".join(f"`{s}`" for s in siblings) if siblings else "nenhum — este space não tem outros agents"
+    lean_exec = lean and _infer_role(name) == "exec"
+    if lean_exec:
+        sib_text = "nenhum ligado agora — space enxuto, os demais sobem sob demanda"
     prompt = ROLE_REINFORCEMENT_PROMPT.format(
         name=name,
         slug=slug,
@@ -730,6 +800,8 @@ def role_reinforcement_prompt(name, slug, cwd, siblings):
         exec_name = f"{slug}-exec"
         prompt += SCOUT_ROLE_NOTE.format(name=name, exec_name=exec_name)
     prompt += HEADLESS_REVIEWER_NOTE.format(slug=slug)
+    if lean_exec:
+        prompt += LEAN_EXEC_NOTE.format(slug=slug)
     return prompt
 
 
@@ -773,10 +845,238 @@ Não edite arquivos nesta hidratação. Confirme somente com:
 
 _COMPOSE_LINE_RE = re.compile(r"^(❯|›)(?:\s+(.*?))?\s*$")
 _COMPOSE_PLACEHOLDERS = {"ask codex to do anything"}
+# Marcadores de dialogo REALMENTE pendente -- algo que espera resposta antes
+# de o pane aceitar trabalho novo.
+#
+# "interrupted" sozinho saiu daqui (2026-09-21). O Codex renderiza, no estado
+# IDLE, o banner informativo "Conversation interrupted - tell the model what to
+# do differently"; ele nao e' modal, o agent aceita prompt normalmente. Como o
+# banner cai dentro das 8 ultimas linhas que este guard inspeciona, o efeito
+# era um DEADLOCK no herdr-swap: com o agent `working` o banner sumia mas o
+# swap recusava por estar working; assim que assentava em `idle` o banner
+# voltava e o guard acusava dialogo pendente. Nenhum estado passava.
+# O dialogo de interrupcao do Claude, que de fato espera resposta, continua
+# coberto por "what should claude do instead".
+#
+# "confia" solto saiu em 2026-09-22 pelo MESMO motivo: e' prefixo de
+# "confianca", "confiavel", "desconfia" -- vocabulario corrente de um agent
+# escrevendo em portugues. O rev-2 capturou o falso positivo ao vivo no
+# `llm-bench-exec`, um pane -exec que usa check_composition=True. E o dialogo
+# de trust observado nesta maquina veio em INGLES mesmo com
+# localeOverride=pt-BR, entao "do you trust"/"trust the contents" ja cobrem o
+# caso real; a forma em portugues fica ancorada na frase, nao no radical.
 _PENDING_MARKERS = (
-    "interrupted", "what should claude do instead", "do you trust",
-    "confia", "trust the contents",
+    "what should claude do instead", "do you trust",
+    "voce confia", "você confia", "trust the contents",
 )
+
+
+# Conteudo da caixa renderizado INTEIRAMENTE em SGR 2 (faint) nao e' entrada
+# humana. Medido em 2026-09-22 nos dois CLIs da malha:
+#
+#   Claude Code, sugestao do historico -> conteudo em ESC[2m
+#   Claude Code, digitado              -> sem ESC[2m
+#   Codex, placeholder da caixa vazia  -> conteudo em ESC[2m
+#   Codex, digitado                    -> sem ESC[2m
+#
+# A regra e' sobre FAINT, nao sobre "tem estilo": `/status` digitado sai
+# colorido (ESC[38;2;177;185;249m) e continua sendo entrada humana. Tambem
+# medidos sem faint: @mencao, colagem multilinha, texto simples.
+#
+# Isso substitui casar a string literal "Ask Codex to do anything", que
+# quebraria com localeOverride ou com uma mudanca de texto no upstream.
+#
+# A fonte precisa ser `visible`: `detection` e' documentado como sempre texto
+# puro (ver herdrdev/herdr#4497, fechada como comportamento documentado, e a
+# discussao #4498). `visible` acompanha o scroll do usuario, entao so vale com
+# a viewport no fim; rolada, caimos no comportamento conservador de antes.
+_FAINT_RE = re.compile(r"\x1b\[[0-9;]*2[;m]")
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+# Conteudo da caixa renderizado INTEIRAMENTE em SGR 2 (faint) nao e' entrada
+# humana. Medido em 2026-09-22 nos dois CLIs da malha, e a premissa foi
+# confirmada pelo owner sobre o unico contraexemplo vivo que apareceu
+# (`wS:p8`, "criar as tags v0.3.0 e v0.3.1", era sugestao).
+#
+#   Claude Code, sugestao -> conteudo em ESC[2m ; digitado -> sem ESC[2m
+#   Codex, placeholder    -> conteudo em ESC[2m ; digitado -> sem ESC[2m
+#
+# A regra e' sobre FAINT, nao sobre "tem estilo": `/status` digitado sai
+# colorido (ESC[38;2;177;185;249m) e continua sendo entrada humana. Tambem
+# medidos sem faint: @mencao, colagem multilinha, texto simples.
+#
+# NAO use regex para detectar faint. A primeira versao usava
+# `\x1b\[[0-9;]*2[;m]` e casava ESC[38;2;...m (truecolor), ESC[38;5;242m
+# (cor indexada) e ESC[22m (que DESLIGA intensidade): 3 de 4 falsos
+# positivos, todos liberando entrada humana. O `2` de `38;2` e' o MODO da
+# cor estendida, nao o atributo. So um parser que consome os parametros de
+# 38/48/58 distingue os dois.
+#
+# Fonte e' `visible` porque `detection` e' documentado como sempre texto puro
+# (herdrdev/herdr#4497, fechada como comportamento documentado; discussao em
+# #4498). `visible` acompanha o scroll, entao so vale com a viewport no fim.
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _faint_spans(texto):
+    """Percorre uma linha ANSI e devolve (texto_limpo, faint_por_caractere).
+
+    Consome os parametros de cor estendida (38/48/58 seguidos de 5;n ou
+    2;r;g;b) para que o `2` do modo truecolor nunca seja lido como faint.
+    """
+    limpo, marcas, faint, i = [], [], False, 0
+    for m in _SGR_RE.finditer(texto):
+        for ch in texto[i:m.start()]:
+            limpo.append(ch); marcas.append(faint)
+        params = [p for p in m.group(1).split(";")]
+        j = 0
+        while j < len(params):
+            p = params[j]
+            if p in ("38", "48", "58"):
+                modo = params[j + 1] if j + 1 < len(params) else ""
+                j += 5 if modo == "2" else 3 if modo == "5" else 1
+                continue
+            if p in ("", "0"):
+                faint = False
+            elif p == "2":
+                faint = True
+            elif p == "22":
+                faint = False
+            j += 1
+        i = m.end()
+    for ch in texto[i:]:
+        limpo.append(ch); marcas.append(faint)
+    return "".join(limpo), marcas
+
+
+# O Codex anima "sparkles" (bloco braille U+2800-U+28FF) por cima da linha da
+# caixa. Nao sao conteudo, nao sao faint, e mudam a cada frame -- entao tem que
+# sair dos dois lados antes de comparar texto e antes de exigir faint, senao o
+# placeholder do proprio Codex e' classificado como entrada humana. Ver
+# herdrdev/herdr#3988 para o mesmo ruido atrapalhando deteccao.
+def _sem_decoracao(texto):
+    return "".join(ch for ch in texto if not ("\u2800" <= ch <= "\u28ff")).strip()
+
+
+def _compose_chrome_verdict(pane_id, compose):
+    """(e_chrome, motivo): True quando a caixa contem so texto que o proprio CLI
+    desenhou (sugestao fantasma / placeholder). `motivo` diz POR QUE devolveu
+    False -- sem isso, um bloqueio de sugestao do Claude e' indistinguivel de
+    rascunho humano e ninguem consegue diagnosticar (recorrencia de 2026-10-01).
+
+    Exige que TODO caractere visivel do conteudo esteja faint -- nao um
+    prefixo. A versao anterior conferia so os 24 primeiros caracteres, entao
+    faint + 24 chars + reset + " HUMAN" passava como cromo.
+
+    Conservador por construcao: leitura que falha, linha nao localizada,
+    marcador ausente, texto que nao bate ou faint parcial devolvem False, e o
+    chamador segue tratando como possivel rascunho humano.
+    """
+    if not compose:
+        return False, "caixa vazia"
+    fonte = "visible"
+    try:
+        info = subprocess.run(herdr_argv("pane", "get", pane_id),
+                              capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+        scroll = json.loads(info.stdout)["result"]["pane"].get("scroll") or {}
+        # `visible` e' o viewport do USUARIO: rolado pra cima (copy mode, roda do
+        # mouse, e desde o `tui default` do Claude os panes TEM scrollback e ficam
+        # rolados), a caixa nao esta nele. `recent` pega as ULTIMAS linhas
+        # renderizadas do buffer, sem depender do viewport.
+        if scroll.get("offset_from_bottom", 1) == 0:
+            args = ["--source", "visible", "--format", "ansi"]
+        else:
+            fonte = "recent"
+            args = ["--source", "recent", "--format", "ansi", "--lines", "12"]
+        out = subprocess.run(herdr_argv("pane", "read", pane_id, *args),
+                             capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+        if out.returncode != 0:
+            return False, f"leitura {fonte} ansi falhou: {out.stderr.strip()[:80]}"
+    except (subprocess.TimeoutExpired, ValueError, KeyError) as exc:
+        return False, f"falha lendo scroll/pane ({type(exc).__name__})"
+
+    divergente = None
+    for linha in reversed(out.stdout.splitlines()):
+        limpo, marcas = _faint_spans(linha)
+        # O marcador da caixa e' o PRIMEIRO caractere da linha, nao o ultimo
+        # marcador nela: `rfind` cortava dentro do conteudo quando o proprio
+        # texto continha `❯`/`›` (apontado pelo rev-1 na rodada herdr-2).
+        # O corte tem que existir porque o marcador do Codex e' desenhado em
+        # ESC[1m/ESC[2m independentemente do conteudo.
+        esq = limpo.lstrip()
+        if esq[:1] not in ("❯", "›"):
+            continue
+        corte = len(limpo) - len(esq)
+        cauda, marcas = limpo[corte + 1:], marcas[corte + 1:]
+        if _sem_decoracao(cauda) != _sem_decoracao(compose):
+            divergente = divergente or _sem_decoracao(cauda)
+            continue
+        visiveis = [(ch, f) for ch, f in zip(cauda, marcas)
+                    if not ch.isspace() and not ("\u2800" <= ch <= "\u28ff")]
+        if not visiveis:
+            return False, f"[{fonte}] caixa sem caractere visivel"
+        nao_faint = "".join(ch for ch, f in visiveis if not f)
+        if nao_faint:
+            return False, (f"[{fonte}] {len(nao_faint)} de {len(visiveis)} caracteres NAO "
+                           f"estao em faint (ex.: {nao_faint[:12]!r}); ansi={linha[:140]!r}")
+        return True, f"[{fonte}] sugestao/placeholder inteiro em faint"
+    if divergente is not None:
+        return False, (f"[{fonte}] texto na tela difere do detection: "
+                       f"tela={divergente[:50]!r} detection={compose[:50]!r}")
+    return False, f"[{fonte}] linha da caixa nao localizada nas leituras ansi"
+
+
+def _compose_is_rendered_chrome(pane_id, compose):
+    return _compose_chrome_verdict(pane_id, compose)[0]
+
+
+def _log_compose_block(pane_id, compose, motivo):
+    """Registra cada bloqueio por composicao (o erro so aparece no terminal de quem
+    chamou e some). Falha de escrita nunca atrapalha o dispatch."""
+    try:
+        d = os.environ.get("HERDR_MESH_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".local", "state", "herdr-mesh")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "compose-guard.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "pane": pane_id,
+                                "compose": compose[:200], "motivo": motivo}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def classify_composition(pane_id, lines=12):
+    """Classifica o que ha na caixa de composicao de um pane, para um agent decidir
+    se pode enviar. Devolve (tipo, texto, motivo):
+      vazia | placeholder | sugestao | humano | dialogo | indeterminado
+    `sugestao` = texto que o proprio CLI desenhou em faint (autosuggest do Claude
+    Code): NAO e' entrada humana, some quando o texto novo e' digitado. Um modelo
+    que le o pane com `herdr pane read` puro nao ve o faint e trata a sugestao como
+    rascunho (strata-exec, 2026-10-01: produto parado 8 min esperando confirmacao)."""
+    try:
+        out = subprocess.run(
+            herdr_argv("pane", "read", pane_id, "--source", "detection", "--lines", str(lines)),
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "indeterminado", "", "timeout lendo o pane"
+    if out.returncode != 0:
+        return "indeterminado", "", f"falha lendo o pane: {out.stderr.strip()[:80]}"
+    text = out.stdout
+    lowered = "\n".join(text.splitlines()[-8:]).lower()
+    for marker in _PENDING_MARKERS:
+        if marker in lowered:
+            return "dialogo", "", f"marcador {marker!r}"
+    compose = None
+    for line in text.splitlines():
+        m = _COMPOSE_LINE_RE.match(line.strip())
+        if m:
+            compose = (m.group(2) or "").strip()
+    if not compose:
+        return "vazia", "", "caixa sem texto"
+    if compose.casefold() in _COMPOSE_PLACEHOLDERS:
+        return "placeholder", compose, "placeholder do proprio CLI"
+    e_chrome, motivo = _compose_chrome_verdict(pane_id, compose)
+    return ("sugestao" if e_chrome else "humano"), compose, motivo
 
 
 def pane_looks_busy_with_human_input(pane_id, lines=12, *, check_composition=True):
@@ -816,7 +1116,11 @@ def pane_looks_busy_with_human_input(pane_id, lines=12, *, check_composition=Tru
         if m:
             compose = (m.group(2) or "").strip()
     if check_composition and compose and compose.casefold() not in _COMPOSE_PLACEHOLDERS:
-        return True, f"caixa de composição parece ter texto não enviado: {compose[:80]!r}"
+        e_chrome, motivo = _compose_chrome_verdict(pane_id, compose)
+        if not e_chrome:
+            _log_compose_block(pane_id, compose, motivo)
+            return True, (f"caixa de composição parece ter texto não enviado: {compose[:80]!r} "
+                          f"[diag: {motivo[:170]}]")
     # Diálogos ficam no fim do buffer; restringir a janela evita que uma
     # palavra como "interrupted" de uma resposta antiga arme o guard.
     lowered = "\n".join(text.splitlines()[-8:]).lower()
@@ -929,7 +1233,7 @@ def _dispatch_observe(name, expected, *, check_composition=True,
             expected=_dispatch_state_view(expected),
             observed=_dispatch_state_view(observed),
         )
-    status = observed.get("agent_status")
+    status = effective_status(observed)
     allowed_statuses = ("idle", "done", "working") if allow_working else ("idle", "done")
     if status not in allowed_statuses:
         raise DispatchPreflightError(
@@ -2061,6 +2365,12 @@ def reset_reviewer_context(name, timeout_s=1200):
     records that comparison as evidence, preserving the operational behavior
     that avoids the old cleanup-induced aborts.
     """
+    if not AUTOMATIC_REVIEWER_RESET:
+        raise ContextResetError(
+            "reset automático desativado; use herdr-swap para recriar o pane",
+            agent=name,
+            phase="policy",
+        )
     evidence = {"runtime_before": None, "runtime_after": None, "phase": "start"}
     try:
         return _reset_reviewer_context(name, timeout_s, _evidence=evidence)
@@ -2188,6 +2498,7 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
     artifact_pending = {}
     retry_preflight_observed = {}
     retry_suppressed = {}
+    codex_idle_polls = {}   # nome -> consultas seguidas com Codex ocioso + artefato pronto
 
     def prompt_chegou(name, texto):
         """O prompt aparece no pane? Usa o caminho do diretorio de veredito como
@@ -2464,6 +2775,30 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                 agent_info = get_agent_info(name)
             except RuntimeError:
                 agent_info = None
+            # Codex nunca chega a idle/done no Herdr >= 0.9.2 (#4563): o `--wait`
+            # acima so resolve no timeout, mesmo com o veredito publicado (llm37,
+            # 2026-09-30). Assenta quando o artefato obrigatorio e' novo e pronto
+            # E a tela fica ociosa por CODEX_SETTLE_POLLS consultas seguidas
+            # (autorizado pelo Breno, 2026-09-30). O artefato sozinho nao basta
+            # (o agent ainda pode estar terminando) e a tela sozinha tambem nao
+            # (foi o idle falso do #4507). Timeout continua sendo timeout.
+            if (agent_info and name in required_artifacts
+                    and inferir_idle(agent_info, _read_detection_screen)):
+                artifact = _artifact_changed_and_ready(
+                    required_artifacts[name], artifact_baseline[name]
+                )
+                codex_idle_polls[name] = codex_idle_polls.get(name, 0) + 1 if artifact else 0
+                if artifact and codex_idle_polls[name] >= CODEX_SETTLE_POLLS:
+                    proc.kill()
+                    proc.wait()
+                    detail = dict(agent_info)
+                    detail["required_artifact"] = artifact
+                    detail["settled_by"] = "codex_artifact_and_screen"
+                    detail["lifecycle_settle_ts"] = now_iso()
+                    finish(name, "idle", detail)
+                    continue
+            else:
+                codex_idle_polls[name] = 0
             if agent_info and agent_info["agent_status"] == "blocked":
                 if blocked_since[name] is None:
                     blocked_since[name] = time.time()

@@ -118,6 +118,13 @@ class ContextWatchTests(unittest.TestCase):
         self.assertEqual(result["context"]["left_percent"], 96.0)
         self.assertTrue(result["status_probe"]["attempted"])
 
+    def test_default_run_is_passive(self):
+        with mock.patch.object(self.watch, "target_names", return_value=[]), \
+             mock.patch.object(self.watch, "observe_agent") as observe:
+            payload = self.watch.run_once("demo", 20)
+        self.assertFalse(payload["status_probe"])
+        observe.assert_not_called()
+
     def test_metadata_change_discards_measurement(self):
         before = _info(seq=10)
         after = _info(seq=11)

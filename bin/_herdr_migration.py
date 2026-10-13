@@ -526,5 +526,10 @@ def extra_args_for_rev2(kind):
         # par, continua intacta; o que se perde e' profundidade de raciocinio no
         # segundo revisor. Decisao de custo consciente, revisitavel quando o
         # limite resetar.
-        return ["--model", "opus-5", "--effort", "low"]
+        # 2026-09-29: matriz nova (pedido do Breno) - Opus 5.5 xhigh.
+        # 2026-10-06 (Breno): rev-2 Claude de xhigh para HIGH.
+        return ["--model", "claude-opus-5-5", "--effort", "high"]
+    if kind == "codex":
+        # 2026-09-29: rev-2 Codex ganha perfil proprio (antes caia em []).
+        return ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=xhigh"]
     return []

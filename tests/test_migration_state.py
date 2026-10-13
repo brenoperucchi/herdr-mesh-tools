@@ -448,7 +448,7 @@ class MigrationStateTests(unittest.TestCase):
         # profundidade no segundo revisor. Ver extra_args_for_rev2.
         self.assertEqual(
             self.migration.extra_args_for_rev2("claude"),
-            ["--model", "opus-5", "--effort", "low"],
+            ["--model", "claude-opus-5-5", "--effort", "high"],
         )
 
     def test_extra_args_for_rev2_grok_gets_no_flags(self):
@@ -533,7 +533,7 @@ class BootstrapRevAgentsTests(unittest.TestCase):
         agents = self.bootstrap.build_rev_agents("foo", self.cwd)
         rev2 = next(a for a in agents if a[0] == "foo-rev-2")
         self.assertEqual(rev2[1], "claude")
-        self.assertEqual(rev2[2], ["--model", "opus-5", "--effort", "low"])
+        self.assertEqual(rev2[2], ["--model", "claude-opus-5-5", "--effort", "high"])
 
 
 class MigrateRevGiveUpTests(unittest.TestCase):

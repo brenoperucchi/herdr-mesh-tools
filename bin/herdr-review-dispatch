@@ -330,9 +330,10 @@ def main():
         print(f"erro: recuperação automática dos revisores obrigatórios falhou: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    validated_info = {}
     try:
         for name in (rev_name, rev2_name):
-            validate_agent_project(name, cwd)
+            validated_info[name] = validate_agent_project(name, cwd)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -366,7 +367,7 @@ def main():
     else:
         for name in (rev_name, rev2_name):
             try:
-                status = agent_status(name)
+                status = core.effective_agent_status(name)
             except RuntimeError as exc:
                 print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
                 sys.exit(1)
@@ -432,7 +433,10 @@ def main():
     dispatched = {}
     for name in target_names:
         try:
-            pre_info[name] = get_agent_info(name)
+            # Reuse the snapshot that passed project validation. A second,
+            # unvalidated read here could baseline a pane after it changed
+            # project between validation and prompt dispatch.
+            pre_info[name] = validated_info[name]
             runtime_before[name] = runtime_profile_evidence(name, pre_info[name])
             dispatched[name] = True
         except RuntimeError as exc:

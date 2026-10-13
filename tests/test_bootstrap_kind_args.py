@@ -120,14 +120,11 @@ class BootstrapKindArgsTests(unittest.TestCase):
     def test_todo_papel_usa_modelo_permitido_pela_matriz(self):
         """A matriz normativa valida somente o modelo por papel.
 
-        ``llm-scout`` é uma exceção operacional Need you e permanece no perfil
-        manual gpt-5.6-sol/xhigh até decisão explícita do owner.
+        Sem excecoes: o `llm-scout` deixou de ser um perfil manual (gpt-5.6-sol/xhigh) em
+        2026-10-05, por decisao do owner, e segue o padrao da tabela como os demais.
         """
         for nome, kind, args in _papeis():
             with self.subTest(papel=nome):
-                if nome == "llm-scout":
-                    self.assertEqual(_modelo(args), "gpt-5.6-sol")
-                    continue
                 papel = _papel(nome)
                 self.assertIsNotNone(papel, nome)
                 modelo = _modelo_canonico(_modelo(args))
@@ -137,8 +134,6 @@ class BootstrapKindArgsTests(unittest.TestCase):
     def test_reasoning_args_nao_criam_uma_segunda_dimensao_de_modelo(self):
         """O effort pode variar sem tornar o modelo fora da matriz."""
         for nome, _kind, args in _papeis():
-            if nome == "llm-scout":
-                continue
             papel = _papel(nome)
             modelo = _modelo_canonico(_modelo(args))
             self.assertIn(modelo, boot.ALLOWED_MODELS_BY_ROLE[papel])

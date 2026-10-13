@@ -16,3 +16,8 @@ venv/
 # dagr runtime state and local swap copies are machine/session artifacts.
 .dagr/
 bin/herdr-swap.backup-*
+
+# Documentos internos do ambiente do Breno (so locais).
+docs/review-groups.md
+docs/orchestration-review-20260920.md
+docs/idle-swap-simulation-herdr-simulation.md

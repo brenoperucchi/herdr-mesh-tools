@@ -47,6 +47,34 @@ class AgentRestoreTests(unittest.TestCase):
             "state_change_seq": 1,
         }
 
+    def _flags_para(self, missing):
+        captured = []
+
+        def get(name):
+            if name in missing and not captured:
+                raise RuntimeError(f"agent target {name}: agent_not_found")
+            return self._info(name)
+
+        def run(command, **kwargs):
+            captured.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+        with mock.patch.object(self.core, "get_agent_info", side_effect=get), \
+             mock.patch.object(self.core.subprocess, "run", side_effect=run), \
+             mock.patch.object(self.core.time, "sleep"):
+            self.core.ensure_required_agents("homehub", self.tmpdir.name, sorted(missing))
+        return captured[0]
+
+    def test_so_revisor_ausente_nao_liga_o_scout(self):
+        cmd = self._flags_para({"homehub-rev-1", "homehub-rev-2"})
+        self.assertIn("--with-reviewers", cmd)
+        self.assertNotIn("--with-scout", cmd)
+
+    def test_so_scout_ausente_nao_liga_revisores(self):
+        cmd = self._flags_para({"homehub-scout"})
+        self.assertIn("--with-scout", cmd)
+        self.assertNotIn("--with-reviewers", cmd)
+
     def test_missing_roles_are_bootstrapped_once_and_reobserved(self):
         missing = {"homehub-scout", "homehub-rev-2"}
         booted = {"value": False}
@@ -60,7 +88,7 @@ class AgentRestoreTests(unittest.TestCase):
 
         def run(command, **kwargs):
             booted["value"] = True
-            self.assertEqual(command[-2:], ["--slug", "homehub"])
+            self.assertEqual(command[-4:], ["--slug", "homehub", "--with-reviewers", "--with-scout"])
             self.assertEqual(kwargs["cwd"], self.tmpdir.name)
             return subprocess.CompletedProcess(command, 0, stdout="HomeHub restaurado\n", stderr="")
 
@@ -111,7 +139,7 @@ class AgentRestoreTests(unittest.TestCase):
         boot = _load("herdr-bootstrap", "herdr_bootstrap_agent_restore_rev2")
         rev2 = next(item for item in boot.build_rev_agents("homehub", self.tmpdir.name)
                     if item[0] == "homehub-rev-2")
-        self.assertEqual(rev2[2], ["--model", "opus-5", "--effort", "low"])
+        self.assertEqual(rev2[2], ["--model", "claude-opus-5-5", "--effort", "low"])
 
     def test_unnamed_scout_pane_is_a_base_not_a_new_default_agent(self):
         boot = _load("herdr-bootstrap", "herdr_bootstrap_agent_restore_base")

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Simula, sem tocar no Herdr, um swap periódico condicionado a idle/done.
+
+Este é um modelo de decisão para o space descartável ``herdr-simulation``.
+Não chama a CLI, não lê panes e não escreve estado de produção. A simulação
+exige identidade estável e a mesma sequência no checkpoint e na confirmação;
+qualquer trabalho em andamento ou corrida devolve defer/abort.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass
+
+
+@dataclass(frozen=True)
+class Pane:
+    name: str
+    pane_id: str
+    workspace_id: str
+    tab_id: str
+    cwd: str
+    session: str
+    kind: str
+    model: str | None
+    reasoning_effort: str | None
+    status: str
+    state_change_seq: int
+
+
+IDENTITY_FIELDS = ("name", "pane_id", "workspace_id", "tab_id", "cwd", "session", "kind")
+
+
+def _identity(pane: Pane) -> tuple:
+    return tuple(getattr(pane, field) for field in IDENTITY_FIELDS)
+
+
+def periodic_swap_decision(checkpoint: Pane, current: Pane) -> dict:
+    """Return the safe decision for one idle-only scheduler tick.
+
+    ``ready`` means that an external coordinator may start the normal
+    two-phase swap. It does not close a pane. ``defer`` leaves working panes
+    untouched; ``abort`` preserves both panes after a race or identity change.
+    """
+    base = {
+        "agent": checkpoint.name,
+        "model": checkpoint.model,
+        "reasoning_effort": checkpoint.reasoning_effort,
+        "observed_profile": True,
+        "mutations": [],
+    }
+    if current.status not in {"idle", "done"}:
+        return {**base, "decision": "defer", "reason": "agent_not_terminal"}
+    if _identity(checkpoint) != _identity(current):
+        return {**base, "decision": "abort", "reason": "identity_changed"}
+    if checkpoint.state_change_seq != current.state_change_seq:
+        return {**base, "decision": "abort", "reason": "state_change_seq_changed"}
+    return {**base, "decision": "ready", "reason": "idle_checkpoint_stable"}
+
+
+def simulation_cases() -> list[dict]:
+    """Produce deterministic cases used by the CLI and regression tests."""
+    base = Pane(
+        name="herdr-simulation-rev-1", pane_id="wS:p2", workspace_id="wS",
+        tab_id="wS:t1", cwd="/home/brenoperucchi/Devs/herdr-simulation",
+        session="session-1", kind="codex", model="gpt-6-astra",
+        reasoning_effort="low", status="idle", state_change_seq=40,
+    )
+    return [
+        {"case": "working_defer", "result": periodic_swap_decision(
+            base, Pane(**{**asdict(base), "status": "working"}))},
+        {"case": "idle_stable_ready", "result": periodic_swap_decision(base, base)},
+        {"case": "idle_race_abort", "result": periodic_swap_decision(
+            base, Pane(**{**asdict(base), "state_change_seq": 41}))},
+        {"case": "identity_race_abort", "result": periodic_swap_decision(
+            base, Pane(**{**asdict(base), "session": "session-2"}))},
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--space", default="herdr-simulation",
+                        help="label apenas documental da simulação")
+    parser.add_argument("--json", action="store_true", help="imprime JSON")
+    args = parser.parse_args(argv)
+    payload = {
+        "schema_version": 1,
+        "space": args.space,
+        "offline": True,
+        "cases": simulation_cases(),
+        "conclusion": "only idle/done with stable identity and sequence is ready",
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"space simulado: {args.space} (offline; nenhum pane foi tocado)")
+        for case in payload["cases"]:
+            result = case["result"]
+            print(f"{case['case']}: {result['decision']} ({result['reason']})")
+        print(payload["conclusion"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

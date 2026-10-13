@@ -5,6 +5,12 @@ herdr-bootstrap e deixa o bootstrap criar tudo.
     herdr-add-space omasession ~/Devs/omasession --note "plugin de restauracao de sessao"
     herdr-add-space HomeHub ~/Devs/HomeHub --no-scout --note "sem scout: pedido do usuario"
 
+Todo space entra no inventario (--categoria obrigatoria, ver ~/Devs/inventory/config/
+categories.json) e SO entra no foco do Guardian com --guardian:
+
+    herdr-add-space foo ~/Devs/foo --lean --categoria SaaS --note "..."              # so inventario
+    herdr-add-space foo ~/Devs/foo --lean --categoria SaaS --guardian --note "..."   # + Guardian
+
 NAO cria workspace/panes/agents por conta propria. Escreve a entrada na tabela
 e chama `herdr-bootstrap`, que ja e' idempotente, ja deriva os revisores do
 slug (REV_EFFORT/REV_OVERRIDES), ja lida com a migracao rev->rev-1 e ja arma o
@@ -20,7 +26,10 @@ isso a ausencia dele deixa um TODO visivel em vez de uma entrada muda.
 import argparse
 import ast
 import datetime
+import glob
+import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -79,7 +88,7 @@ def existing_labels(source):
     return labels
 
 
-def render_entry(label, cwd, slug, exec_kind, scout_kind, note):
+def render_entry(label, cwd, slug, exec_kind, scout_kind, note, lean=False):
     """The tuple as it will read in the file, comment first."""
     today = datetime.date.today().isoformat()
     lines = []
@@ -111,7 +120,7 @@ def render_entry(label, cwd, slug, exec_kind, scout_kind, note):
         if kind == "codex":
             return "SCOUT_ARGS" if role == "scout" else "EXEC_ARGS_CODEX"
         if kind == "claude":
-            return "EXEC_ARGS"
+            return "SCOUT_ARGS_CLAUDE" if role == "scout" else "EXEC_ARGS"
         # Kinds without a shared model/effort profile (for example grok) keep
         # their native defaults; they are not silently given flags from a
         # different CLI family.
@@ -120,11 +129,323 @@ def render_entry(label, cwd, slug, exec_kind, scout_kind, note):
     exec_args = profile_expr(exec_kind, "exec")
     scout_part = (f'("{slug}-scout", "{scout_kind}", '
                   f'{profile_expr(scout_kind, "scout")})' if scout_kind else "None")
-    slug_part = f', "{slug}"' if slug != label.lower() else ""
+    # `lean` e' o 6o elemento da tupla e exige o slug explicito (5o), mesmo igual ao label.
+    slug_part = f', "{slug}"' if (slug != label.lower() or lean) else ""
+    if lean:
+        slug_part += ', {"lean": True}'
 
     lines.append(f'    ("{label}", {cwd_expr}, ("{exec_name}", "{exec_kind}", {exec_args}),')
     lines.append(f"        {scout_part}{slug_part}),")
     return "\n".join(lines) + "\n"
+
+
+# --- passos pos-bootstrap ------------------------------------------------
+#
+# Os tres abaixo nasceram de um space criado a mao em 2026-09-22 e sao
+# deliberadamente IDEMPOTENTES: cada um checa o estado antes de agir e nao
+# falha a criacao do space se nao conseguir. Um space meio criado e' pior que
+# um passo opcional que avisou e seguiu.
+
+
+def ensure_git(cwd):
+    """`git init` so quando o cwd AINDA NAO e' repo.
+
+    Nunca sobrescreve nada. Um .gitignore pre-existente e' preservado e as
+    entradas do Herdr sao ANEXADAS -- reescrever o arquivo de um projeto ja
+    existente (ex.: um app Rails) apaga as regras dele, inclusive as que
+    protegem segredo como config/master.key.
+    """
+    # `isdir(.git)` nao reconhece worktree (onde .git e' ARQUIVO) nem um
+    # subdiretorio de repo; `git rev-parse` reconhece os dois.
+    dentro = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                            cwd=cwd, capture_output=True, text=True)
+    if dentro.returncode == 0 and dentro.stdout.strip() == "true":
+        print(f"herdr-add-space: {cwd} ja esta sob git, nao toquei")
+    else:
+        r = subprocess.run(["git", "init", "-q"], cwd=cwd,
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"herdr-add-space: aviso: `git init` falhou ({r.stderr.strip()}); seguindo")
+            return
+        print(f"herdr-add-space: git init em {cwd}")
+
+    # Comparar REGRAS efetivas, nao a substring ".herdr/": um .gitignore que
+    # so MENCIONA .herdr num comentario, ou que cobre apenas uma das regras,
+    # fazia a funcao desistir e deixar o resto desprotegido.
+    gi = os.path.join(cwd, ".gitignore")
+    atual = ""
+    if os.path.exists(gi):
+        try:
+            with open(gi, encoding="utf-8") as fh:
+                atual = fh.read()
+        except OSError as exc:
+            print(f"herdr-add-space: aviso: nao li {gi} ({exc}); seguindo")
+            return
+    vigentes = {l.strip().lstrip("/") for l in atual.splitlines()
+                if l.strip() and not l.lstrip().startswith("#")}
+    if ".herdr/" in vigentes or ".herdr" in vigentes:
+        return  # regra abrangente ja cobre tudo
+    querem = ["/.herdr/review/", "/.herdr/ask/", "/.herdr/handoff/",
+              "/.herdr/migration.lock", "/.herdr/migration-state.json"]
+    faltam = [r for r in querem if r.lstrip("/") not in vigentes]
+    if not faltam:
+        return
+    bloco = ("\n# Artefatos locais do Herdr. Snapshots de revisao e estado de\n"
+             "# migracao nascem por rodada e nao devem versionar.\n"
+             + "\n".join(faltam) + "\n")
+    try:
+        with open(gi, "a", encoding="utf-8") as fh:
+            fh.write(bloco)
+    except OSError as exc:
+        print(f"herdr-add-space: aviso: nao escrevi {gi} ({exc}); seguindo")
+        return
+    print(f"herdr-add-space: {len(faltam)} regra(s) do Herdr anexada(s) em {gi}")
+
+
+def _hargv(*args):
+    """`herdr` com `--session` na frente quando HERDR_SESSION estiver setada.
+
+    Sem isto, estes passos consultavam e MUTAVAM o endpoint padrao enquanto o
+    resto do fluxo operava numa sessao nomeada -- com labels coincidentes,
+    abririam e renomeariam tab no workspace errado. Apontado pelos dois
+    revisores na rodada herdr-2. `HERDR_SESSION` sozinha nao isola nada: ver
+    herdr_argv em _herdr_dispatch.py.
+    """
+    sess = os.environ.get("HERDR_SESSION")
+    return ["herdr", *(["--session", sess] if sess else []), *args]
+
+
+def ensure_openboard(label):
+    """Tab `OpenBoard` com o board do plugin herdr-tsk.
+
+    NAO e' um agent. Escrito assim depois de eu criar, duas vezes, um pane
+    com Claude chamado `<slug>-onboard` -- "onboard" aqui sempre foi a acao
+    `open-board` do plugin de tarefas, que e' um pane de plugin sem agent
+    nenhum (`agent_status: unknown`). Convencao confirmada nos 13 workspaces
+    que ja tinham: um pane de label `tsk`, sozinho numa tab chamada
+    `OpenBoard`.
+    """
+    ws = workspace_id_por_label(label)
+    if not ws:
+        print(f"herdr-add-space: aviso: workspace de '{label}' nao encontrado; OpenBoard nao aberto")
+        return
+    panes = subprocess.run(_hargv("pane", "list"), capture_output=True, text=True)
+    for linha in panes.stdout.splitlines():
+        try:
+            dados = json.loads(linha)
+        except ValueError:
+            continue
+        for pane in dados.get("result", {}).get("panes", []):
+            if pane.get("label") == "tsk" and str(pane.get("pane_id", "")).startswith(ws + ":"):
+                print(f"herdr-add-space: OpenBoard ja existe em {pane['pane_id']}, pulando")
+                return
+    aberto = subprocess.run(
+        _hargv("plugin", "pane", "open", "--plugin", "herdr-tsk",
+               "--entrypoint", "board", "--placement", "tab", "--workspace", ws),
+        capture_output=True, text=True)
+    try:
+        tab = json.loads(aberto.stdout)["result"]["plugin_pane"]["pane"]["tab_id"]
+    except (ValueError, KeyError):
+        print(f"herdr-add-space: aviso: nao abri o board do tsk "
+              f"({aberto.stderr.strip() or aberto.stdout.strip()})")
+        return
+    subprocess.run(_hargv("tab", "rename", tab, "OpenBoard"),
+                   capture_output=True, text=True)
+    print(f"herdr-add-space: tab OpenBoard em {tab} (board do tsk)")
+
+
+def workspace_id_por_label(label):
+    r = subprocess.run(_hargv("workspace", "list"), capture_output=True, text=True)
+    for linha in r.stdout.splitlines():
+        try:
+            dados = json.loads(linha)
+        except ValueError:
+            continue
+        for ws in dados.get("result", {}).get("workspaces", []):
+            if ws.get("label") == label:
+                return ws.get("workspace_id")
+    return None
+
+
+def ensure_board(cwd):
+    """Projeto correspondente no board do tsk.
+
+    O tsk so cria destino novo a partir de um DIRETORIO ABSOLUTO existente, e
+    nomeia o projeto pelo basename da raiz do repo -- por isso este passo vem
+    depois do ensure_git. Um `-p <nome>` solto e' recusado com unknown-project.
+    """
+    tsk = shutil.which("tsk") or next(
+        (c for c in glob.glob(os.path.expanduser(
+            "~/.config/herdr/plugins/github/herdr-tsk-*/target/release/tsk"))
+         if os.access(c, os.X_OK)), None)
+    if not tsk:
+        print("herdr-add-space: binario do `tsk` nao encontrado; board nao criado")
+        return
+    nome = os.path.basename(cwd.rstrip("/"))
+    # stdout vazio NAO prova ausencia de projeto: uma task ancora fechada ou
+    # arquivada some das views vivas e a funcao recriaria outra a cada
+    # execucao. `--done`/`--archived` cobrem esses estados; um list que FALHA
+    # (returncode != 0) nao autoriza criar nada.
+    visto = False
+    for extra in ([], ["--done"], ["--archived"]):
+        r = subprocess.run([tsk, "list", "-p", nome, *extra],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            saida = (r.stdout or r.stderr or "").strip()
+            if "unknown-project" in saida:
+                continue  # projeto realmente nao existe; segue pra criar
+            print(f"herdr-add-space: aviso: `tsk list` falhou ({saida[:80]}); "
+                  f"board nao criado")
+            return
+        if r.stdout.strip():
+            visto = True
+            break
+    if visto:
+        print(f"herdr-add-space: board '{nome}' ja existe, pulando")
+        return
+    r = subprocess.run(
+        [tsk, "add", "-t", f"Bootstrap do space {nome}",
+         "-n", "Task ancora criada por herdr-add-space: ela e' o que faz o "
+               "projeto existir no board do tsk. NAO arquive esta task -- o "
+               "projeto so existe enquanto tiver ao menos uma.",
+         "-p", cwd, "--json"], capture_output=True, text=True)
+    print(f"herdr-add-space: board '{nome}' criado no tsk"
+          if r.returncode == 0 else
+          f"herdr-add-space: aviso: nao criei o board ({r.stdout.strip() or r.stderr.strip()})")
+
+
+# --- registro no inventario e no Guardian -----------------------------------
+#
+# Todo space novo ENTRA no inventario (catalogo de projetos, http://127.0.0.1:8088/inventory/)
+# e so entra no Guardian com --guardian. O inventario descobre o space sozinho pelo cwd do
+# pane `<slug>-exec`, mas sem linha em categories.json o projeto cai em "outros"; por isso a
+# categoria e' obrigatoria aqui. Os arquivos sao de outros projetos (inventory e claude-bridge):
+# a edicao e' uma linha de texto por vez, atomica, sem reformatar o resto -- ha mudancas
+# sem commit de outros agents nesses repositorios e um dump do json as reescreveria.
+
+INVENTORY_DIR = os.path.realpath(os.path.expanduser(
+    os.environ.get("HERDR_INVENTORY_DIR") or "~/Devs/inventory"))
+GUARDIAN_FASES = os.path.realpath(os.path.expanduser(
+    os.environ.get("HERDR_GUARDIAN_FASES") or "~/Devs/claude-bridge/guardian/visao-fases.json"))
+# Em teste (qualquer override) os coletores reais nao rodam.
+_REGISTROS_ISOLADOS = bool(os.environ.get("HERDR_INVENTORY_DIR")
+                           or os.environ.get("HERDR_GUARDIAN_FASES"))
+
+
+def categorias_validas():
+    """Categorias declaradas no inventario; [] se o arquivo nao pode ser lido."""
+    try:
+        with open(os.path.join(INVENTORY_DIR, "config", "categories.json"), encoding="utf-8") as fh:
+            return list(json.load(fh).get("categories", []))
+    except (OSError, ValueError):
+        return []
+
+
+def inserir_membro(texto, abre, fecha_re, linha):
+    """Insere `linha` como ultimo membro do bloco aberto por `abre` (substring de uma linha;
+    None = objeto de topo). Mexe so nessa linha e na virgula do membro anterior."""
+    linhas = texto.splitlines(keepends=True)
+    inicio = 0
+    if abre is not None:
+        achou = [i for i, l in enumerate(linhas) if abre in l]
+        if len(achou) != 1:
+            raise ValueError(f"bloco {abre!r} encontrado {len(achou)} vez(es)")
+        inicio = achou[0]
+    fecho = next((i for i in range(inicio + 1, len(linhas))
+                  if re.match(fecha_re, linhas[i])), None)
+    if fecho is None:
+        raise ValueError(f"nao achei o fim do bloco {abre!r}")
+    ant = next((i for i in range(fecho - 1, inicio - 1, -1) if linhas[i].strip()), None)
+    if ant is not None:
+        corpo = linhas[ant].rstrip("\n").rstrip()
+        if not corpo.endswith((",", "{", "[")):
+            linhas[ant] = corpo + ",\n"
+    linhas.insert(fecho, linha.rstrip("\n") + "\n")
+    return "".join(linhas)
+
+
+def _gravar_atomico(caminho, texto):
+    tmp = caminho + ".herdr-tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(texto)
+    os.chmod(tmp, os.stat(caminho).st_mode & 0o7777)
+    os.replace(tmp, caminho)
+
+
+def _chave_inventario(cwd):
+    return "~" + cwd[len(HOME):] if cwd.startswith(HOME + "/") else cwd
+
+
+def registrar_inventario(cwd, categoria, descricao):
+    """categories.json (obrigatorio) e projects.json (so com descricao). Idempotente."""
+    chave = _chave_inventario(cwd)
+    cat_path = os.path.join(INVENTORY_DIR, "config", "categories.json")
+    texto = open(cat_path, encoding="utf-8").read()
+    if chave in json.loads(texto)["projects"]:
+        print(f"herdr-add-space: inventario: {chave} ja tem categoria, nao toquei")
+    else:
+        novo = inserir_membro(texto, '"projects": {', r"^  \},?\s*$",
+                              f"    {json.dumps(chave, ensure_ascii=False)}: "
+                              f"{json.dumps([categoria], ensure_ascii=False)}")
+        if json.loads(novo)["projects"].get(chave) != [categoria]:
+            raise ValueError("a insercao em categories.json nao reproduziu a entrada")
+        _gravar_atomico(cat_path, novo)
+        print(f"herdr-add-space: inventario: {chave} -> [{categoria}] em {cat_path}")
+    if not descricao:
+        return
+    desc_path = os.path.join(INVENTORY_DIR, "config", "projects.json")
+    texto = open(desc_path, encoding="utf-8").read()
+    if chave in json.loads(texto):
+        print(f"herdr-add-space: inventario: {chave} ja tem descricao, nao toquei")
+        return
+    novo = inserir_membro(texto, None, r"^\}\s*$",
+                          f"  {json.dumps(chave, ensure_ascii=False)}: "
+                          f"{json.dumps(descricao, ensure_ascii=False)}")
+    if json.loads(novo).get(chave) != descricao:
+        raise ValueError("a insercao em projects.json nao reproduziu a entrada")
+    _gravar_atomico(desc_path, novo)
+    print(f"herdr-add-space: inventario: descricao de {chave} em {desc_path}")
+
+
+def atualizar_catalogo():
+    """Refaz a lista de projetos do inventario agora (leitura; o timer faria depois)."""
+    if _REGISTROS_ISOLADOS:
+        return
+    for script in ("collector/linux/projects.py", "collector/export.py"):
+        r = subprocess.run([sys.executable, os.path.join(INVENTORY_DIR, script)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"herdr-add-space: aviso: {script} falhou ({r.stderr.strip()[-120:]}); "
+                  f"o timer do inventario refaz")
+            return
+    print("herdr-add-space: inventario: catalogo de projetos atualizado")
+
+
+def foco_do_guardian():
+    with open(GUARDIAN_FASES, encoding="utf-8") as fh:
+        return json.load(fh).get("foco", [])
+
+
+def registrar_guardian(exec_name, quer):
+    """`--guardian` poe `<slug>-exec` em `foco` de visao-fases.json; sem a flag NAO poe.
+    Nunca tira ninguem de la: quem ja estava la foi decisao do Breno / claude-bridge-exec."""
+    foco = foco_do_guardian()
+    if not quer:
+        if exec_name in foco:
+            print(f"herdr-add-space: aviso: {exec_name} JA esta no foco do Guardian "
+                  f"({GUARDIAN_FASES}) e voce nao passou --guardian; nao removi")
+        else:
+            print("herdr-add-space: Guardian: fora do foco (sem --guardian)")
+        return
+    if exec_name in foco:
+        print(f"herdr-add-space: Guardian: {exec_name} ja esta no foco")
+        return
+    texto = open(GUARDIAN_FASES, encoding="utf-8").read()
+    novo = inserir_membro(texto, '"foco": [', r"^  \],?\s*$", f'    "{exec_name}"')
+    if exec_name not in json.loads(novo).get("foco", []):
+        raise ValueError("a insercao em visao-fases.json nao reproduziu a entrada")
+    _gravar_atomico(GUARDIAN_FASES, novo)
+    print(f"herdr-add-space: Guardian: {exec_name} entrou no foco em {GUARDIAN_FASES}")
 
 
 def main():
@@ -139,6 +460,24 @@ def main():
     ap.add_argument("--note", default="",
                     help="por que este space existe. Sem isso fica um TODO no arquivo.")
     ap.add_argument("--no-scout", action="store_true", help="space sem scout")
+    ap.add_argument("--lean", action="store_true",
+                    help="space enxuto: so o exec sobe; revisores e scout ficam declarados "
+                         "na tabela e sobem sob demanda (dispatchers). Poupa memoria.")
+    ap.add_argument("--no-openboard", action="store_true",
+                    help="nao abre a tab OpenBoard com o board do tsk")
+    ap.add_argument("--no-git", action="store_true",
+                    help="nao roda `git init` num cwd que ainda nao e' repo")
+    ap.add_argument("--no-board", action="store_true",
+                    help="nao cria o projeto correspondente no board do tsk")
+    ap.add_argument("--categoria", default=None,
+                    help="categoria do projeto no inventario (obrigatoria; ver categories.json "
+                         "em ~/Devs/inventory/config). O space SEMPRE entra no inventario.")
+    ap.add_argument("--descricao", default=None,
+                    help="descricao curta no inventario (default: o --note). So e' usada se o "
+                         "README do projeto nao serve; vai em config/projects.json")
+    ap.add_argument("--guardian", action="store_true",
+                    help="poe o exec no foco do Guardian (guardian/visao-fases.json). "
+                         "SEM esta flag o space NAO entra na monitoracao do Guardian.")
     ap.add_argument("--exec-kind", default="claude")
     ap.add_argument("--scout-kind", default="codex")
     ap.add_argument("--dry-run", action="store_true",
@@ -154,6 +493,20 @@ def main():
         die(f"diretorio nao existe: {cwd}  (o bootstrap nao cria pastas)")
 
     slug = args.slug or label.lower()
+
+    # Inventario e' obrigatorio: falha ANTES de escrever qualquer coisa.
+    cats = categorias_validas()
+    if not cats:
+        die(f"nao consegui ler as categorias do inventario em {INVENTORY_DIR}/config/categories.json")
+    if not args.categoria and not args.dry_run:
+        die("--categoria e' obrigatoria: todo space entra no inventario. "
+            f"Opcoes: {', '.join(cats)}")
+    if args.categoria and args.categoria not in cats:
+        die(f"categoria '{args.categoria}' nao existe no inventario. Opcoes: {', '.join(cats)}")
+    try:
+        foco_do_guardian()
+    except (OSError, ValueError) as exc:
+        die(f"nao consegui ler o foco do Guardian em {GUARDIAN_FASES} ({exc})")
     scout_kind = None if args.no_scout else args.scout_kind
 
     session = os.environ.get("HERDR_SESSION")
@@ -178,7 +531,7 @@ def main():
         print(f"herdr-add-space: workspace '{label}' ja existe — registrando na "
               f"tabela para o bootstrap saber recria-lo (ele nao vai duplicar)")
 
-    entry = render_entry(label, cwd, slug, args.exec_kind, scout_kind, args.note)
+    entry = render_entry(label, cwd, slug, args.exec_kind, scout_kind, args.note, lean=args.lean)
     print("herdr-add-space: entrada a inserir\n", flush=True)
     print(entry, flush=True)
 
@@ -255,10 +608,35 @@ def main():
         die(f"herdr-bootstrap saiu com {rc} — a entrada ficou no arquivo, "
             f"revise e rode `herdr-bootstrap` de novo")
 
+    # Inventario sempre; Guardian so com --guardian. Falha aqui NAO desfaz o space (o bootstrap
+    # ja rodou): avisa alto e sai com codigo != 0 no fim, para ninguem achar que registrou.
+    falhas_registro = []
+    for nome, fn in (("inventario", lambda: registrar_inventario(
+                          cwd, args.categoria, args.descricao or args.note)),
+                     ("guardian", lambda: registrar_guardian(f"{slug}-exec", args.guardian))):
+        try:
+            fn()
+        except (OSError, ValueError, KeyError) as exc:
+            falhas_registro.append(nome)
+            print(f"herdr-add-space: ERRO: nao registrei no {nome}: {exc}", file=sys.stderr)
+    if "inventario" not in falhas_registro:
+        atualizar_catalogo()
+
+    if not args.no_git:
+        ensure_git(cwd)
+    if not args.no_openboard:
+        ensure_openboard(label)
+    if not args.no_board:
+        ensure_board(cwd)
+
     # Verify against herdr, not against exit codes: `herdr agent start` exits
     # non-zero when readiness detection times out even though the agent is up.
     print(f"\nherdr-add-space: agents com cwd em {cwd}\n", flush=True)
     subprocess.run(["herdr-agents", "--name", os.path.basename(cwd)])
+    if falhas_registro:
+        print(f"\nherdr-add-space: ATENCAO: space criado, mas NAO registrado em: "
+              f"{', '.join(falhas_registro)}. Corrija e registre a mao.", file=sys.stderr)
+        return 1
     return 0
 
 

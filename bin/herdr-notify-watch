@@ -10,8 +10,12 @@
 set -u
 
 name="${1:?uso: herdr-notify-watch <agent-name>}"
-log="/tmp/herdr-notify-${name}.log"
-lock="/tmp/herdr-notify-${name}.lock"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/herdr-notify"
+mkdir -p "$runtime_dir"
+chmod 700 "$runtime_dir" 2>/dev/null || true
+safe_name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')
+log="$runtime_dir/${safe_name}.log"
+lock="$runtime_dir/${safe_name}.lock"
 
 exec 9>"$lock"
 if ! flock -n 9; then

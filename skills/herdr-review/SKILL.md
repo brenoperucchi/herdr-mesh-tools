@@ -145,7 +145,9 @@ herdr-ask "$slug" --question-file /caminho/da-duvida.md \
 `herdr-ask --reviewer scout` entrega a terceira análise automática diretamente
 ao pane existente; não há reset implícito nem sonda que bloqueie por troca de
 perfil. Use `herdr-swap` antes, quando uma recriação limpa for necessária, e
-`herdr-context-watch` para medir o contexto sem enviar comandos. Model e
+`herdr-context-watch` para medir o contexto passivamente sem enviar comandos;
+uma sonda `/status` só ocorre com `--probe` explícito e qualquer falha tenta
+cancelar o diálogo com `Esc`. Model e
 reasoning capturados antes/depois são evidência; se ficarem desconhecidos ou
 diferentes, registre isso sem inventar default e sem abortar a consulta.
 

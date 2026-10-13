@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""herdr-can-send <agent|pane> [--allow-working] [--json]
+
+Responde, so lendo, se da pra mandar texto agora pra um agent sem juntar com um
+rascunho humano. Existe porque `herdr pane read` puro NAO mostra o estilo: a
+sugestao automatica do Claude Code (texto cinza depois do ❯) e um rascunho digitado
+ficam identicos, e um modelo que decide sozinho para e pergunta ao humano toda vez
+(strata-exec, 2026-10-01). Esta checagem le o estilo (SGR 2 / faint) e distingue.
+
+Saida (primeira linha) e codigo de saida:
+  0  PODE ENVIAR   caixa vazia, placeholder, ou SUGESTAO automatica (some ao digitar)
+  1  NAO ENVIE     RASCUNHO humano na caixa (enviar junta os dois textos)
+  2  NAO ENVIE     dialogo/pergunta pendente no pane
+  3  NAO ENVIE     agent working/blocked (use --allow-working se enviar assim e' ok)
+  4  INDETERMINADO falha ao ler; trate como NAO ENVIE e pergunte ao humano
+Nunca escreve no pane.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core  # noqa: E402
+
+
+def resolver(alvo):
+    try:
+        return core.get_agent_info(alvo)
+    except RuntimeError:
+        for a in core.api("agent", "list")["agents"]:
+            if a.get("pane_id") == alvo:
+                return a
+        raise
+
+
+def decidir(info, allow_working=False):
+    """(codigo, rotulo, detalhe, tipo, texto)"""
+    status = core.effective_status(info)
+    tipo, texto, motivo = core.classify_composition(info["pane_id"])
+    if tipo == "indeterminado":
+        return 4, "INDETERMINADO", motivo, tipo, texto
+    if tipo == "dialogo":
+        return 2, "NAO ENVIE", f"dialogo pendente no pane ({motivo})", tipo, texto
+    if tipo == "humano":
+        return 1, "NAO ENVIE", f"rascunho humano na caixa: {texto[:80]!r}", tipo, texto
+    if status in ("working", "blocked") and not (allow_working and status == "working"):
+        return 3, "NAO ENVIE", f"agent esta {status}", tipo, texto
+    if tipo == "sugestao":
+        detalhe = f"sugestao automatica do CLI (faint), nao e rascunho: {texto[:80]!r}; some ao enviar"
+    elif tipo == "placeholder":
+        detalhe = "placeholder do CLI, caixa vazia"
+    else:
+        detalhe = "caixa vazia"
+    return 0, "PODE ENVIAR", detalhe, tipo, texto
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Diz, so lendo, se da pra enviar texto a um agent agora.")
+    ap.add_argument("alvo", help="nome do agent ou pane_id")
+    ap.add_argument("--allow-working", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    try:
+        info = resolver(args.alvo)
+    except RuntimeError as exc:
+        print(f"INDETERMINADO: agent/pane {args.alvo!r} nao encontrado ({exc})")
+        sys.exit(4)
+    code, rotulo, detalhe, tipo, texto = decidir(info, args.allow_working)
+    if args.json:
+        print(json.dumps({"alvo": args.alvo, "pane": info["pane_id"], "pode_enviar": code == 0, "codigo": code,
+                          "tipo_caixa": tipo, "texto": texto, "status": core.effective_status(info),
+                          "detalhe": detalhe}, ensure_ascii=False))
+    else:
+        print(f"{rotulo}: {detalhe}")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

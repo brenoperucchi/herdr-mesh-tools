@@ -112,3 +112,26 @@ def atualiza(cache, nome, model, effort, origem, kind=None, quando=None):
         novo["kind"] = kind
     cache[nome] = melhor(cache.get(nome), novo)
     return cache
+
+
+# --- ultimo estado conhecido de cada agent (pane, sessao, pasta) --------------------------------
+# Quando um agent SAI (`/exit`, queda), o Herdr apaga o registro: nome, pane e sessao somem da
+# `agent list`. O `herdr-agent-restart` precisa desses dados justamente nesse momento. A sonda,
+# que ja roda por timer, os grava aqui. Nunca sobrescreve um valor com vazio.
+LEDGER_PATH = os.environ.get(
+    "HERDR_LEDGER",
+    os.path.join(os.path.dirname(CACHE_PATH), "last-agents.json"))
+
+
+def ledger_atualiza(ledger, agents, quando=None):
+    """Registra pane/kind/pasta/sessao dos agents VIVOS e nomeados. Sessao so e' trocada por uma nova."""
+    for a in agents:
+        nome = a.get("name")
+        if not nome:
+            continue
+        sid = (a.get("agent_session") or {}).get("value")
+        ant = ledger.get(nome, {})
+        ledger[nome] = {"pane": a.get("pane_id") or ant.get("pane"), "kind": a.get("agent") or ant.get("kind"),
+                        "cwd": a.get("cwd") or ant.get("cwd"), "session": sid or ant.get("session"),
+                        "visto_em": quando or agora()}
+    return ledger

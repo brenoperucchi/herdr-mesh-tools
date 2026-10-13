@@ -61,6 +61,9 @@ class PaneCompositionTests(unittest.TestCase):
 class ReviewerContextResetTests(unittest.TestCase):
     def setUp(self):
         self.core = _load()
+        # Exercise the legacy primitive explicitly; production policy remains
+        # disabled and is covered by test_disabled_reset_is_explicitly_blocked.
+        self.core.AUTOMATIC_REVIEWER_RESET = True
         self.before = {
             "agent": "codex",
             "agent_status": "idle",
@@ -72,6 +75,12 @@ class ReviewerContextResetTests(unittest.TestCase):
             **self.before,
             "agent_session": {"value": "new-session"},
         }
+
+    def test_disabled_reset_is_explicitly_blocked(self):
+        self.core.AUTOMATIC_REVIEWER_RESET = False
+        with self.assertRaisesRegex(self.core.ContextResetError, "herdr-swap") as caught:
+            self.core.reset_reviewer_context("rev")
+        self.assertEqual(caught.exception.phase, "policy")
 
     def _run(
         self,

@@ -74,7 +74,8 @@ Model e `reasoning_effort` podem ser capturados como evidência, mas não são
 permissão de despacho: diferenças, mudanças ou valores desconhecidos não
 abortam a consulta. Quando for necessária uma fronteira limpa, recrie o pane
 explicitamente com `herdr-swap`, copiando o handoff; para acompanhamento
-rotineiro use `herdr-context-watch`, que é somente leitura. Reasoning não é
+rotineiro use `herdr-context-watch`, que é somente leitura por padrão (`--probe`
+é opt-in e envia `/status`). Reasoning não é
 dimensão de seleção e nenhum default é inventado.
 
 O lifecycle do Herdr não acompanha a escrita do turno: `agent prompt --wait`

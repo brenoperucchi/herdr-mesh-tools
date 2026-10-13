@@ -233,7 +233,7 @@ def main():
 
     for name in target_names:
         try:
-            status = agent_status(name)
+            status = core.effective_agent_status(name)
         except RuntimeError as exc:
             print(f"erro: agent '{name}' não encontrado ({exc})", file=sys.stderr)
             sys.exit(1)
@@ -241,9 +241,10 @@ def main():
             print(f"erro: '{name}' está '{status}' — não vou disparar em cima de working/blocked", file=sys.stderr)
             sys.exit(1)
 
+    validated_info = {}
     try:
         for name in target_names:
-            validate_agent_project(name, cwd)
+            validated_info[name] = validate_agent_project(name, cwd)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -299,7 +300,7 @@ def main():
     dispatched = {}
     for name in target_names:
         try:
-            pre_info[name] = get_agent_info(name)
+            pre_info[name] = validated_info[name]
             runtime_before[name] = runtime_profile_evidence(name, pre_info[name])
             dispatched[name] = True
         except RuntimeError as exc:

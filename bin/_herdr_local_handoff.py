@@ -226,11 +226,17 @@ def gerar(log_path, projeto, modelo=MODELO, url=OLLAMA_URL, timeout=900):
         "prompt_chars": len(prompt),
         "prompt_eval_count": d.get("prompt_eval_count"),
         "eval_count": d.get("eval_count"),
+        "done_reason": d.get("done_reason"),
         "msgs_no_log": len(msgs),
         "msgs_usadas": len(usadas),
         "segundos": round(d.get("total_duration", 0) / 1e9, 1),
         "cortou_verificacao": cortou,
     }
+    if metricas["done_reason"] in {"length", "limit", "max_tokens"}:
+        raise Truncou(
+            "a LLM local terminou por limite de saída "
+            f"(done_reason={metricas['done_reason']!r}); handoff rejeitado"
+        )
     confere_truncamento(metricas)
     return texto, metricas
 
@@ -243,6 +249,11 @@ def confere_truncamento(metricas, chars_por_token=CHARS_POR_TOKEN):
     A conferencia e' contra o TETO, que e' um numero conhecido: se o servidor
     avaliou um valor colado no teto, ele parou no teto, nao no fim do prompt.
     """
+    if metricas.get("done_reason") in {"length", "limit", "max_tokens"}:
+        raise Truncou(
+            "a LLM local terminou por limite de saída "
+            f"(done_reason={metricas['done_reason']!r}); handoff rejeitado"
+        )
     pe = metricas.get("prompt_eval_count")
     if not pe:
         # Sem o contador nao da pra afirmar que passou. Nao afirmo.

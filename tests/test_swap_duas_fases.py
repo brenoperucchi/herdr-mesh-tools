@@ -177,6 +177,29 @@ class FlagsTests(unittest.TestCase):
         fonte = open(os.path.join(BIN_DIR, "herdr-swap"), encoding="utf-8").read()
         self.assertIn('("idle", "done", "working") if auto else ("idle", "done")', fonte)
 
+    def test_dry_run_finalizar_nao_cria_dir_nem_muta_pane(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(swap.sys, "argv", [
+                 "herdr-swap", "demo", "exec", "codex",
+                 "--finalizar", "--dry-run",
+             ]), \
+             mock.patch.object(swap.core, "require_herdr_pane"), \
+             mock.patch.object(swap, "get_agent", return_value={
+                 "agent": "codex", "agent_status": "idle", "pane_id": "w:p1",
+                 "cwd": d, "tab_id": "w:t1",
+             }), \
+             mock.patch.object(swap.core, "project_root", return_value=d), \
+             mock.patch.object(swap.migration, "space_gate_message", return_value=None), \
+             mock.patch.object(swap.core, "pane_looks_busy_with_human_input",
+                               return_value=(False, None)), \
+             mock.patch.object(swap.os, "makedirs") as makedirs, \
+             mock.patch.object(swap, "api") as api, \
+             redirect_stdout(io.StringIO()) as out:
+            swap.main()
+        makedirs.assert_not_called()
+        api.assert_not_called()
+        self.assertIn("[dry-run]", out.getvalue())
+
 
 class GuardDeComposicaoTests(unittest.TestCase):
     """`pane_looks_busy_with_human_input` devolve (suspeito, motivo).
@@ -234,7 +257,7 @@ class RuntimeInheritanceTests(unittest.TestCase):
             "claude",
             {"observed": True, "model": "Opus 5", "reasoning_effort": "medium"},
         )
-        self.assertEqual(args, ["--model", "opus-5", "--effort", "medium"])
+        self.assertEqual(args, ["--model", "claude-opus-5-5", "--effort", "medium"])
 
     def test_profile_kind_blocks_cross_family_model_copy(self):
         self.assertEqual(

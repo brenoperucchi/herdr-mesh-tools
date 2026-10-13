@@ -31,6 +31,12 @@ local = _load("_herdr_local_handoff.py")
 
 
 class TruncamentoTests(unittest.TestCase):
+    def test_done_reason_length_rejeita_handoff(self):
+        met = {"prompt_chars": 1000, "prompt_eval_count": 100,
+               "done_reason": "length"}
+        with self.assertRaises(local.Truncou):
+            local.confere_truncamento(met)
+
     def test_colado_no_teto_levanta(self):
         """O caso real: 49.154 avaliados contra teto de 49.152."""
         met = {"prompt_chars": 380_000, "prompt_eval_count": 49_154}

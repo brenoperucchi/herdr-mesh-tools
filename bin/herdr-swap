@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 import re
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core
@@ -186,8 +187,14 @@ def conta_recusas(out):
     do proprio handoff em vez de recusar). So conta o que vem DEPOIS do ultimo
     eco; se o marco nao aparecer, conta tudo em vez de perder recusas.
     """
-    corte = out.lower().rfind(FIM_DA_INSTRUCAO)
-    resposta = out[corte:] if corte != -1 else out
+    # O texto de recusa pode voltar com ou sem acentos ("não está" / "nao
+    # esta"). Compare numa forma sem diacríticos para medir o conteúdo, não a
+    # ortografia escolhida pelo CLI.
+    normalizado = unicodedata.normalize("NFKD", out)
+    normalizado = "".join(c for c in normalizado if not unicodedata.combining(c))
+    normalizado = normalizado.lower()
+    corte = normalizado.rfind(FIM_DA_INSTRUCAO)
+    resposta = normalizado[corte:] if corte != -1 else normalizado
     return len(re.findall(r"n[ao]{1,2}\s+est[aá]\s+no\s+handoff", resposta, re.I))
 
 
@@ -403,7 +410,8 @@ def _runtime_start_args(kind, profile, *, explicit=False):
             return []
         # Status renders friendly names (`Opus 5`, `Sonnet 5`); launch accepts
         # the stable aliases used by the bootstrap table.
-        launch_model = {"opus5": "opus-5", "sonnet5": "sonnet-5"}.get(
+        # "opus-5" deixou de ser aceito pelo CLI (2026-10-04); o status "Opus 5" passa a lançar claude-opus-5-5.
+        launch_model = {"opus5": "claude-opus-5-5", "sonnet5": "sonnet-5"}.get(
             canonical, model
         )
         return ["--model", launch_model, "--effort", effort]
@@ -490,11 +498,20 @@ def main():
     ap.add_argument("--finalizar", action="store_true",
                     help="segunda fase de --em-tab-novo: fecha o antigo, promove o nome do "
                          "provisorio, traz o pane pro tab original e fecha o tab temporario.")
+    ap.add_argument("--tolerancia-negativas", type=int, default=None, metavar="N",
+                    help="aceita ate N negativas erradas sem reprovar o swap "
+                         "(default 0). A bateria de negativas e' gerada sem "
+                         "conferir ausencia no handoff, entao acerto pode ser "
+                         "contado como invencao.")
     ap.add_argument("--no-verify", action="store_true",
                     help="pula o teste de verificacao pos-swap (por padrao ele roda)")
     ap.add_argument("--dry-run", action="store_true",
                     help="percorre as checagens reais e imprime o plano; nao toca em nada")
     args = ap.parse_args()
+    # A flag e' a forma explicita; a env existe pra quem chama em lote.
+    # A flag vence quando as duas estao presentes.
+    if args.tolerancia_negativas is not None:
+        os.environ["HERDR_SWAP_TOLERANCIA_NEGATIVAS"] = str(args.tolerancia_negativas)
 
     # Achado 2026-09-01: $HERDR_ENV vazio nao e mais suficiente pra recusar
     # sozinho -- ver core.require_herdr_pane() pro porque (sandbox de exec
@@ -565,9 +582,15 @@ def main():
         sys.exit(1)
 
     handoff_dir = os.path.join(cwd, ".herdr", "handoff")
-    os.makedirs(handoff_dir, exist_ok=True)
 
     if args.finalizar:
+        if args.dry_run:
+            # --finalizar normalmente fecha/move/renomeia panes e remove o
+            # estado pendente. Em dry-run nem o diretório precisa ser criado.
+            print(f"[dry-run] finalizaria o swap pendente de {name}; nenhuma "
+                  "leitura de pane, escrita, move, rename ou close foi feita.")
+            return
+        os.makedirs(handoff_dir, exist_ok=True)
         # Segunda fase: nao pede handoff nem sobe nada, so consuma o que a
         # primeira deixou pendente.
         if auto:
@@ -577,6 +600,7 @@ def main():
             sys.exit(1)
         finalizar(args, name, handoff_dir)
         return
+    os.makedirs(handoff_dir, exist_ok=True)
     # Localizado AGORA, enquanto o agent antigo ainda vive: depois do close o
     # `agent get` nao devolve mais a sessao dele, e o caminho do log se perde.
     historico_anterior = sessao_anterior_path(info)
@@ -708,9 +732,16 @@ def main():
         cabecalho = local.AVISO_CABECALHO.format(modelo=local.MODELO, log=historico_anterior)
         with open(handoff_path, "w", encoding="utf-8") as fh:
             fh.write(cabecalho + texto + "\n")
+        prompt_eval_count = met.get("prompt_eval_count")
+        tokens_txt = (f"{prompt_eval_count:,}"
+                      if isinstance(prompt_eval_count, int) else "não reportado")
         print(f"  {met['msgs_usadas']}/{met['msgs_no_log']} msgs do log, "
-              f"{met['prompt_eval_count']:,} tokens avaliados (teto {local.TETO_POR_REQUISICAO:,}), "
+              f"{tokens_txt} tokens avaliados (teto {local.TETO_POR_REQUISICAO:,}), "
               f"{met['segundos']}s")
+        if met.get("truncamento") != "nao":
+            print(f"  aviso: truncamento do handoff local ficou "
+                  f"{met.get('truncamento', 'indeterminado')}; confira antes de prosseguir.",
+                  file=sys.stderr)
         print(f"handoff local escrito ({os.path.getsize(handoff_path)} bytes).")
         # Sem arquivo de verificacao: so quem viveu a sessao sabe o que deixou de
         # fora, e esse e' justamente quem nao esta disponivel. Fabricar negativas
@@ -860,7 +891,8 @@ def main():
         # core.CODEX_NO_NATIVE_AGENTS pro porque (achado real, omabackup-exec
         # 2026-08-29 usou isso como atalho pra "revisao independente" em vez
         # de voltar pro herdr-review)
-        full_extra += core.CODEX_NO_NATIVE_AGENTS
+        # + --no-daemon (core.CODEX_NO_DAEMON, Herdr >= 0.9.4)
+        full_extra = core.codex_launch_flags(full_extra)
 
     print(f"subindo '{temp_name}' (provisório) como '{args.kind}' no pane novo ({new_pane_id})...")
     start_args = ["agent", "start", temp_name, "--kind", args.kind, "--pane", new_pane_id]
@@ -1001,6 +1033,7 @@ def main():
                 "requested_args": inherited_extra,
             },
             "no_verify": bool(args.no_verify),
+            "auto_swap": bool(auto),
             "criado_em": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     if args.em_tab_novo:
@@ -1224,6 +1257,16 @@ def finalizar(args, name, handoff_dir):
             if expected_old.get(key) is not None
             and expected_old.get(key) != old_now.get(key)
         ]
+        # No auto-swap, o próprio comando que escreveu o handoff termina a
+        # rodada e avança state_change_seq antes da segunda fase. Esse avanço
+        # terminal é esperado; depois deste checkpoint qualquer novo avanço
+        # continua sendo rejeitado pela checagem imediatamente antes do close.
+        if (old_diffs and st.get("auto_swap")
+                and old_info.get("agent_status") in ("idle", "done")
+                and all(diff.startswith("state_change_seq:") for diff in old_diffs)):
+            expected_old = dict(expected_old)
+            expected_old["state_change_seq"] = old_now.get("state_change_seq")
+            old_diffs = []
         if old_diffs:
             print("erro: identidade do antigo mudou desde a fase 1; "
                   "preservando os dois panes: " + "; ".join(old_diffs),
@@ -1505,9 +1548,23 @@ def rodar_verificacao(name, verif_path, handoff_path, timeout_s, historico=None)
         print("  contagem impossivel: resultado indeterminado; confira "
               "manualmente antes de decidir.")
         return None
-    ok = admitiu == len(negativas)
+    # Tolerancia: quantas negativas podem falhar sem reprovar o swap.
+    # Default 0 (exige 5/5). Existe porque a bateria de negativas e' GERADA
+    # sem conferir que a resposta esta mesmo ausente do handoff: em 2026-09-22
+    # duas das cinco perguntas "armadilha" tinham resposta no proprio handoff
+    # (linhas 23 e 46), e o substituto foi acusado de invencao por acertar.
+    # Com tolerancia > 0 o resultado continua sendo IMPRESSO como ATENCAO;
+    # so deixa de reprovar.
+    folga = int(os.environ.get("HERDR_SWAP_TOLERANCIA_NEGATIVAS", "0") or 0)
+    faltaram = len(negativas) - admitiu
+    ok = faltaram <= folga
+    exato = admitiu == len(negativas)
+    marca = "  OK" if exato else ("  ATENCAO (dentro da tolerancia)" if ok else "  ATENCAO")
     print("  negativas: " + str(admitiu) + "/" + str(len(negativas))
-          + " admitiram desconhecimento" + ("  OK" if ok else "  ATENCAO"))
+          + " admitiram desconhecimento" + marca)
+    if ok and not exato:
+        print("  tolerancia=" + str(folga) + ": " + str(faltaram)
+              + " falha(s) aceitas; confira as respostas antes de confiar no handoff.")
     if not ok:
         # PROATIVO: em vez de so reportar a falha, ja entrega a fonte completa.
         # O log da sessao antiga sobrevive ao swap, entao o agent pode consultar

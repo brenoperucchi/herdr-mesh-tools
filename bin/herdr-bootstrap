@@ -40,16 +40,19 @@ DRY = "--dry-run" in sys.argv
 # high: agora o rev-1 e' a rede larga barata e o rev-2 a lente cara de verdade,
 # cara no modelo E no raciocinio -- que era a intencao registrada no comentario
 # original, nunca a configuracao real.
-REV_EFFORT = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"]
+# Default trocado em 2026-09-29 (pedido do Breno): Codex em gpt-6-sol medium.
+# 2026-10-04 (Breno): rev-1 Codex gpt-6.1-sol de xhigh para LOW: "esta muito lento".
+# O rev-2 (Claude xhigh) e o override por space nao mudam.
+REV_EFFORT = ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=low"]
 
 # Matriz normativa: a seleção de um papel depende somente do modelo. O
 # reasoning_effort continua explícito quando a CLI é iniciada, mas não cria
 # uma variante de perfil nem autoriza promoção para outro modelo.
 ALLOWED_MODELS_BY_ROLE = {
-    "rev-1": ("gpt-5.6-luna", "gpt-6-astra"),
-    "rev-2": ("opus-5",),
-    "scout": ("gpt-6-astra", "fable-5", "opus-5"),
-    "exec": ("sonnet-5", "opus-5", "gpt-5.6-luna"),
+    "rev-1": ("gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "claude-opus-5-5", "gpt-6.1-sol"),
+    "rev-2": ("opus-5", "claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol"),
+    "scout": ("gpt-6-astra", "fable-5", "opus-5", "gpt-6-sol", "claude-opus-5-5", "gpt-6.1-sol"),
+    "exec": ("sonnet-5", "claude-sonnet-5-5", "opus-5", "gpt-5.6-luna", "claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol"),
 }
 
 # Achado 2026-09-09 (consulta herdr-8, os dois revisores + pesquisa de preco):
@@ -59,7 +62,9 @@ ALLOWED_MODELS_BY_ROLE = {
 # de todos os rev-2 do mesh, e foi assim que dois revisores acordaram em Fable
 # 5.1 (o modelo MAIS caro do catalogo, $10/$50 - o dobro do Opus pretendido).
 # Dai a regra: model E effort explicitos em TODO papel, sempre.
-EXEC_ARGS = ["--model", "sonnet-5", "--effort", "high"]
+# Default trocado em 2026-09-29 (pedido do Breno): Claude em Opus 5.5 low.
+# 2026-10-06 (Breno): exec Claude de Opus 5.5 low para SONNET 5.5 low.
+EXEC_ARGS = ["--model", "claude-sonnet-5-5", "--effort", "low"]
 
 # Perfil explícito do DRE após o swap de 2026-09-15. O ID completo evita que
 # uma restauração futura dependa do alias/default global do Claude Code.
@@ -73,7 +78,7 @@ EXEC_ARGS_SONNET_5 = ["--model", "claude-sonnet-5", "--effort", "high"]
 # arquivo de policy ficou pra tras: por ~1h o bootstrap teria recriado os cinco
 # em Claude/Sonnet, desfazendo a migracao em silencio. Quem trocar um exec
 # adiante tem que mexer AQUI tambem, senao o proximo bootstrap reverte.
-EXEC_ARGS_CODEX = ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high"]
+EXEC_ARGS_CODEX = ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium"]
 
 # scout: Astra @ max (decisao do usuario 2026-09-10, revisando o Terra que
 # tinha sido escolhido no dia anterior). E' a combinacao mais cara do catalogo
@@ -81,7 +86,19 @@ EXEC_ARGS_CODEX = ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high
 # escolha deliberada de quem paga a conta, porque o scout aqui faz exploracao
 # pesada e nao so busca. Fica registrado o custo pra que a decisao seja
 # revisitavel, nao para contesta-la.
-SCOUT_ARGS = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=max"]
+# Matriz de 2026-09-29 (pedido do Breno), por papel e familia:
+#   exec   claude sonnet-5.5 low  | codex gpt-6.1-sol medium   (exec Claude em Sonnet 5.5 desde 2026-10-06)
+#   rev-1  claude opus-5.5 medium | codex gpt-6.1-sol low   (rev-1 Codex em low desde 2026-10-04)
+#   rev-2  claude opus-5.5 high   | codex gpt-6.1-sol xhigh   (rev-2 Claude em high desde 2026-10-06)
+#   scout  claude opus-5.5 xhigh  | codex gpt-6.1-sol xhigh
+# rev-1 hoje e' sempre codex (build_rev_agents); REV1_ARGS_CLAUDE fica
+# declarado para quando um space pedir rev-1 Claude.
+# 2026-09-29: Astra substituido por gpt-6.1-sol high (pedido do Breno).
+# 2026-10-06 (Breno): scout em XHIGH (era high no Codex e max no Claude).
+SCOUT_ARGS = ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=xhigh"]
+SCOUT_ARGS_CLAUDE = ["--model", "claude-opus-5-5", "--effort", "xhigh"]
+# rev-1 quando for Claude: MEDIUM (2026-10-06); o rev-1 Codex (o comum) segue em low.
+REV1_ARGS_CLAUDE = ["--model", "claude-opus-5-5", "--effort", "medium"]
 
 # Override pontual de model/effort dos revisores, por slug - a maioria dos
 # spaces usa REV_EFFORT/rev2_kind (default "claude") e
@@ -93,17 +110,16 @@ SCOUT_ARGS = ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=max"]
 # guarda rev2_kind) porque isto e' decisao de custo pontual do usuario, nao
 # estado de migracao do space.
 REV_OVERRIDES = {
-    "llm": {
-        "rev_extra_args": ["--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max"],
-        "rev2_extra_args": ["--model", "opus-5", "--effort", "max"],
-    },
+    # "llm": REMOVIDO em 2026-10-05 por pedido do Breno -- os revisores do llm voltam a seguir o
+    # padrao da tabela (rev-1 REV_EFFORT, rev-2 por extra_args_for_rev2). O override antigo
+    # (2026-09-02) pedia rev-1 gpt-5.6-luna max e rev-2 Opus max.
     # Perfil do HomeHub: Opus @ low, igual ao perfil explicito de
     # extra_args_for_rev2("claude"). O override antigo tinha somente
     # "--model opus", deixando o raciocínio cair no settings.json global
     # quando o papel precisasse ser inicializado sem pane-base.
     "homehub": {
         "rev_extra_args": ["--model", "gpt-6-astra", "-c", "model_reasoning_effort=medium"],
-        "rev2_extra_args": ["--model", "opus-5", "--effort", "low"],
+        "rev2_extra_args": ["--model", "claude-opus-5-5", "--effort", "low"],
     },
 }
 
@@ -121,20 +137,26 @@ REV_OVERRIDES = {
 # herdr-4/5/6: bootstrap recriando "-rev" depois que o space ja migrou pra
 # "-rev-1", e o "-rev-2" sempre subindo hardcoded como Claude/Opus mesmo com
 # a policy viva sendo Grok (rev2_kind por space).
+# Todos os spaces sao ENXUTOS desde 2026-10-04 (lean): so o exec fica ligado; revisores/scout
+# sobem sob demanda (dispatchers) e saem com `herdr-release <slug>`.
 SPACES = [
     ("omabackup", f"{HOME}/Devs/omabackup", ("omabackup-exec", "codex", EXEC_ARGS_CODEX),
-        ("omabackup-scout", "codex", SCOUT_ARGS)),
+        ("omabackup-scout", "codex", SCOUT_ARGS), "omabackup", {"lean": True}),
+    # Enxuto desde 2026-10-04 (migracao para o modo lean): so o exec fica ligado.
     ("MFC", os.environ.get("HERDR_MFC_CWD", f"{HOME}/Devs/mfc"), ("mfc-exec", "codex", EXEC_ARGS_CODEX),
-        ("mfc-scout", "codex", SCOUT_ARGS)),
+        ("mfc-scout", "codex", SCOUT_ARGS), "mfc", {"lean": True}),
+    # 2026-10-06: scout DECLARADO. Antes era None (o acervo-scout foi criado a mao em setembro, fora
+    # da tabela), entao o dispatcher nao conseguia religa-lo sob demanda e o `herdr release`
+    # o fechou sem volta (`herdr-ask acervo --reviewer scout` -> agent_not_found).
     ("acervo", f"{HOME}/Devs/acervo", ("acervo-exec", "claude", EXEC_ARGS),
-        None),
+        ("acervo-scout", "codex", SCOUT_ARGS), "acervo", {"lean": True}),
     # DRE: analise financeira (Demonstrativo de Resultado), nao um repo git -
     # herdr-bootstrap nao exige git, so migration.read_migration_state()
     # cai no fallback "phase=legacy" de sempre. O exec foi trocado para
     # Claude Sonnet 5 em 2026-09-15; manter o perfil aqui evita que uma
     # restauração sem pane-base reverta o swap.
     ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", EXEC_ARGS_SONNET_5),
-        ("dre-scout", "codex", SCOUT_ARGS)),
+        ("dre-scout", "codex", SCOUT_ARGS), "dre", {"lean": True}),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
     # broker.sqlite/tokens.json) - achado 2026-08-29: claude-bridge-exec
@@ -147,8 +169,10 @@ SPACES = [
     # da troca - herdr-bootstrap so age em pane vazio, entao nao teria
     # revertido o swap sozinho, mas recriar o agent do zero um dia teria).
     # scout continua Codex (nao fez parte daquele swap, confirmado ao vivo).
+    # Enxuto desde 2026-10-03 (migracao dos spaces para o modo lean, primeiro space migrado):
+    # so o exec fica ligado; rev-1, rev-2 e scout sobem sob demanda e saem com herdr-release.
     ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "claude", EXEC_ARGS),
-        ("claude-bridge-scout", "codex", SCOUT_ARGS)),
+        ("claude-bridge-scout", "codex", SCOUT_ARGS), "claude-bridge", {"lean": True}),
     # exec trocado pra Claude no mesmo batch-swap de 2026-08-31 (ver
     # claude-bridge acima) - mesma correcao de tabela stale.
     # Workspace e todos os agents foram renomeados de
@@ -156,7 +180,7 @@ SPACES = [
     # "cic"/"cic-*" fora desta sessao - achado 2026-09-04 (dry-run ia criar
     # um workspace DUPLICADO porque o label aqui nao batia mais com o real).
     ("cic", f"{HOME}/Devs/content-insights-collector",
-        ("cic-exec", "claude", EXEC_ARGS), None),
+        ("cic-exec", "claude", EXEC_ARGS), None, "cic", {"lean": True}),
     # llm-gateway: label do workspace que o usuario ja tinha criado na mao
     # (llm-exec ja vivo la antes deste script rodar) - slug "llm" (5o
     # elemento) porque foi assim que o usuario nomeou os revisores
@@ -164,15 +188,15 @@ SPACES = [
     # mais caros que o default (ver REV_OVERRIDES) e scout customizado (Sol
     # xhigh) - pedido explicito do usuario 2026-09-02.
     ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "codex", EXEC_ARGS_CODEX),
-        ("llm-scout", "codex", ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=xhigh"]),
-        "llm"),
+        ("llm-scout", "codex", SCOUT_ARGS),   # 2026-10-05: padrao da tabela (era gpt-5.6-sol xhigh)
+        "llm", {"lean": True}),
     # llm-bench: workspace e exec ja existiam na mao (pane sem nome, so
     # renomeado pra "llm-bench-exec" 2026-09-04) - label e slug batem aqui,
     # sem divergencia (diferente do llm-gateway acima). rev/rev-2/scout com
     # os defaults padrao (REV_EFFORT/rev2_kind claude/scout Codex sem
     # override) - nao foi pedido nada mais caro pra este space.
     ("llm-bench", f"{HOME}/Devs/llm-bench", ("llm-bench-exec", "codex", EXEC_ARGS_CODEX),
-        ("llm-bench-scout", "codex", SCOUT_ARGS)),
+        ("llm-bench-scout", "codex", SCOUT_ARGS), "llm-bench", {"lean": True}),
     # HomeHub: workspace e exec ja existiam na mao (homehub-exec ja com o
     # nome certo, slug=label.lower() sem divergencia). rev/rev-2 com custo
     # customizado (ver REV_OVERRIDES). Em 2026-09-15, Breno reclassificou o
@@ -184,7 +208,7 @@ SPACES = [
     # restauracao ou swap de um pane que ja' existe preserva o perfil observado
     # nele, nunca substitui por estes defaults.
     ("HomeHub", f"{HOME}/Devs/HomeHub", ("homehub-exec", "codex", EXEC_ARGS_CODEX),
-        ("homehub-scout", "codex", SCOUT_ARGS)),
+        ("homehub-scout", "codex", SCOUT_ARGS), "homehub", {"lean": True}),
     # omasession: plugin Omarchy de restauracao de sessao grafica (janelas e
     # workspaces de volta apos reboot/queda). Workspace wS e os 4 agents foram
     # criados na mao em 2026-09-08 antes desta entrada existir - registrado
@@ -193,7 +217,7 @@ SPACES = [
     # exec Claude, rev-1 Codex (REV_EFFORT), rev-2 Claude, scout Codex; nao
     # foi pedido nada mais caro. slug=label, sem divergencia.
     ("omasession", f"{HOME}/Devs/omasession", ("omasession-exec", "codex", EXEC_ARGS_CODEX),
-        ("omasession-scout", "codex", SCOUT_ARGS)),
+        ("omasession-scout", "codex", SCOUT_ARGS), "omasession", {"lean": True}),
     # omaspotlight: fork nosso do io.github.maajix.spotlight
     # (github.com/brenoperucchi/omarchy-spotlight, upstream maajix/omarchy-spotlight).
     # Forkado em 2026-09-10 depois que o mantenedor aceitou as issues #1 e #2 em
@@ -206,25 +230,102 @@ SPACES = [
     # `omarchy plugin update` e seria sobrescrito).
     ("omaspotlight", f"{HOME}/Devs/GitHub/omarchy-spotlight",
         ("omaspotlight-exec", "claude", EXEC_ARGS),
-        ("omaspotlight-scout", "codex", SCOUT_ARGS)),
-    # "herdr": space de meta/tooling do proprio usuario (config, scripts, este
-    # tipo de trabalho). Sem entrada de exec aqui de proposito: quem executa
-    # e' sempre a sessao interativa anexada a este pane (renomeada na mao pra
-    # "herdr-exec", 2026-08-29) - nao e' um agent bootstrapado por este
-    # script, entao nao entra no SPACES pra nao arriscar o script tentar
-    # reiniciar/trocar uma sessao com humano atras dela. So os revisores sao
-    # geridos por aqui.
-    # scout registrado aqui em 2026-09-09 (antes existia vivo mas fora da
-    # tabela, criado a mao - o herdr-fix-names reclamava de "papel scout nao
-    # existe neste space" justamente por isso). O exec continua None DE
-    # PROPOSITO: e' a sessao interativa com humano atras, nao um agent
-    # bootstrapado.
-    ("herdr", HOME, None, ("herdr-scout", "codex", SCOUT_ARGS)),
-    # herdr-simulation: Space isolado para simulacoes de revisao e cleanup
-    # Registrado por herdr-add-space em 2026-09-17.
-    ("herdr-simulation", f"{HOME}/Devs/herdr-simulation", ("herdr-sim-exec", "claude", EXEC_ARGS),
-        ("herdr-sim-scout", "codex", SCOUT_ARGS), "herdr-sim"),
+        ("omaspotlight-scout", "codex", SCOUT_ARGS), "omaspotlight", {"lean": True}),
+    # O antigo space de meta/tooling foi separado do projeto upstream em
+    # 2026-09-20. Mantemos sua tabela com nomes próprios para que um bootstrap
+    # futuro não confunda os revisores do control plane com os do repositório
+    # oficial.
+    # Desativado em 2026-09-25: o Breno fechou o space de propósito.
+    # ("herdr-control", HOME, None, ("herdr-control-scout", "codex", SCOUT_ARGS)),
+    # Desenvolvimento do Herdr upstream: este é o space público do projeto,
+    # com exec e revisores próprios no clone local.
+    # Enxuto desde 2026-10-03 (teste do Breno): so o exec fica ligado; rev-1, rev-2 e scout
+    # sobem sob demanda pelos dispatchers.
+    ("herdr", f"{HOME}/Devs/GitHub/herdr", ("herdr-exec", "codex", EXEC_ARGS_CODEX),
+        ("herdr-scout", "codex", SCOUT_ARGS), "herdr", {"lean": True}),
+    # herdr-mesh-tools: space criado a mao, nunca esteve na tabela. Entrada acrescentada em
+    # 2026-10-04 para os dispatchers religarem os revisores sob demanda (modo enxuto); sem
+    # ela, `herdr-bootstrap --slug herdr-mesh-tools` falhava e nenhuma revisao subia.
+    ("herdr-mesh-tools", f"{HOME}/Devs/herdr-mesh-tools",
+        ("herdr-mesh-tools-exec", "codex", EXEC_ARGS_CODEX),
+        ("herdr-mesh-tools-scout", "codex", SCOUT_ARGS), "herdr-mesh-tools", {"lean": True}),
+    # herdr-simulation: ENCERRADO em 2026-10-03 por decisao do Breno (space fechado por
+    # inteiro, nao volta). A pasta ~/Devs/herdr-simulation continua em disco. Entrada
+    # mantida comentada de proposito: sem ela o bootstrap recria os 4 agents.
+    # ("herdr-simulation", f"{HOME}/Devs/herdr-simulation", ("herdr-sim-exec", "claude", EXEC_ARGS),
+    #     ("herdr-sim-scout", "codex", SCOUT_ARGS), "herdr-sim"),
+    # healthcare_ai: Piloto IA-first de healthcare (Khronos); plano em
+    # HEALTHCARE_IA_FIRST_PLANO_PILOTO.md
+    # Registrado por herdr-add-space em 2026-09-22.
+    ("healthcare_ai", f"{HOME}/Devs/Khronos/healthcare_ai", ("healthcare-exec", "claude", EXEC_ARGS),
+        ("healthcare-scout", "codex", SCOUT_ARGS), "healthcare", {"lean": True}),
+    # nixoFiscal: TODO por que este space existe (registrado
+    # por herdr-add-space em 2026-09-25, sem --note). Uma entrada muda
+    # aqui vira uma decisao que ninguem consegue reconstruir depois.
+    ("nixoFiscal", f"{HOME}/Devs/nixoFiscal", ("nixofiscal-exec", "claude", EXEC_ARGS),
+        ("nixofiscal-scout", "codex", SCOUT_ARGS), "nixofiscal", {"lean": True}),
+    # mt5-web-replicator: TODO por que este space existe (registrado
+    # por herdr-add-space em 2026-09-29, sem --note). Uma entrada muda
+    # aqui vira uma decisao que ninguem consegue reconstruir depois.
+    ("mt5-web-replicator", f"{HOME}/Devs/GitHub/mt5-web-replicator", ("mt5-exec", "claude", EXEC_ARGS),
+        ("mt5-scout", "codex", SCOUT_ARGS), "mt5", {"lean": True}),
+    # strata: contribuicao ao projeto open source Strata (MIT).
+    # Registrado por herdr-add-space em 2026-10-01.
+    ("strata", f"{HOME}/Devs/GitHub/strata", ("strata-exec", "claude", EXEC_ARGS),
+        ("strata-scout", "codex", SCOUT_ARGS), "strata", {"lean": True}),
+    # inventory: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-03.
+    ("inventory", f"{HOME}/Devs/inventory", ("inventory-exec", "claude", EXEC_ARGS),
+        ("inventory-scout", "codex", SCOUT_ARGS), "inventory", {"lean": True}),
+    # digest: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-03.
+    ("digest", f"{HOME}/Devs/digest", ("digest-exec", "claude", EXEC_ARGS),
+        ("digest-scout", "codex", SCOUT_ARGS), "digest", {"lean": True}),
+    # agf-renda: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-05.
+    ("agf-renda", f"{HOME}/Devs/trading/agf-renda", ("agf-renda-exec", "claude", EXEC_ARGS),
+        ("agf-renda-scout", "codex", SCOUT_ARGS), "agf-renda", {"lean": True}),
+    # strata-bench: Instrumento e formato para medir um servidor Strata em
+    # execucao e comparar resultados entre maquinas e versoes
+    # (strata-bench/v1; repo publico brenoperucchi/strata-bench, MIT).
+    # Nasceu do issue Niko1221/Strata#713. Pecas: nucleo medidor (feito),
+    # runner A,B,A,B e pagina de comparacao (a fazer). Space ENXUTO: so o
+    # exec. Pedido do Breno em 2026-10-07; handoff em .herdr/handoff.md
+    # (local, nao vai ao GitHub).
+    # Registrado por herdr-add-space em 2026-10-07.
+    ("strata-bench", f"{HOME}/Devs/strata-bench", ("strata-bench-exec", "claude", EXEC_ARGS),
+        ("strata-bench-scout", "codex", SCOUT_ARGS), "strata-bench", {"lean": True}),
+    # communication: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-09.
+    ("communication", f"{HOME}/Devs/communication", ("communication-exec", "claude", EXEC_ARGS),
+        ("communication-scout", "codex", SCOUT_ARGS), "communication", {"lean": True}),
+    # opencode-strata: Integracao do OpenCode CLI com o Strata: OpenCode
+    # como executor, Swift do Strata como modelo SEMPRE via llm-gateway
+    # (perfil opencode-local, ainda nao existe), sem chave do Strata no
+    # cliente; futuro plugin open source. OpenRouter fora. Pedido do Breno
+    # em 2026-10-09 via claude-bridge-exec; plano em
+    # ~/Devs/llm-gateway/docs/PLANO-opencode-strata-tools-2026-10-09.md.
+    # Space ENXUTO: so o exec.
+    # Registrado por herdr-add-space em 2026-10-09.
+    # Renomeado de opencode-strata para strata-opencode em 2026-10-09 (Breno; pasta e workspace tambem).
+    ("strata-opencode", f"{HOME}/Devs/strata-opencode", ("strata-opencode-exec", "claude", EXEC_ARGS),
+        ("strata-opencode-scout", "codex", SCOUT_ARGS), "strata-opencode", {"lean": True}),
 ]
+
+
+def entry_opts(entry):
+    """6o elemento opcional de uma entrada de SPACES: dict de opcoes do space.
+    Hoje so `{"lean": True}`. Exige o slug explicito (5o elemento)."""
+    return entry[5] if len(entry) > 5 and isinstance(entry[5], dict) else {}
+
+
+def is_lean(entry, with_reviewers=False):
+    """Space enxuto: so o exec sobe por padrao. Revisores e scout continuam
+    DECLARADOS na tabela (perfil, nome) mas so sobem sob demanda -- os dispatchers
+    chamam `herdr-bootstrap --slug X --with-reviewers`, que ignora o `lean`.
+    Motivo (Breno, 2026-10-03): 75 agents ocupavam ~51 GB dos 94 GB da maquina, 38 GB
+    deles em revisores e scouts parados."""
+    return bool(entry_opts(entry).get("lean")) and not with_reviewers
 
 
 def build_rev_agents(slug, cwd):
@@ -286,7 +387,7 @@ def ensure_notify_watchers(workspace_ids=None):
         )
 
 
-def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings):
+def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=False):
     """Sobe (name, kind) no pane_id e, se subir de verdade, manda o reforço de
     papel — usado tanto pro loop de split da tab 1 quanto pra tab do scout,
     pra não duplicar a mesma lógica dos dois lugares. Os argumentos de model e
@@ -297,7 +398,9 @@ def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings):
         # desliga o sistema nativo de sub-agentes do Codex - ver
         # core.CODEX_NO_NATIVE_AGENTS pro porque (achado real,
         # omabackup-exec 2026-08-29)
-        full_extra += core.CODEX_NO_NATIVE_AGENTS
+        # e roda com --no-daemon (core.CODEX_NO_DAEMON): sem isso o Codex fica em
+        # `unknown` depois de cada turno no Herdr >= 0.9.4
+        full_extra = core.codex_launch_flags(full_extra)
     print(f"  {pane_id}: iniciando {kind} como '{name}'" + (f" ({' '.join(full_extra)})" if full_extra else ""))
     started_ok = False
     try:
@@ -316,7 +419,7 @@ def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings):
             raise
 
     if started_ok:
-        prompt = core.role_reinforcement_prompt(name, slug, cwd, siblings)
+        prompt = core.role_reinforcement_prompt(name, slug, cwd, siblings, lean=lean)
         try:
             run("agent", "prompt", name, prompt)
         except RuntimeError as exc:
@@ -371,6 +474,12 @@ def main():
                       help="processa somente o workspace com este label")
     alvo.add_argument("--slug", metavar="SLUG",
                       help="processa somente a entrada cujo prefixo de agents é este slug")
+    ap.add_argument("--with-reviewers", action="store_true",
+                    help="sobe tambem os REVISORES dos spaces enxutos (`lean`) nesta execucao; "
+                         "e' o que os dispatchers usam para ligar sob demanda")
+    ap.add_argument("--with-scout", action="store_true",
+                    help="sobe tambem o SCOUT dos spaces enxutos nesta execucao (so quando "
+                         "alguem o requisitou: `--with-reviewers` nao o liga)")
     args = ap.parse_args()
     DRY = args.dry_run
 
@@ -427,7 +536,12 @@ def main():
             if migration.read_migration_state(migration_cwd)["phase"] == "legacy":
                 migration.write_migration_state_atomic(migration_cwd, {"phase": "migrated"})
 
-        tab1_agents = ([exec_agent] if exec_agent else []) + build_rev_agents(slug, migration_cwd)
+        lean = is_lean(entry, args.with_reviewers)            # revisores
+        lean_scout = is_lean(entry, args.with_scout)          # scout (independente)
+        if lean or lean_scout:
+            print(f"space {label}: enxuto (só o exec; revisores/scout sobem sob demanda)")
+        tab1_agents = ([exec_agent] if exec_agent else []) + (
+            [] if lean else build_rev_agents(slug, migration_cwd))
 
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")
@@ -455,46 +569,54 @@ def main():
                 break
             panes.append(res["pane"]["pane_id"])
 
+        if lean_scout:
+            scout = None        # enxuto: sem scout (nem tab propria) ate ser chamado
         all_names = [n for (n, _, _) in tab1_agents] + ([scout[0]] if scout else [])
-        missing_reviewer_names = [name for name, _kind, _args in tab1_agents if name.endswith(("-rev-1", "-rev-2")) and name not in existing_agent_names]
-        unnamed_reviewer = find_unnamed_reviewer_base(agents, ws_id, tab1_id, missing_reviewer_names, existing_agent_names)
+        # A ordem de `pane list` não representa papéis. Primeiro associe por
+        # nome já observado; só panes livres podem receber um papel ausente.
+        named_tab_agents = {
+            a.get("name"): a for a in agents
+            if a.get("workspace_id") == ws_id and a.get("tab_id") == tab1_id
+            and a.get("name")
+        }
+        missing_reviewer_names = [
+            name for name, _kind, _args in tab1_agents
+            if name.endswith(("-rev-1", "-rev-2")) and name not in named_tab_agents
+        ]
+        unnamed_reviewer = find_unnamed_reviewer_base(
+            agents, ws_id, tab1_id, missing_reviewer_names,
+            set(named_tab_agents),
+        )
+        assigned = set()
         if unnamed_reviewer is not None:
-            # `pane list` não é ordenado pela tabela de papéis. Coloque o pane
-            # anônimo na posição do papel ausente antes do zip abaixo; assim a
-            # associação única encontrada pelo helper é aplicada ao pane real,
-            # mesmo depois de swaps/rearranjos.
             unnamed_pane, unnamed_name = unnamed_reviewer
-            target_index = next(
-                (i for i, (name, _kind, _args) in enumerate(tab1_agents)
-                 if name == unnamed_name),
+            pane_id = unnamed_pane.get("pane_id")
+            print(f"  {pane_id}: revisor sem nome encontrado; restaurando '{unnamed_name}' sem reiniciar")
+            if not DRY:
+                run("agent", "rename", pane_id, unnamed_name)
+                named_tab_agents[unnamed_name] = unnamed_pane
+            assigned.add(pane_id)
+
+        for name, kind, extra_args in tab1_agents:
+            existing = named_tab_agents.get(name)
+            if existing is not None:
+                assigned.add(existing.get("pane_id"))
+                print(f"  {existing.get('pane_id')}: '{name}' já existe, preservando o pane e o perfil")
+                continue
+            pane_id = next(
+                (candidate for candidate in panes
+                 if candidate not in busy and candidate not in assigned),
                 None,
             )
-            candidate_index = next(
-                (i for i, pane_id in enumerate(panes)
-                 if pane_id == unnamed_pane.get("pane_id")),
-                None,
-            )
-            if target_index is not None and candidate_index is not None:
-                panes[target_index], panes[candidate_index] = (
-                    panes[candidate_index], panes[target_index]
-                )
-        for pane_id, (name, kind, extra_args) in zip(panes, tab1_agents):
-            if pane_id in busy:
-                occupant = next((a for a in agents if a.get("pane_id") == pane_id), None)
-                if (unnamed_reviewer is not None and occupant is unnamed_reviewer[0]
-                        and name == unnamed_reviewer[1]):
-                    # The process is the existing base; restore only its
-                    # volatile registry name and keep its observed family/model.
-                    print(f"  {pane_id}: revisor sem nome encontrado; restaurando '{name}' sem reiniciar")
-                    if not DRY:
-                        run("agent", "rename", pane_id, name)
-                        existing_agent_names.add(name)
-                        unnamed_reviewer = None
-                else:
-                    print(f"  {pane_id}: já tem agent, pulando")
+            if pane_id is None:
+                print(f"  erro: não há pane livre para '{name}'; nenhum agent ocupado será reiniciado",
+                      file=sys.stderr)
                 continue
             siblings = [n for n in all_names if n != name]
-            start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings)
+            start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=lean)
+            assigned.add(pane_id)
+            busy.add(pane_id)
+            named_tab_agents[name] = {"pane_id": pane_id}
 
         if scout is not None:
             scout_name, scout_kind, scout_extra = scout

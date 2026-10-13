@@ -221,6 +221,8 @@ def resume_uuid(argv):
     return None
 
 
+from _herdr_codex_status import codex_ocioso_pela_tela, inferir_idle  # noqa: F401
+
 try:
     import _herdr_probe_cache as probe_cache
 except ImportError:      # pragma: no cover - o listing funciona sem a sonda
@@ -280,7 +282,7 @@ def amostra_um(agent):
         return None
     if kind == "codex":
         model, effort = do_rodape(le_pane(nome))
-        return (nome, model, effort, "pane") if model else None
+        return (nome, model, effort, "pane", kind) if model else None
     if kind == "claude":
         # Claude nao imprime modelo na tela; a unica fonte passiva e' o log, e
         # ele so vale quando o agent respondeu DEPOIS da ultima troca.
@@ -296,7 +298,7 @@ def amostra_um(agent):
         model, confiavel = claude_model_confiavel(uuid)
         if model and confiavel:
             _dm, de = defaults_claude()
-            return nome, model, de or "?", "thread-confirmado"
+            return nome, model, de or "?", "thread-confirmado", kind
     return None
 
 
@@ -308,8 +310,8 @@ def amostra_todos(agents, workers=12):
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for r in ex.map(amostra_um, agents):
             if r:
-                nome, model, effort, origem = r
-                probe_cache.atualiza(c, nome, model, effort, origem)
+                nome, model, effort, origem, kind = r
+                probe_cache.atualiza(c, nome, model, effort, origem, kind=kind)
     probe_cache.gravar(c)
     return c
 
@@ -320,7 +322,7 @@ def amostra_todos(agents, workers=12):
 IDADE_MAX_MIN = 90
 
 
-def do_cache(nome, agora_model, agora_effort, agora_origem, c=None):
+def do_cache(nome, agora_model, agora_effort, agora_origem, c=None, kind=None):
     """Deixa a sonda sobrepor o que o listing conseguiu sozinho.
 
     A ordem de preferencia nao e' obvia e vale escrever: uma leitura de PANE
@@ -338,6 +340,24 @@ def do_cache(nome, agora_model, agora_effort, agora_origem, c=None):
     e = ((probe_cache.ler() if c is None else c) or {}).get(nome)
     if not e:
         return agora_model, agora_effort, agora_origem
+    # O cache e' indexado so pelo NOME, e nome sobrevive a troca de familia:
+    # depois de um swap, a entrada escrita pelo processo antigo continua
+    # valendo e passa a descrever um agent de outra familia. Um modelo errado
+    # numa coluna que as pessoas usam pra cacar custo manda o operador atras
+    # de um fantasma -- entao entrada de familia divergente e' descartada.
+    if kind:
+        gravado = e.get("kind")
+        if gravado and gravado != kind:
+            return agora_model, agora_effort, agora_origem
+        # Entradas legadas nao tem `kind`, mas a ORIGEM delata a familia de
+        # quem escreveu (ver amostra_um): o ramo codex produz "pane", o ramo
+        # claude produz "thread-confirmado". A primeira versao so cobria
+        # codex->claude; claude->codex passava batido e o agent codex exibia
+        # modelo do claude anterior. Apontado pelos dois revisores.
+        familia = {"pane": "codex", "thread-confirmado": "claude"}.get(
+            e.get("origem"))
+        if not gravado and familia and familia != kind:
+            return agora_model, agora_effort, agora_origem
     idade = probe_cache.idade_min(e)
     origem = e.get("origem", "?")
     if origem == "pane":
@@ -350,6 +370,14 @@ def do_cache(nome, agora_model, agora_effort, agora_origem, c=None):
     return agora_model, agora_effort, agora_origem
 
 
+def status_efetivo(agent):
+    """agent_status como o Herdr informa, exceto Codex `unknown` pronto e com a
+    tela ociosa, que vira `idle?` (inferido; regra em _herdr_codex_status)."""
+    if agent.get("name") and inferir_idle(agent, lambda a: le_pane(a["name"], 15)):
+        return "idle?"
+    return agent.get("agent_status", "?")
+
+
 def status_curto(status):
     """`working` ocupa 7 colunas e nao diz nada que o operador ja nao saiba
     pelo nome do agent -- comprime pra `job` (sem id numerico: a API do
@@ -358,13 +386,21 @@ def status_curto(status):
 
 
 def cwd_relativo(cwd):
-    """So imprime o CWD quando ele esta FORA do $HOME -- dentro e' o caso
-    comum e nao precisa ocupar coluna nenhuma. Fora, mostra relativo ao
-    $HOME em vez de realpath absoluto."""
+    """Abrevia o $HOME como `~` em vez de suprimir a linha.
+
+    A versao anterior devolvia "" para tudo que estava dentro do $HOME,
+    por supor que esse era o caso comum e nao valia coluna. Numa maquina
+    onde TODO projeto mora sob o $HOME isso zera a coluna inteira -- medido
+    em 60/60 agents -- e junto some o unico caso que realmente importa
+    olhar: o agent cujo cwd E' o proprio $HOME, ou um diretorio de estado
+    como ~/.claude-bridge em vez da raiz do repo. Abreviar mostra os dois.
+    """
     if not cwd or cwd == "?":
         return ""
-    if cwd == HOME or cwd.startswith(HOME + "/"):
-        return ""
+    if cwd == HOME:
+        return "~"
+    if cwd.startswith(HOME + "/"):
+        return "~/" + cwd[len(HOME) + 1:]
     return cwd
 
 
@@ -467,15 +503,16 @@ def main():
 
     with ThreadPoolExecutor(max_workers=12) as ex:
         modelos = list(ex.map(resolve, agents))
+        status_ef = list(ex.map(status_efetivo, agents))
 
     linhas = []
-    for a, (model, effort, origem) in zip(agents, modelos):
+    for a, (model, effort, origem), st in zip(agents, modelos, status_ef):
         kind = a.get("agent", "?")
         model, effort, origem = do_cache(a.get("name") or "", model, effort, origem,
-                                         cache_atual)
+                                         cache_atual, kind=kind)
         nome = a.get("name") or ""
         linhas.append([
-            status_curto(a.get("agent_status", "?")), cwd_relativo(a.get("cwd", "?")), kind,
+            status_curto(st), cwd_relativo(a.get("cwd", "?")), kind,
             sem_prefixo_do_kind(model, kind), effort, origem,
             nome, a.get("pane_id", "?"), a.get("tab_id", "?"),
             a.get("workspace_id", ""),   # so pra ordenar; nao e' impressa

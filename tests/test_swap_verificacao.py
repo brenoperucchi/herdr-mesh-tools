@@ -61,6 +61,10 @@ class ContaRecusasTests(unittest.TestCase):
         out = ECO + "1. Nao esta no handoff\n2. nao está no handoff\n3. NAO ESTA NO HANDOFF\n"
         self.assertEqual(swap.conta_recusas(out), 3)
 
+    def test_recusa_com_nao_e_esta_acentuados(self):
+        out = ECO + "1. não está no handoff\n2. não está no handoff\n"
+        self.assertEqual(swap.conta_recusas(out), 2)
+
     def test_sem_eco_conta_tudo(self):
         """Se o marco nao aparecer (pane truncou o eco), nao perde recusas."""
         self.assertEqual(swap.conta_recusas("1. nao esta no handoff\n2. nao esta no handoff\n"), 2)

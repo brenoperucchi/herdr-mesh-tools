@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""herdr-release <slug> [--only reviewers|scout|all] [--force] [--dry-run] [--json]
+herdr-release --status
+
+Desliga revisores e scout de um space DEPOIS de a rodada acabar (modo enxuto: so o exec
+fica ligado; os outros sobem sozinhos, sob demanda, e este comando e' o "desligar").
+
+Quem roda e' quem da o aceite: o exec ou o Breno. Nao ha marcador nem segunda chave;
+fechar e' reversivel (sessao em disco, vereditos em arquivo, o agent volta sob demanda).
+O que o comando confere, sozinho, e' o que de fato da errado:
+  - agent working/blocked/desconhecido        -> recusa
+  - rascunho humano ou dialogo na caixa       -> recusa (ou a leitura da caixa falhou)
+  - a rodada mais recente nao tem o veredito  -> recusa (nao feche antes de ver o resultado)
+  - veredito com REQUEST_CHANGES e nenhuma rodada depois -> AVISA (heuristica, nao bloqueia)
+`--force` ignora as recusas. Antes de fechar grava agent, sessao e motivo em
+~/.local/state/herdr-mesh/released.jsonl (para retomar com `resume`). Nunca toca no exec.
+`--status` lista revisores/scout ligados, com a idade da ultima rodada de cada um.
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core  # noqa: E402
+
+RESULT_FILES = ("verdict.md", "answer.md")
+REV_SUFFIXES = ("-rev", "-rev-1", "-rev-2")
+
+
+def _bootstrap():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
+    return SourceFileLoader("herdr_bootstrap_for_release", path).load_module()
+
+
+def entry_for_slug(spaces, slug):
+    for entry in spaces:
+        if (entry[4] if len(entry) > 4 else entry[0].lower()) == slug:
+            return entry
+    return None
+
+
+def targets(slug, agents, only="all"):
+    """Revisores e scout vivos do slug (nunca o exec)."""
+    nomes = []
+    if only in ("reviewers", "all"):
+        nomes += [f"{slug}{s}" for s in REV_SUFFIXES]
+    if only in ("scout", "all"):
+        nomes.append(f"{slug}-scout")
+    return [a for a in agents if a.get("name") in nomes]
+
+
+def result_state(root, slug, agent_name):
+    """(estado, caminho, achados_abertos): 'sem_rodada' | 'pendente' | 'ok'.
+    Olha a rodada mais recente (review/ ou ask/) em que o agent tem pasta."""
+    achadas = []
+    for tipo in ("review", "ask"):
+        for d in glob.glob(os.path.join(root, ".herdr", tipo, f"{slug}-*")):
+            sub = os.path.join(d, agent_name)
+            if os.path.isdir(sub):
+                achadas.append((os.path.getmtime(sub), sub))
+    if not achadas:
+        return "sem_rodada", None, False
+    achadas.sort(reverse=True)
+    sub = achadas[0][1]
+    for nome in RESULT_FILES:
+        caminho = os.path.join(sub, nome)
+        if os.path.isfile(caminho) and os.path.getsize(caminho) > 0:
+            with open(caminho, encoding="utf-8", errors="replace") as f:
+                return "ok", caminho, "REQUEST_CHANGES" in f.read()
+    return "pendente", sub, False
+
+
+def avaliar(status, composicao, estado):
+    """(motivos_de_recusa, avisos). `composicao` = (tipo, texto, motivo) de classify_composition;
+    `estado` = retorno de result_state."""
+    motivos, avisos = [], []
+    if status in ("working", "blocked"):
+        motivos.append(f"agent esta {status}")
+    elif status not in ("idle", "done"):
+        motivos.append(f"estado {status!r}: nao da pra confirmar que terminou")
+    tipo, texto, _ = composicao
+    if tipo == "humano":
+        motivos.append(f"rascunho humano na caixa: {texto[:60]!r}")
+    elif tipo == "dialogo":
+        motivos.append("dialogo pendente no pane")
+    elif tipo == "indeterminado":
+        motivos.append("nao consegui ler a caixa de composicao")
+    if estado[0] == "pendente":
+        motivos.append("a rodada mais recente nao tem o veredito dele (nao feche antes de ver o resultado)")
+    elif estado[0] == "sem_rodada":
+        avisos.append("sem rodada registrada para este agent")
+    if estado[2]:
+        avisos.append("o ultimo veredito tem REQUEST_CHANGES e nao ha rodada depois (heuristica)")
+    return motivos, avisos
+
+
+def state_dir():
+    return os.environ.get("HERDR_MESH_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "herdr-mesh")
+
+
+def registrar(info, motivo):
+    os.makedirs(state_dir(), exist_ok=True)
+    reg = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": info.get("name"),
+           "pane": info.get("pane_id"), "kind": info.get("agent"), "cwd": info.get("cwd"),
+           "session": (info.get("agent_session") or {}).get("value"), "motivo": motivo}
+    with open(os.path.join(state_dir(), "released.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(reg, ensure_ascii=False) + "\n")
+
+
+def fechar(info):
+    r = subprocess.run(core.herdr_argv("pane", "close", info["pane_id"]), capture_output=True,
+                       text=True, timeout=core.CLI_TIMEOUT_S)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()[:120]
+
+
+def liberar(slug, agents, only, force, dry_run, spaces=None):
+    """Retorna lista de dicts por agent: {name, pane, acao, motivos, avisos}."""
+    saida = []
+    for info in targets(slug, agents, only):
+        root = core.project_root(info.get("cwd") or ".")
+        estado = result_state(root, slug, info["name"])
+        composicao = core.classify_composition(info["pane_id"])
+        motivos, avisos = avaliar(core.effective_status(info), composicao, estado)
+        item = {"name": info["name"], "pane": info["pane_id"], "motivos": motivos, "avisos": avisos,
+                "resultado": estado[1]}
+        if motivos and not force:
+            item["acao"] = "recusado"
+        elif dry_run:
+            item["acao"] = "fecharia" + (" (--force)" if motivos else "")
+        else:
+            registrar(info, "release" + (" --force" if motivos else ""))
+            ok, msg = fechar(info)
+            item["acao"] = "fechado" if ok else f"falha ao fechar: {msg}"
+        saida.append(item)
+    return saida
+
+
+def status(spaces, agents):
+    """Revisores/scout ligados por space, com a idade da ultima rodada de cada um."""
+    linhas = []
+    por_nome = {a.get("name"): a for a in agents}
+    for entry in spaces:
+        slug = entry[4] if len(entry) > 4 else entry[0].lower()
+        lean = bool(entry[5].get("lean")) if len(entry) > 5 and isinstance(entry[5], dict) else False
+        for info in targets(slug, [por_nome[n] for n in por_nome if n], "all"):
+            root = core.project_root(info.get("cwd") or ".")
+            achadas = []
+            for tipo in ("review", "ask"):
+                for d in glob.glob(os.path.join(root, ".herdr", tipo, f"{slug}-*", info["name"])):
+                    achadas.append(os.path.getmtime(d))
+            idade = None if not achadas else (time.time() - max(achadas)) / 3600
+            linhas.append({"name": info["name"], "space": entry[0], "enxuto": lean,
+                           "status": core.effective_status(info), "ultima_rodada_h": idade})
+    return linhas
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Desliga revisores/scout de um space depois da rodada.")
+    ap.add_argument("slug", nargs="?", help="slug do space (ex.: herdr, mfc, llm)")
+    ap.add_argument("--only", choices=["reviewers", "scout", "all"], default="all")
+    ap.add_argument("--force", action="store_true", help="ignora as recusas (agent working, rascunho, sem veredito)")
+    ap.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem fechar")
+    ap.add_argument("--status", action="store_true", help="lista revisores/scout ligados e a idade da ultima rodada")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    spaces = _bootstrap().SPACES
+    agents = json.loads(subprocess.run(core.herdr_argv("agent", "list"), capture_output=True,
+                                       text=True, timeout=core.CLI_TIMEOUT_S).stdout)["result"]["agents"]
+
+    if args.status:
+        linhas = status(spaces, agents)
+        if args.json:
+            print(json.dumps(linhas, ensure_ascii=False))
+            return 0
+        if not linhas:
+            print("nenhum revisor ou scout ligado")
+        for l in linhas:
+            idade = "nunca teve rodada" if l["ultima_rodada_h"] is None else f"ultima rodada ha {l['ultima_rodada_h']:.1f} h"
+            print(f"{l['name']:26} {l['status']:8} {idade}" + ("" if l["enxuto"] else "  (space nao enxuto)"))
+        return 0
+
+    if not args.slug:
+        ap.error("informe o slug do space (ou use --status)")
+    entry = entry_for_slug(spaces, args.slug)
+    itens = liberar(args.slug, agents, args.only, args.force, args.dry_run, spaces)
+    if args.json:
+        print(json.dumps(itens, ensure_ascii=False))
+    else:
+        if not itens:
+            print(f"nada ligado para fechar em '{args.slug}'")
+        for it in itens:
+            print(f"{it['acao'].upper():10} {it['name']} ({it['pane']})")
+            for m in it["motivos"]:
+                print(f"    - {m}")
+            for a in it["avisos"]:
+                print(f"    ! aviso: {a}")
+        if entry is not None and itens and not (len(entry) > 5 and isinstance(entry[5], dict) and entry[5].get("lean")):
+            print(f"nota: o space '{args.slug}' nao e enxuto; um `herdr-bootstrap` recria o que foi fechado.")
+    return 1 if any(it["acao"] == "recusado" for it in itens) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

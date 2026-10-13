@@ -147,10 +147,13 @@ exception, and the comment next to it explains why.
   contexto por handoff, e qualquer divergência de perfil fica como evidência
   para decisão posterior.
 - **`herdr-context-watch`** — leitura periódica (ou `--once`) de `rev-1`,
-  `rev-2` e `scout` em `idle`/`done`. Extrai somente o bloco ancorado
-  `Context window:` do status da CLI, registra modelo/reasoning como
-  evidência, detecta mudanças de sessão durante a leitura e publica JSON
-  atomicamente. Nunca envia prompt, `/clear`, `/new` ou troca de modelo.
+  `rev-2` e `scout` em `idle`/`done`. Por padrão é passivo: extrai somente o
+  buffer já visível, incluindo o bloco ancorado `Context window:`. Registra
+  modelo/reasoning como evidência, detecta mudanças de identidade durante a
+  leitura e publica JSON atomicamente. `--probe` habilita `/status`
+  explicitamente; se a sonda falhar, tenta enviar `Esc` e marca a medição como
+  desconhecida. O modo padrão nunca envia prompt, `/clear`, `/new` ou troca de
+  modelo.
 - **`herdr-notify-watch`** — a `flock`-protected daemon that notifies via
   `omarchy-notification-send` when a `*-exec` agent has a genuine state
   change (edge-triggered on `state_change_seq`, not naive status polling).
@@ -158,6 +161,10 @@ exception, and the comment next to it explains why.
   roda a suíte e executa (ou apenas imprime com `--offline`) um smoke test da
   rota `herdr-ask --reviewer scout` em um space descartável. Exige um slug
   explícito e não libera slugs conhecidos de produção sem `--allow-production`.
+- **`herdr-simulate-idle-swap`** — simulação offline do swap periódico para o
+  space `herdr-simulation`: só marca `ready` quando o pane está `idle`/`done`
+  com identidade e `state_change_seq` estáveis; marca `defer` durante trabalho
+  e `abort` em corrida. Não chama a CLI nem modifica panes.
 - **`herdr-simulate-full.sh`** — encena o ciclo completo em um fixture de
   teste: duas rodadas com `rev-1`/`rev-2`, correção sintética, terceira análise
   automática pelo scout e registro da decisão pendente do Breno. Não faz commit

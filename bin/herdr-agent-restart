@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""herdr-agent-restart [NOME|PANE_ID] [--dry-run] [--force] [--model M --effort E] [--list]
+
+Reinicia o processo (Claude ou Codex) de UM agent do Herdr, na mesma sessao, no mesmo pane
+e com o mesmo nome durável (`agent start`). Serve para pegar a versão nova do CLI ou aplicar
+um perfil novo sem perder a conversa. Uso mínimo:
+
+    herdr-agent-restart acervo-exec
+    herdr-agent-restart            # sem argumento: acha o agent pelo diretório atual (o exec)
+
+O comando descobre sozinho: o pane, o id da sessão e o modelo/esforço. O perfil vem, nesta ordem,
+de: (1) --model/--effort; (2) o cache da sonda do `herdr-agents` (`herdr-probe`, que roda por
+timer), se a leitura é recente e confiável; (3) o argv do processo vivo; (4) a matriz do bootstrap
+para o papel. A saída diz de qual fonte veio cada valor. Nunca inventa uma sessão: sem id de sessão
+ele recusa.
+
+Segurança (mesmas guardas do herdr-can-send): recusa agent working/blocked, rascunho humano ou
+diálogo na caixa; a sugestão automática do Claude NÃO conta como rascunho. O processo é encerrado
+com SIGTERM, nunca por `/exit` digitado na caixa. `--force` ignora as recusas. Se o alvo é o
+pane de quem roda o comando, o reinício sai separado e acontece cerca de 25 s depois.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core  # noqa: E402
+import _herdr_probe_cache as probe_cache  # noqa: E402
+
+EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+MODEL_OK = re.compile(r"^(claude-[a-z0-9.-]+|sonnet-5|gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*)$")
+MODELOS_MORTOS = {"opus-5"}      # o CLI do Claude recusa (2026-10-04)
+CACHE_MAX_H = 48                 # leitura de sonda mais velha que isso nao decide perfil
+FONTES_CONFIAVEIS = ("pane", "thread-confirmado")
+DEMORA_SEPARADO_S = 25
+
+
+def bootstrap():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
+    return SourceFileLoader("herdr_bootstrap_for_restart", path).load_module()
+
+
+# ------------------------------------------------------------------ perfil
+def parse_argv(argv):
+    """(model, effort) lidos da linha de comando de um processo claude/codex."""
+    model = effort = None
+    for i, a in enumerate(argv):
+        if a in ("--model", "-m") and i + 1 < len(argv):
+            model = argv[i + 1]
+        elif a == "--effort" and i + 1 < len(argv):
+            effort = argv[i + 1]
+        elif a.startswith("model_reasoning_effort="):
+            effort = a.split("=", 1)[1]
+    return model, effort
+
+
+def modelo_valido(m):
+    return bool(m) and m not in MODELOS_MORTOS and bool(MODEL_OK.match(m))
+
+
+def perfil_valido(model, effort):
+    return modelo_valido(model) and effort in EFFORTS
+
+
+def role_of(name):
+    if name.endswith("-exec"):
+        return "exec"
+    if name.endswith("-scout"):
+        return "scout"
+    if name.endswith("-rev-2"):
+        return "rev2"
+    if name.endswith(("-rev-1", "-rev")):
+        return "rev1"
+    return None
+
+
+def matrix_profile(name, kind, bs=None):
+    """Perfil padrão do bootstrap para o papel, ou None."""
+    bs = bs or bootstrap()
+    role = role_of(name)
+    if role is None:
+        return None
+    if role == "exec":
+        args = bs.EXEC_ARGS if kind == "claude" else bs.EXEC_ARGS_CODEX if kind == "codex" else None
+    elif role == "scout":
+        args = bs.SCOUT_ARGS_CLAUDE if kind == "claude" else bs.SCOUT_ARGS if kind == "codex" else None
+    elif role == "rev1":
+        args = bs.REV1_ARGS_CLAUDE if kind == "claude" else bs.REV_EFFORT if kind == "codex" else None
+    else:
+        import _herdr_migration as mig
+        args = mig.extra_args_for_rev2(kind)
+    if not args:
+        return None
+    model, effort = parse_argv(args)
+    return (model, effort) if perfil_valido(model, effort) else None
+
+
+def resolve_profile(name, kind, argv, cache_entry, matrix, explicit_model=None, explicit_effort=None,
+                    agora=None):
+    """(model, effort, fonte). Ordem: explicito > sonda recente > argv vivo > matriz."""
+    if explicit_model or explicit_effort:
+        m0, e0, _ = resolve_profile(name, kind, argv, cache_entry, matrix, agora=agora)
+        model, effort = explicit_model or m0, explicit_effort or e0
+        if not perfil_valido(model, effort):
+            raise SystemExit(f"perfil invalido: model={model!r} effort={effort!r}")
+        return model, effort, "pedido na linha de comando"
+    e = cache_entry or {}
+    idade = probe_cache.idade_min(e, agora) if e else None
+    if (e and e.get("origem") in FONTES_CONFIAVEIS and perfil_valido(e.get("model"), e.get("effort"))
+            and (e.get("kind") in (None, kind)) and idade is not None and idade <= CACHE_MAX_H * 60):
+        fonte = f"sonda do herdr-agents ({e['origem']}, ha {idade} min)"
+        am, ae = parse_argv(argv or [])
+        # Claude: a sonda confirma o MODELO pelo log da sessao, mas o esforco que ela guarda e' o padrao
+        # global do settings.json, nao o do processo. Se o esforco foi fixado na linha de comando,
+        # ele vale mais (senao um exec lancado em `low` voltaria em `high`).
+        if kind == "claude" and e.get("origem") == "thread-confirmado" and ae in EFFORTS:
+            return e["model"], ae, fonte + " + esforco fixado no argv"
+        return e["model"], e["effort"], fonte
+    am, ae = parse_argv(argv or [])
+    if perfil_valido(am, ae):
+        return am, ae, "argv do processo vivo"
+    mp = matrix_profile(name, kind)
+    if mp:
+        return mp[0], mp[1], "matriz do bootstrap"
+    raise SystemExit(f"nao consegui determinar modelo/esforco de {name}: use --model e --effort")
+
+
+def start_args(kind, session, model, effort, old_argv=None):
+    """Argumentos depois do `--` no `herdr agent start`."""
+    if kind == "claude":
+        return ["--resume", session, "--model", model, "--effort", effort]
+    if kind == "codex":
+        extra = []
+        # preserva -c <chave>=<valor> e flags soltas do lancamento anterior, menos o que trocamos
+        old = list(old_argv or [])
+        if "resume" in old:
+            old = old[old.index("resume") + 2:]
+        i = 0
+        while i < len(old):
+            a = old[i]
+            if a in ("-m", "--model"):
+                i += 2
+                continue
+            if a == "-c" and i + 1 < len(old):
+                if not old[i + 1].startswith("model_reasoning_effort="):
+                    extra += ["-c", old[i + 1]]
+                i += 2
+                continue
+            if a.startswith("-"):
+                extra.append(a)
+            i += 1
+        base = ["resume", session, "-m", model, "-c", f"model_reasoning_effort={effort}"]
+        # agents.max_depth=0 e --no-daemon (Herdr >= 0.9.4) em todo restart, venham ou nao do argv antigo
+        extra = core.codex_launch_flags(extra)
+        return base + extra
+    raise SystemExit(f"kind sem suporte: {kind}")
+
+
+# ------------------------------------------------------------------ descoberta
+def agentes():
+    r = subprocess.run(core.herdr_argv("agent", "list"), capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+    return json.loads(r.stdout)["result"]["agents"]
+
+
+def processos():
+    """pane_id -> (pid, comm, argv) do processo de topo claude/codex de cada pane."""
+    ppid, comm = {}, {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            st = open(f"/proc/{d}/stat").read()
+            ppid[int(d)] = int(st[st.rindex(")") + 2:].split()[1])
+            comm[int(d)] = open(f"/proc/{d}/comm").read().strip()
+        except (OSError, ValueError, IndexError):
+            pass
+
+    def tem_ancestral_agente(p):
+        q = ppid.get(p)
+        while q and q > 1:
+            if comm.get(q) in ("claude", "codex"):
+                return True
+            q = ppid.get(q)
+        return False
+
+    out = {}
+    for pid, c in comm.items():
+        if c not in ("claude", "codex") or tem_ancestral_agente(pid):
+            continue
+        try:
+            env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+            argv = [x.decode() for x in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if x]
+        except OSError:
+            continue
+        if "app-server" in argv:
+            continue
+        pane = next((e.split(b"=", 1)[1].decode() for e in env if e.startswith(b"HERDR_PANE_ID=")), None)
+        if pane and pane not in out:
+            out[pane] = (pid, c, argv)
+    return out
+
+
+def agente_orfao(nome, vivos):
+    """Agent que SAIU (`/exit`, queda): o Herdr apagou o registro, mas a sonda guardou pane, kind,
+    pasta e sessao em last-agents.json. So vale se o pane ainda existe e esta num shell sem agent."""
+    e = probe_cache.ler(probe_cache.LEDGER_PATH).get(nome)
+    if not e or not e.get("pane") or not e.get("session"):
+        return None
+    if any(a.get("pane_id") == e["pane"] for a in vivos):
+        return None          # o pane tem outro agent vivo: nao e' o caso
+    r = subprocess.run(core.herdr_argv("pane", "list"), capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+    try:
+        panes = json.loads(r.stdout)["result"]["panes"]
+    except (ValueError, KeyError):
+        return None
+    if not any(p.get("pane_id") == e["pane"] for p in panes):
+        return None
+    return {"name": nome, "pane_id": e["pane"], "agent": e.get("kind") or "claude", "agent_status": "saiu",
+            "cwd": e.get("cwd"), "agent_session": {"value": e["session"]}, "_orfao": True,
+            "_visto_em": e.get("visto_em")}
+
+
+def achar_alvo(alvo, lista):
+    """Agent por nome ou pane_id; sem alvo, o exec do projeto do diretorio atual."""
+    if alvo:
+        for a in lista:
+            if a.get("name") == alvo or a.get("pane_id") == alvo:
+                return a
+        orfao = agente_orfao(alvo, lista)
+        if orfao:
+            return orfao
+        raise SystemExit(f"agent '{alvo}' nao encontrado (veja `herdr-agent-restart --list`)")
+    atual = os.path.realpath(os.getcwd())
+    raiz = os.path.realpath(core.project_root(atual))
+    cand = [a for a in lista if os.path.realpath(core.project_root(a.get("cwd") or "/")) == raiz]
+    execs = [a for a in cand if (a.get("name") or "").endswith("-exec")]
+    if len(execs) == 1:
+        return execs[0]
+    nomes = ", ".join(sorted(a.get("name") or a["pane_id"] for a in cand)) or "nenhum agent neste diretorio"
+    raise SystemExit(f"nao deu para escolher sozinho em {raiz}: {nomes}. Informe o nome.")
+
+
+def sessao_de(info, argv):
+    sid = (info.get("agent_session") or {}).get("value")
+    if sid:
+        return sid
+    for k in ("--resume", "resume"):
+        if k in (argv or []) and (argv.index(k) + 1) < len(argv):
+            return argv[argv.index(k) + 1]
+    return None
+
+
+def checar_seguranca(info):
+    """Lista de motivos de recusa (vazia = pode reiniciar)."""
+    motivos = []
+    status = core.effective_status(info)
+    if status in ("working", "blocked"):
+        motivos.append(f"agent esta {status}")
+    elif status not in ("idle", "done"):
+        motivos.append(f"estado {status!r}: nao da pra confirmar que terminou")
+    tipo, texto, _ = core.classify_composition(info["pane_id"])
+    if tipo == "humano":
+        motivos.append(f"rascunho humano na caixa: {texto[:60]!r} (reiniciar descarta o rascunho)")
+    elif tipo == "dialogo":
+        motivos.append("dialogo pendente no pane")
+    elif tipo == "indeterminado":
+        motivos.append("nao consegui ler a caixa de composicao")
+    return motivos
+
+
+# ------------------------------------------------------------------ execucao
+def tela(pane, n=30):
+    r = subprocess.run(core.herdr_argv("pane", "read", pane, "--source", "visible", "--lines", str(n)),
+                       capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+    return r.stdout
+
+
+def encerrar(pid, espera_s=15):
+    os.kill(pid, signal.SIGTERM)
+    fim = time.time() + espera_s
+    while time.time() < fim:
+        if not os.path.exists(f"/proc/{pid}"):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def tratar_dialogos(pane, kind, tentativas=8):
+    """Codex: sessao ainda presa pelo processo antigo ('press R') e escolha de pasta. Claude: nada
+    e' aprovado automaticamente (o dialogo de confianca fica para o humano)."""
+    if kind != "codex":
+        return []
+    feito = []
+    for _ in range(tentativas):
+        t = tela(pane)
+        if "press R to continue" in t or "Press R to continue" in t:
+            subprocess.run(core.herdr_argv("pane", "send-keys", pane, "r"), capture_output=True, text=True)
+            feito.append("r (sessao presa pelo processo antigo)")
+            time.sleep(10)
+        elif "Use session directory" in t and "Working directory" in t:
+            subprocess.run(core.herdr_argv("pane", "send-keys", pane, "enter"), capture_output=True, text=True)
+            feito.append("enter (usar a pasta da sessao)")
+            time.sleep(4)
+        else:
+            break
+    return feito
+
+
+def log_restart(reg):
+    d = os.environ.get("HERDR_MESH_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".local", "state", "herdr-mesh")
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "restarts.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def reiniciar(info, kind, session, model, effort, old_pid, old_argv):  # old_pid None = agent ja saiu
+    pane, name = info["pane_id"], info["name"]
+    if old_pid is not None:
+        if not encerrar(old_pid):
+            return False, f"o processo {old_pid} nao saiu com SIGTERM; nada mais foi feito"
+        time.sleep(1.5)
+    args = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "90000", "--",
+            *start_args(kind, session, model, effort, old_argv)]
+    ultimo = ""
+    for _ in range(6):
+        r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)
+        ultimo = (r.stderr or r.stdout).strip()
+        if r.returncode == 0:
+            return True, "ok"
+        time.sleep(2.5)
+    return False, (f"agent start falhou (o processo antigo JA foi encerrado; retome com "
+                   f"`--resume {session}`): {ultimo[:160]}")
+
+
+def lista(agents, procs, cache):
+    linhas = []
+    for a in sorted(agents, key=lambda x: x.get("name") or ""):
+        pid, comm, argv = procs.get(a["pane_id"], (None, a["agent"], []))
+        try:
+            m, e, fonte = resolve_profile(a.get("name") or "", a["agent"], argv, cache.get(a.get("name") or ""), None)
+        except SystemExit:
+            m, e, fonte = "?", "?", "sem perfil"
+        linhas.append((a.get("name") or "<sem nome>", a["pane_id"], a["agent_status"], a["agent"],
+                       (sessao_de(a, argv) or "-")[:8], f"{m.replace('claude-', '')} {e}", fonte))
+    return linhas
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reinicia um agent do Herdr na mesma sessao, pane e nome.")
+    ap.add_argument("alvo", nargs="?", help="nome do agent ou pane_id; sem argumento: o exec do diretorio atual")
+    ap.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem encerrar nada")
+    ap.add_argument("--force", action="store_true", help="ignora as recusas (working, rascunho, dialogo)")
+    ap.add_argument("--model", help="modelo (ex.: claude-sonnet-5-5, gpt-6.1-sol)")
+    ap.add_argument("--effort", help="esforco: low|medium|high|xhigh|max")
+    ap.add_argument("--list", action="store_true", help="lista o perfil que seria usado para cada agent")
+    ap.add_argument("--session", help="id da sessao a retomar (so se o agent ja saiu e o ledger nao a tem)")
+    ap.add_argument("--_separado", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    agents, procs, cache = agentes(), processos(), probe_cache.ler()
+    if args.list:
+        print(f"{'agent':24}{'pane':9}{'status':9}{'kind':8}{'sessao':10}{'perfil':22}fonte")
+        for l in lista(agents, procs, cache):
+            print(f"{l[0]:24}{l[1]:9}{l[2]:9}{l[3]:8}{l[4]:10}{l[5]:22}{l[6]}")
+        return 0
+
+    info = achar_alvo(args.alvo, agents)
+    name, pane, kind = info.get("name"), info["pane_id"], info["agent"]
+    if not name:
+        raise SystemExit(f"o agent do pane {pane} nao tem nome: rode `herdr-fix-names` primeiro")
+    pid, comm, argv = procs.get(pane, (None, kind, []))
+    orfao = bool(info.get("_orfao"))
+    if pid is None and not orfao:
+        raise SystemExit(f"nao achei o processo {kind} do pane {pane}")
+    if orfao:
+        print(f"{name} nao esta na lista (saiu): usando o ultimo estado conhecido (visto {info.get('_visto_em')})")
+    session = args.session or sessao_de(info, argv)
+    if not session:
+        raise SystemExit(f"{name} nao tem sessao registrada (nunca teve um turno?): nao ha o que retomar")
+    model, effort, fonte = resolve_profile(name, kind, argv, cache.get(name), None, args.model, args.effort)
+
+    print(f"agent   : {name}  ({kind}, pane {pane}, {info['agent_status']})")
+    print(f"sessao  : {session}")
+    print(f"perfil  : {model} / {effort}   <- {fonte}")
+    print(f"comando : herdr agent start {name} --kind {kind} --pane {pane} -- "
+          f"{' '.join(start_args(kind, session, model, effort, argv))}")
+
+    motivos = [] if (args.force or orfao) else checar_seguranca(info)
+    if motivos:
+        print("RECUSADO:")
+        for m in motivos:
+            print(f"  - {m}")
+        print("(--force ignora; o processo e' encerrado por SIGTERM e um rascunho seria descartado)")
+        return 1
+    if args.dry_run:
+        print("dry-run: nada foi encerrado.")
+        return 0
+
+    if os.environ.get("HERDR_PANE_ID") == pane and not args._separado:
+        cmd = ["bash", "-c", f"sleep {DEMORA_SEPARADO_S}; exec {sys.executable} {os.path.abspath(__file__)} "
+               f"{pane} --force --model {model} --effort {effort} --_separado"]
+        subprocess.Popen(cmd, stdout=open("/dev/null", "w"), stderr=open("/dev/null", "w"),
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        print(f"este e' o seu proprio pane: o reinicio sai separado, em ~{DEMORA_SEPARADO_S} s. Nao digite nada ate voltar.")
+        return 0
+
+    ok, msg = reiniciar(info, kind, session, model, effort, pid, argv)
+    if not ok:
+        print(f"FALHA: {msg}")
+        log_restart({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": name, "ok": False, "msg": msg})
+        return 1
+    dialogos = tratar_dialogos(pane, kind)
+    time.sleep(2)
+    novo = next((a for a in agentes() if a.get("pane_id") == pane), {})
+    sid_novo = (novo.get("agent_session") or {}).get("value")
+    print(f"FEITO   : nome={novo.get('name')} interactive_ready={novo.get('interactive_ready')} "
+          f"status={novo.get('agent_status')} sessao={'igual' if sid_novo in (None, session) else sid_novo}")
+    if dialogos:
+        print("dialogos tratados: " + "; ".join(dialogos))
+    if kind == "claude" and "Yes, I trust this folder" in tela(pane):
+        print("ATENCAO: o Claude pediu confianca na pasta; aprove na mao (nao aprovo por voce).")
+    log_restart({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": name, "pane": pane,
+                 "kind": kind, "session": session, "model": model, "effort": effort, "fonte": fonte, "ok": True})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

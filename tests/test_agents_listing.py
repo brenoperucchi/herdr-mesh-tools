@@ -21,6 +21,9 @@ BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def _load():
+    import sys
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
     loader = SourceFileLoader("herdr_agents_test", os.path.join(BIN_DIR, "herdr-agents"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
@@ -87,6 +90,47 @@ class ClaudeDefaultsTests(unittest.TestCase):
         with mock.patch.object(self.m, "HOME", home):
             _model, effort = self.m.defaults_claude()
         self.assertIsNone(effort)
+
+
+class CodexOciosoPelaTelaTests(unittest.TestCase):
+    """Herdr >= 0.9.2 deixa todo Codex `unknown` depois de um turno (#4563). O
+    listing infere `idle?` so quando a caixa esta vazia e nao ha marcador de
+    trabalho -- e na duvida NAO infere."""
+
+    def setUp(self):
+        self.m = _load()
+
+    def test_caixa_vazia_sem_trabalho_e_ocioso(self):
+        tela = "Worked for 3m 0s • 7:06 PM\n› Ask Codex to do anything\n  gpt-6.1-sol high · ~/x\n  ? for shortcuts"
+        self.assertTrue(self.m.codex_ocioso_pela_tela(tela))
+
+    def test_timer_vivo_com_dica_de_interrupcao_nao_e_ocioso(self):
+        tela = "• Working (12s • esc to interrupt)\n› Ask Codex to do anything\n  gpt-6.1-sol high · ~/x"
+        self.assertFalse(self.m.codex_ocioso_pela_tela(tela))
+
+    def test_timer_vivo_sem_dica_de_interrupcao_nao_e_ocioso(self):
+        tela = "• Thinking (1m 5s)\n› Ask Codex to do anything\n  gpt-6.1-sol high · ~/x"
+        self.assertFalse(self.m.codex_ocioso_pela_tela(tela))
+
+    def test_rascunho_humano_na_caixa_nao_conta_como_ocioso(self):
+        tela = "Worked for 5s • 7:06 PM\n› criar as tags v0.3.0\n  gpt-6.1-sol high · ~/x"
+        self.assertFalse(self.m.codex_ocioso_pela_tela(tela))
+
+    def test_braille_animado_sobre_a_caixa_nao_e_trabalho(self):
+        tela = "Worked for 5s • 7:06 PM\n⠁  ⠄  ⠂ ⢀\n› Ask Codex to do anything ⠈ ⠐\n  gpt-6.1-sol high · ~/x"
+        self.assertTrue(self.m.codex_ocioso_pela_tela(tela))
+
+    def test_vazio_nao_infere(self):
+        self.assertFalse(self.m.codex_ocioso_pela_tela(""))
+
+    def test_status_efetivo_so_mexe_em_codex_unknown_pronto(self):
+        m = self.m
+        with mock.patch.object(m, "le_pane", return_value="› Ask Codex to do anything"):
+            codex = {"agent": "codex", "name": "x-rev-1", "agent_status": "unknown", "interactive_ready": True}
+            self.assertEqual(m.status_efetivo(codex), "idle?")
+            self.assertEqual(m.status_efetivo({**codex, "agent_status": "working"}), "working")
+            self.assertEqual(m.status_efetivo({**codex, "interactive_ready": None}), "unknown")
+            self.assertEqual(m.status_efetivo({**codex, "agent": "claude"}), "unknown")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 
 O dispatcher usa este comando como uma sonda periódica. Ele só lê agentes em
 ``idle``/``done`` e extrai o bloco ``Context window:`` do status renderizado
-pela CLI. Por padrão, consulta ``/status`` uma vez para obter uma medição atual;
-``--passive`` desliga essa consulta. Nenhuma decisão é aplicada automaticamente:
+pela CLI. Por padrão, usa somente o buffer já visível; ``--probe`` pede uma
+consulta explícita a ``/status``. Nenhuma decisão é aplicada automaticamente:
 o resultado é telemetria para o ``-exec`` decidir entre continuar, trocar o
 pane com ``herdr-swap`` ou consultar o operador.
 
@@ -30,6 +30,10 @@ import _herdr_dispatch as core
 DEFAULT_INTERVAL_S = 300.0
 DEFAULT_THRESHOLD_PERCENT = 20.0
 ROLE_SUFFIXES = ("-rev-1", "-rev-2", "-scout")
+IDENTITY_KEYS = (
+    "agent", "pane_id", "workspace_id", "tab_id", "cwd", "foreground_cwd",
+    "agent_session", "revision",
+)
 
 # Anchored to the status block. Do not replace this with a loose search for a
 # percentage: prose in a pane can mention arbitrary context numbers.
@@ -140,6 +144,21 @@ def identity_snapshot(info: dict) -> dict:
     }
 
 
+def _identity_changed(before: dict, after: dict, *, include_seq: bool = False) -> bool:
+    """Compare a âncora de identidade, permitindo avanço normal do lifecycle."""
+    keys = IDENTITY_KEYS + (("state_change_seq",) if include_seq else ())
+    return any(before.get(key) != after.get(key) for key in keys)
+
+
+def _cancel_status_probe(pane_id: str, record: dict) -> None:
+    """Best effort para retirar um /status que ficou em diálogo/modal."""
+    try:
+        core.api("pane", "send-keys", pane_id, "esc")
+        record["status_probe_cleanup"] = {"attempted": True, "key": "esc"}
+    except Exception as exc:
+        record["status_probe_cleanup"] = {"attempted": True, "error": str(exc)}
+
+
 def _process_evidence(info: dict) -> dict:
     pane_id = info.get("pane_id")
     if not pane_id:
@@ -178,6 +197,12 @@ def observe_agent(name: str, threshold_percent: float, *, probe_status: bool = F
         record["reason"] = "agent não está idle/done; nenhuma leitura de contexto feita"
         return record
 
+    pane_id = before.get("pane_id")
+    if not pane_id:
+        record["state"] = "unknown"
+        record["reason"] = "pane_id ausente"
+        return record
+
     if probe_status:
         try:
             probe_result, probe_info, _ = core.dispatch_and_wait_all(
@@ -193,28 +218,29 @@ def observe_agent(name: str, threshold_percent: float, *, probe_status: bool = F
                 "info": probe_info.get(name),
             }
             if probe_state not in ("idle", "done"):
+                _cancel_status_probe(pane_id, record)
                 record["state"] = "unknown"
                 record["reason"] = f"sonda /status terminou em {probe_state!r}"
                 record["reason_code"] = "status_probe_failed"
                 return record
-            # /status cria uma nova saída e pode avançar state_change_seq. A
-            # leitura seguinte vira a nova base da janela, não uma corrida.
-            before = core.get_agent_info(name)
-            snapshot_before = identity_snapshot(before)
-            record["identity_before"] = snapshot_before
+            # /status pode avançar state_change_seq; isso é lifecycle, não
+            # troca de identidade. A âncora original continua valendo.
+            after_probe = core.get_agent_info(name)
+            if _identity_changed(snapshot_before, identity_snapshot(after_probe)):
+                _cancel_status_probe(after_probe.get("pane_id") or pane_id, record)
+                record["state"] = "race"
+                record["reason"] = "identidade mudou durante a sonda /status"
+                record["reason_code"] = "identity_changed"
+                return record
+            before = after_probe
             record["status"] = before.get("agent_status")
         except Exception as exc:
+            _cancel_status_probe(pane_id, record)
             record["status_probe"] = {"attempted": True, "error": str(exc)}
             record["state"] = "unknown"
             record["reason"] = f"falha na sonda /status: {exc}"
             record["reason_code"] = "status_probe_failed"
             return record
-
-    pane_id = before.get("pane_id")
-    if not pane_id:
-        record["state"] = "unknown"
-        record["reason"] = "pane_id ausente"
-        return record
 
     try:
         text = core._read_agent_recent(name, lines=120)
@@ -242,7 +268,7 @@ def observe_agent(name: str, threshold_percent: float, *, probe_status: bool = F
         return record
     snapshot_after = identity_snapshot(after)
     record["identity_after"] = snapshot_after
-    if snapshot_before != snapshot_after:
+    if _identity_changed(snapshot_before, snapshot_after, include_seq=not probe_status):
         record["state"] = "race"
         record["reason"] = "metadata mudou durante a leitura; medição descartada"
         record["reason_code"] = "identity_changed"
@@ -338,8 +364,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="segundos entre leituras (default: 300)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD_PERCENT, help="percentual restante que gera near_limit (default: 20)")
     parser.add_argument("--output", help="arquivo JSON publicado atomicamente a cada leitura")
+    parser.add_argument("--probe", action="store_true",
+                        help="enviar /status explicitamente (pode alterar o lifecycle do pane)")
     parser.add_argument("--passive", action="store_true",
-                        help="não enviar /status; usa somente o buffer já visível")
+                        help="compatibilidade: mantém a leitura passiva (padrão)")
     args = parser.parse_args(argv)
     if args.interval <= 0:
         parser.error("--interval deve ser maior que zero")
@@ -349,7 +377,8 @@ def main(argv: list[str] | None = None) -> int:
     core.require_herdr_pane()
     try:
         while True:
-            payload = run_once(args.slug, args.threshold, probe_status=not args.passive)
+            payload = run_once(args.slug, args.threshold,
+                               probe_status=bool(args.probe and not args.passive))
             encoded = json.dumps(payload, ensure_ascii=False)
             print(encoded, flush=True)
             if args.output:

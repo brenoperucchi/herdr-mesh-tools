@@ -134,6 +134,8 @@ def main():
             ag = por_pane.get(pane_id)
             if ag is None:
                 continue  # pane sem agent: e' trabalho do bootstrap, nao deste script
+            if ag.get("agent") == "opencode" and str(ag.get("name") or "").endswith("-oc"):
+                continue  # cliente OpenCode `<slug>-oc`: fora dos papeis exec/rev/scout, nao e' erro
             if p["tab_id"] == f"{ws_id}:t1":
                 if pane_id not in rects:
                     avisos.append(f"{label}/{pane_id}: sem rect no layout — nao da pra inferir papel")

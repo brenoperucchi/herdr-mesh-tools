@@ -92,6 +92,10 @@ def main():
         sys.exit(1)
 
     c = ha.amostra_todos(agents)
+    try:
+        cache.gravar(cache.ledger_atualiza(cache.ler(cache.LEDGER_PATH), agents), cache.LEDGER_PATH)
+    except OSError as exc:      # o ledger e' auxiliar: nunca derruba a sonda
+        print(f"aviso: nao gravei o ledger ({exc})", file=sys.stderr)
     print(f"{len(c)} leitura(s) no cache ({cache.CACHE_PATH})")
 
     if args.deriva:
