@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _herdr_dispatch as core
 import _herdr_migration as migration
 import _herdr_review_groups as review_groups
+import _herdr_initial_hydration as initial_hydration
 
 HERDR = core.HERDR  # compatibilidade para consumidores que importam o módulo
 HOME = os.path.expanduser("~")
@@ -549,7 +550,12 @@ def bootstrap_review_group(group, args):
                     review_groups.revalidate(binding, core)
                     run("agent", "start", name, "--kind", kind, "--pane", pane, "--", *extra)
                     core._wait_restored_agent(name)
-                    current = review_groups.validate_member(binding, name, core.get_agent_info(name), core)
+                    current = core.get_agent_info(name)
+                    first_turn = kind == "codex" and current.get("agent_session") is None
+                    if first_turn:
+                        current = initial_hydration.hydrate_locked(binding, name, pane, core)
+                    else:
+                        current = review_groups.validate_member(binding, name, current, core)
                     if current["pane_id"] != pane:
                         raise RuntimeError("nome do revisor resolveu para outro pane")
                     review_groups.revalidate(binding, core)
@@ -559,7 +565,8 @@ def bootstrap_review_group(group, args):
                         coordinator_name=group.coordinator_name,
                     )
                     try:
-                        run("agent", "prompt", name, prompt)
+                        if not first_turn:
+                            run("agent", "prompt", name, prompt)
                         print(f"  {name}: criado; hydrated=true")
                     except core.GroupBindingRefusedError:
                         raise
@@ -595,16 +602,34 @@ def main():
                          "alguem o requisitou: `--with-reviewers` nao o liga)")
     ap.add_argument("--role", action="append", default=[], choices=["rev-1", "rev-2", "scout"],
                     help="cria somente este papel de um grupo (repetível)")
+    ap.add_argument("--hydrate-initial", choices=["rev-1", "rev-2", "scout"],
+                    help="somente o primeiro turno de um Codex existente sem sessão")
+    ap.add_argument("--pane", help="pane explicitamente autorizado para --hydrate-initial")
     args = ap.parse_args()
     DRY = args.dry_run
+    if args.hydrate_initial or args.pane:
+        if (not args.hydrate_initial or not args.pane or not args.group
+                or args.with_reviewers or args.with_scout or args.role):
+            ap.error("--hydrate-initial exige --group e --pane, sem provisionamento de papéis")
 
     group = review_groups.get_group(args.group or args.slug)
     if args.group and group is None:
         ap.error(f"grupo não registrado: {args.group}")
     if group is not None:
         try:
+            if args.hydrate_initial:
+                from contextlib import nullcontext
+                name = f"{group.slug}-{args.hydrate_initial}"
+                binding = review_groups.resolve_binding(group, core)
+                gate = migration.space_gate_message(binding["root"], group.slug)
+                if gate:
+                    raise RuntimeError(gate)
+                with (nullcontext() if DRY else review_groups.group_lock(group, core)):
+                    with (nullcontext() if DRY else core._dispatch_submission_locks({name: core.get_agent_info(name)})):
+                        initial_hydration.hydrate_locked(binding, name, args.pane, core, dry_run=DRY)
+                return 0
             return bootstrap_review_group(group, args)
-        except RuntimeError as exc:
+        except (RuntimeError, OSError, ValueError, KeyError) as exc:
             print(f"erro: {exc}", file=sys.stderr)
             return 1
 

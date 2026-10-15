@@ -477,3 +477,188 @@ def test_main_group_round_lock_failure_is_clean(env,monkeypatch,capsys,command):
     assert 'erro: grupo sample: rodada ou recuperação em andamento' in capsys.readouterr().err
     assert not list((root/'.herdr').glob('**/request.md'))
     assert not any(c[0]=='submission' for c in fake.calls)
+
+
+@pytest.fixture
+def initial(env, monkeypatch):
+    import _herdr_initial_hydration as initial
+    root,group,fake,boot,args=env
+    info=agent('sample-rev-1',root,'w9:p20',kind='codex')
+    info['agent_session']=None;info['terminal_id']='terminal-initial'
+    fake.agents[info['name']]=info
+    process={'pid':42,'starttime':'100','boot_id':'boot','executable':'/native/codex','argv_sha256':'hash'}
+    monkeypatch.setattr(initial,'process_identity',lambda *a:copy.deepcopy(process))
+    monkeypatch.setattr(core,'effective_agent_status',lambda name:fake.get(name)['agent_status'])
+    original_run=core.subprocess.run
+    def submit(*a,**kw):
+        if 'prompt' not in a[0]:return original_run(*a,**kw)
+        fake.calls.append(('initial-delivery',a[0]))
+        fake.agents['sample-rev-1']['agent_session']={'kind':'id','source':'herdr:codex','value':'native-first'}
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(initial.subprocess,'run',submit)
+    binding=groups.resolve_binding(group,core)
+    return initial, binding, info, process
+
+
+def test_initial_handshake_only_then_strict_session(env,initial):
+    _,_,fake,_,_=env; module,binding,info,_=initial
+    with pytest.raises(RuntimeError,match='sem sessão'):groups.existing_members(binding,core)
+    with pytest.raises(core.GroupBindingRefusedError):core.guard_delivery(('agent','prompt','sample-rev-1','arbitrary'))
+    result=module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert result['agent_session']['value']=='native-first'
+    groups.existing_members(binding,core)
+    delivered=[c for c in fake.calls if c[0]=='initial-delivery']
+    assert len(delivered)==1 and delivered[0][1][2:4]==['prompt','w9:p20']
+    assert 'Confirme explicitamente' in delivered[0][1][4]
+
+
+def test_initial_dry_run_never_sends_or_creates_receipt(env,initial):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    module.hydrate_locked(binding,'sample-rev-1','w9:p20',core,dry_run=True)
+    assert fake.calls==[]
+
+
+@pytest.mark.parametrize('code',[1,2,3,4])
+def test_initial_guard_refusal_never_submits(env,initial,monkeypatch,code):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    monkeypatch.setattr(core,'require_can_send',mock.Mock(side_effect=core.DeliveryRefusedError(str(code))))
+    with pytest.raises(core.DeliveryRefusedError):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+
+
+@pytest.mark.parametrize('field,value',[('pane_id','changed'),('terminal_id',None),('tab_id','changed'),('interactive_ready',None),('agent_status','working')])
+def test_initial_target_mismatch_never_submits(env,initial,field,value):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    fake.agents['sample-rev-1'][field]=value
+    with pytest.raises(RuntimeError):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+
+
+def test_initial_process_change_after_guard_never_submits(env,initial,monkeypatch):
+    _,_,fake,_,_=env;module,binding,_,process=initial
+    monkeypatch.setattr(core,'require_can_send',lambda *a,**kw:process.update(starttime='changed'))
+    with pytest.raises(RuntimeError,match='identidade'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+
+
+def test_initial_ambiguous_receipt_forbids_retry(env,initial,monkeypatch):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    monkeypatch.setattr(module,'TIMEOUT_S',0)
+    original_run=core.subprocess.run
+    def submit(*a,**kw):
+        if 'prompt' not in a[0]:return original_run(*a,**kw)
+        fake.calls.append(('initial-delivery',a[0]));return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(module.subprocess,'run',submit)
+    with pytest.raises(RuntimeError,match='incompleta'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    with pytest.raises(RuntimeError,match='recibo inicial existente'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert len(fake.calls)==1
+
+
+def test_initial_other_member_is_strict(env,initial):
+    root,_,fake,_,_=env;module,binding,_,_=initial
+    other=agent('sample-rev-2',root,'w9:p21');other['agent_session']=None
+    fake.agents[other['name']]=other
+    with pytest.raises(RuntimeError,match='sem sessão'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+
+
+@pytest.mark.parametrize('tail',[['resume','id'],['prompt'],['--unknown'],['-m'],['--'],['--image','file']])
+def test_initial_argv_refuses_old_turns(tail):
+    import _herdr_initial_hydration as initial
+    with pytest.raises(RuntimeError):initial._initial_argv(['/native/codex',*tail])
+
+
+def test_initial_argv_keeps_observed_profile_without_defaults():
+    import _herdr_initial_hydration as initial
+    initial._initial_argv(['/native/codex','-m','arbitrary-existing-model','-c','model_reasoning_effort=low','-s','workspace-write','-C','/project','--no-daemon'])
+
+
+
+def test_initial_cli_dry_run_pinned_target_no_provision(env,initial,monkeypatch):
+    _,_,fake,boot,_=env
+    monkeypatch.setattr(sys,'argv',['herdr-bootstrap','--group','sample','--hydrate-initial','rev-1','--pane','w9:p20','--dry-run'])
+    assert boot.main()==0
+    assert fake.calls==[]
+
+
+def test_initial_automatic_new_codex_is_hydrated_once(env,monkeypatch):
+    import _herdr_initial_hydration as initial
+    _,group,fake,boot,args=env
+    original=fake.api
+    def api(*a):
+        result=original(*a)
+        if a[:2]==('agent','start') and a[2].endswith('rev-1'):
+            fake.agents[a[2]]['agent_session']=None
+        return result
+    monkeypatch.setattr(boot,'api',api)
+    def hydrate(binding,name,pane,runtime):
+        assert fake.get(name)['agent_session'] is None
+        fake.calls.append(('canonical-initial',name))
+        fake.agents[name]['agent_session']={'kind':'id','source':'herdr:codex','value':'new-native'}
+        return fake.get(name)
+    monkeypatch.setattr(initial,'hydrate_locked',hydrate)
+    assert boot.bootstrap_review_group(group,args)==0
+    assert len([c for c in fake.calls if c[0]=='canonical-initial'])==1
+    assert not any(c[:3]==('agent','prompt','sample-rev-1') for c in fake.calls)
+
+
+@pytest.mark.parametrize('case',['ok','ambiguous','argv','cwd','suspended','exe'])
+def test_initial_process_crosschecks_foreground_and_proc(env,monkeypatch,case):
+    import _herdr_initial_hydration as initial
+    root,_,_,_,_=env
+    info=agent('sample-rev-1',root,'w9:p20',kind='codex')
+    argv=['/native/codex','-m','observed-model','-c','model_reasoning_effort=low']
+    native=dict(argv=argv,starttime='100',state='S',cwd=str(root),executable='/native/codex',boot_id='boot')
+    processes=[dict(pid=42,name='codex',argv=argv,cwd=str(root))]
+    if case=='ambiguous':processes*=2
+    elif case=='argv':native['argv']=[*argv,'prompt']
+    elif case=='cwd':native['cwd']='/different'
+    elif case=='suspended':native['state']='T'
+    elif case=='exe':native['executable']='/native/bash'
+    monkeypatch.setattr(initial,'_proc_identity',lambda p:native)
+    monkeypatch.setattr(core,'api',lambda *a:{'process_info':{'pane_id':'w9:p20','foreground_processes':processes}})
+    if case=='ok':assert initial.process_identity(info,core,str(root))['pid']==42
+    else:
+        with pytest.raises(RuntimeError):initial.process_identity(info,core,str(root))
+
+
+def test_initial_receipt_failure_before_delivery_never_submits(env,initial,monkeypatch):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    monkeypatch.setattr(module,'_persist',mock.Mock(side_effect=OSError('disk full')))
+    with pytest.raises(OSError):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+
+
+def test_initial_second_guard_refusal_never_submits(env,initial,monkeypatch):
+    _,_,fake,_,_=env;module,binding,_,_=initial
+    monkeypatch.setattr(core,'require_can_send',mock.Mock(side_effect=[None,core.DeliveryRefusedError('draft')]))
+    with pytest.raises(RuntimeError,match='incompleta'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    assert fake.calls==[]
+    path=module._receipt_path(binding,'sample-rev-1',fake.get('sample-rev-1'),initial[3],core)
+    assert json.loads(path.read_text())['state']=='aborted_before_send'
+    with pytest.raises(RuntimeError,match='recibo inicial existente'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+
+
+
+@pytest.mark.parametrize('native_after_stall',[True,False])
+def test_initial_stall_observes_without_resubmitting(env,initial,monkeypatch,native_after_stall):
+    _,_,fake,_,_=env;module,binding,_,process=initial
+    original_run=core.subprocess.run
+    def stalled(*a,**kw):
+        if 'prompt' not in a[0]:return original_run(*a,**kw)
+        fake.calls.append(('initial-delivery',a[0]))
+        if native_after_stall:
+            fake.agents['sample-rev-1']['agent_session']={'kind':'id','source':'herdr:codex','value':'late-native'}
+        return SimpleNamespace(returncode=1,stdout=json.dumps({'error':{'code':'agent_prompt_stalled'}}),stderr='')
+    monkeypatch.setattr(module.subprocess,'run',stalled)
+    monkeypatch.setattr(module,'TIMEOUT_S',0)
+    if native_after_stall:
+        result=module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+        assert result['agent_session']['value']=='late-native'
+    else:
+        with pytest.raises(RuntimeError,match='incompleta'):module.hydrate_locked(binding,'sample-rev-1','w9:p20',core)
+    path=module._receipt_path(binding,'sample-rev-1',fake.get('sample-rev-1'),process,core)
+    receipt=json.loads(path.read_text())
+    assert receipt['state']==('complete' if native_after_stall else 'ambiguous')
+    assert receipt['delivery_error']=='agent_prompt_stalled'
+    assert len(fake.calls)==1

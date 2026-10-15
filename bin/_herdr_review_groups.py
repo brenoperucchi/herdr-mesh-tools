@@ -89,7 +89,7 @@ def identity(info):
     )}
 
 
-def check_project(info, root, core):
+def _check_location(info, root, core):
     if info.get("interactive_ready") is False:
         raise RuntimeError(f"agent não está interactive-ready: {info.get('name')}")
     for field in ("cwd", "foreground_cwd"):
@@ -98,6 +98,10 @@ def check_project(info, root, core):
     for field in ("pane_id", "tab_id", "workspace_id"):
         if not info.get(field):
             raise RuntimeError(f"vínculo de grupo sem {field}")
+
+
+def check_project(info, root, core):
+    _check_location(info, root, core)
     if not isinstance(info.get("agent_session"), dict) or not info["agent_session"].get("value"):
         raise RuntimeError(f"vínculo de grupo sem sessão comprovada: {info.get('name')}")
 
@@ -125,6 +129,11 @@ def validate_member(binding, name, info, core):
     if name not in group.roles() or info.get("name") != name:
         raise RuntimeError(f"alvo não pertence ao grupo: {name}")
     check_project(info, binding["root"], core)
+    return _check_member_topology(binding, name, info)
+
+
+def _check_member_topology(binding, name, info):
+    group = get_group(binding["slug"])
     owner = binding["coordinator"]
     if (info.get("agent") != group.roles()[name][1]
             or info.get("pane_id") == owner["pane_id"]
@@ -204,3 +213,16 @@ def protected_candidate(info, agents, core):
         if not anchors and info.get("cwd") and core.project_root(info["cwd"]) == group.project_root:
             return True
     return False
+
+
+def validate_initial_codex_member(binding, name, info, core):
+    """Only the first canonical hydration may lack a native session."""
+    group = get_group(binding['slug'])
+    if (name not in group.roles() or info.get('name') != name
+            or group.roles()[name][1] != 'codex' or info.get('agent_session') is not None
+            or info.get('interactive_ready') is not True
+            or info.get('agent_status') not in ('idle', 'done')
+            or not info.get('terminal_id')):
+        raise RuntimeError('hidratação inicial exige papel Codex sem sessão, explicitamente pronto')
+    _check_location(info, binding['root'], core)
+    return _check_member_topology(binding, name, info)
