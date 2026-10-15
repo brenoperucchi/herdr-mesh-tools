@@ -87,11 +87,10 @@ resultado é `artifact_missing` e a consulta falha; nunca trate `done` com
 temporário no mesmo diretório e `os.replace`, de modo que leituras concorrentes
 não observem JSON parcial.
 
-Os panes de `rev-1`, `rev-2` e `scout` são headless. Uma composição residual
-(inclusive uma letra digitada por engano) é descartável e não impede o reset ou
-o próximo despacho; somente um diálogo real do CLI, reportado pelo canal
-oficial como `agent_blocked`, interrompe a cadeia. A proteção contra texto
-humano não enviado continua valendo para o `-exec` e para o `herdr-swap`.
+Antes de cada entrega, inclusive aos revisores headless, execute
+`herdr-can-send <alvo>`. Só código 0 permite enviar; códigos 1–4 recusam.
+Sugestão automática não é rascunho. Não descarte composição para contornar
+uma recusa. O dispatcher não reseta revisores automaticamente.
 
 Antes de criar os prompts, o dispatcher revalida sob lock curto o snapshot
 capturado de cada alvo: status, pane, workspace, cwd, sessão, revision e
@@ -183,3 +182,16 @@ entre posições.
   existe — nesse ponto a pergunta certa é "isso está correto", não "qual a
   melhor abordagem", e o formato de achado atômico do `herdr-review` serve
   melhor.
+
+
+## Grupo na tab do coordenador
+
+Grupos registrados usam um `coordinator_name` explícito; o nome não precisa
+terminar em `-exec`. Use o slug configurado, sem inferi-lo do label da tab.
+O primeiro grupo é `guardian2`, coordenado por `guardian2-exec`, com raiz real
+`/home/brenoperucchi/Devs/guardian2`. Rode a partir dessa raiz e use o slug
+`guardian2` na chamada normal. Revisores ausentes sobem somente na tab atual
+do coordenador vivo; a raiz de `cwd` e `foreground_cwd` deve coincidir.
+Para fechar o par após o resultado: `herdr-release guardian2 --only reviewers`.
+O grupo recusa liberação de agent ocupado, vínculo divergente ou rodada
+incompleta mesmo com `--force`. Bia não tem grupo registrado nesta entrega.

@@ -20,7 +20,8 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 # Modulo irmao: garante a pasta bin no caminho de busca mesmo quando este arquivo e' carregado
@@ -29,6 +30,7 @@ _AQUI = os.path.dirname(os.path.abspath(__file__))
 if _AQUI not in sys.path:
     sys.path.insert(0, _AQUI)
 from _herdr_codex_status import inferir_idle  # noqa: E402
+import _herdr_review_groups as review_groups
 
 # Consultas seguidas (uma a cada ~2s) com artefato pronto E tela ociosa para um
 # Codex assentar sem o idle/done do Herdr. Ver o laco de espera de dispatch.
@@ -177,7 +179,66 @@ def herdr_argv(*args):
     return [HERDR, *prefixo, *args]
 
 
+class DeliveryRefusedError(RuntimeError):
+    """A rejected read-only guard must never trigger draft-clearing cleanup."""
+
+
+class GroupBindingRefusedError(DeliveryRefusedError):
+    """A topology change is operational failure, while preserving drafts."""
+
+
+def require_can_send(name, *, expected_pane=None):
+    """Run the mesh's read-only delivery guard immediately before sending."""
+    guard = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-can-send")
+    try:
+        result = subprocess.run(
+            [sys.executable, guard, name, "--json"], capture_output=True,
+            text=True, timeout=CLI_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeliveryRefusedError(f"herdr-can-send {name}: leitura falhou; envio recusado") from exc
+    if result.returncode != 0:
+        raise DeliveryRefusedError(
+            f"herdr-can-send {name}: código {result.returncode}; envio recusado: "
+            f"{(result.stdout or result.stderr).strip()}"
+        )
+    if expected_pane is not None:
+        try:
+            verdict = json.loads(result.stdout)
+        except (TypeError, ValueError) as exc:
+            raise DeliveryRefusedError(f"herdr-can-send {name}: JSON inválido; envio recusado") from exc
+        if (verdict.get("codigo") != 0 or verdict.get("pode_enviar") is not True
+                or verdict.get("pane") != expected_pane):
+            raise DeliveryRefusedError(f"herdr-can-send {name}: pane/veredito mudou; envio recusado")
+
+
+def _group_runtime():
+    # SourceFileLoader consumers do not always register their module in sys.modules.
+    return SimpleNamespace(get_agent_info=get_agent_info, project_root=project_root,
+                           herdr_argv=herdr_argv, _is_agent_not_found=_is_agent_not_found,
+                           DISPATCH_LOCK_WAIT_S=DISPATCH_LOCK_WAIT_S)
+
+
+def guard_delivery(args, expected=None):
+    """Guard text only; reads performed by herdr-can-send cannot recurse."""
+    if args[:2] not in (("agent", "prompt"), ("pane", "run"), ("pane", "send-text")):
+        return
+    try:
+        name = args[2]
+        info = expected or get_agent_info(name)
+        require_can_send(name, expected_pane=info.get("pane_id"))
+        group = review_groups.group_for_agent(info.get("name", name))
+        if group is not None and info.get("name") in group.roles():
+            binding = review_groups.resolve_binding(group, _group_runtime())
+            review_groups.validate_member(binding, info["name"], get_agent_info(name), _group_runtime())
+    except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, DeliveryRefusedError):
+            raise
+        raise GroupBindingRefusedError(f"guarda de envio recusou: {exc}") from exc
+
+
 def api(*args):
+    guard_delivery(args)
     try:
         out = subprocess.run(herdr_argv(*args), capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -271,6 +332,13 @@ def _agent_restore_lock(slug):
 
 def ensure_required_agents(slug, cwd, required_names):
     """Serializa e executa a recuperação de papéis obrigatórios ausentes."""
+    group = review_groups.get_group(slug)
+    if group is not None:
+        try:
+            binding = review_groups.resolve_binding(group, _group_runtime(), cwd)
+            review_groups.existing_members(binding, _group_runtime())
+        except RuntimeError as exc:
+            raise AgentRestoreError(str(exc)) from exc
     with _agent_restore_lock(slug):
         return _ensure_required_agents_locked(slug, cwd, required_names)
 
@@ -316,9 +384,15 @@ def _ensure_required_agents_locked(slug, cwd, required_names):
     command = [sys.executable, bootstrap, "--slug", slug]
     # Sobe so o que falta: spaces enxutos (`lean`) ignoram o papel que nao for ligado
     # explicitamente, e o scout NAO deve subir quando so um revisor foi requisitado.
-    if any(n.endswith(("-rev", "-rev-1", "-rev-2")) for n in missing):
+    group = review_groups.get_group(slug)
+    if group is not None:
+        for name in missing:
+            if name not in group.roles():
+                raise AgentRestoreError(f"papel não declarado no grupo: {name}")
+            command.extend(["--role", group.roles()[name][0]])
+    elif any(n.endswith(("-rev", "-rev-1", "-rev-2")) for n in missing):
         command.append("--with-reviewers")
-    if any(n.endswith("-scout") for n in missing):
+    if group is None and any(n.endswith("-scout") for n in missing):
         command.append("--with-scout")
     try:
         out = subprocess.run(
@@ -640,7 +714,7 @@ nunca inferida do treinamento do modelo:
    pane, workspace/space, cwd e raiz do projeto, família/kind, estado e
    `interactive_ready` com este prompt e com a solicitação recebida.
 2. Confirme explicitamente o papel `{role}`. A autoridade humana é Breno, o
-   usuário/owner deste workspace. `{slug}-exec` é o mecanismo/coordenador
+   usuário/owner deste workspace. `{coordinator_name}` é o mecanismo/coordenador
    delegado por Breno para despachar e consolidar trabalho; isso não autoriza
    inventar regras, canais ou agentes. Cada agent só exerce o dever do seu
    papel e não assume a autoridade de outro.
@@ -709,7 +783,7 @@ Política de escalonamento que o exec deve aplicar ao ciclo de revisão:
 6. O dispatcher entrega a dúvida ao scout existente sem reset automático. Se
    uma fronteira limpa for necessária, o exec usa `herdr-swap` com handoff;
    `herdr-context-watch` mede o contexto somente em leitura.
-7. O scout devolve `answer.md` ao `{slug}-exec`; não fala diretamente com o
+7. O scout devolve `answer.md` ao `{coordinator_name}`; não fala diretamente com o
    usuário, não decide pelo space e não faz commit. Depois de ler a resposta,
    se você ainda julgar necessária outra análise, ou se o scout registrar
    divergência ou incerteza, pare e consulte o Breno. A decisão final deve estar
@@ -733,13 +807,11 @@ junto (dois incidentes reais registrados no CLAUDE.md do usuário)."""
 # ativa no exec e no swap, onde pode haver uma pessoa operando o pane.
 HEADLESS_REVIEWER_NOTE = """
 
-Panes headless de revisão: `{slug}-rev-1`, `{slug}-rev-2` e `{slug}-scout` são
-usados somente para análise. Texto residual na caixa de composição (inclusive
-uma letra isolada digitada por engano) não é autorização humana e não deve
-parar o fluxo de reset ou despacho; o dispatcher pode descartá-lo e seguir
-pelo canal oficial. Um diálogo real do CLI ainda pode ser recusado como
-`agent_blocked`. O `{slug}-exec` é quem consolida a análise e fala com Breno;
-a guarda de composição humana permanece no exec e no `herdr-swap`.
+Regra de envio: mesmo os revisores/scout sendo headless, execute
+`herdr-can-send <alvo>` antes de cada entrega. Só código 0 permite enviar;
+rascunho humano (1), diálogo (2), trabalho/bloqueio (3) e falha de leitura (4)
+impedem envio. Não descarte texto para contornar essa recusa. O `{coordinator_name}`
+consolida a análise e fala com Breno; só o canal oficial entrega trabalho.
 """
 
 SCOUT_ROLE_NOTE = """
@@ -755,6 +827,9 @@ enquanto isso."""
 
 
 def _infer_role(name):
+    group = review_groups.group_for_agent(name)
+    if group is not None and name == group.coordinator_name:
+        return "exec"
     if name.endswith("-rev-2"):
         return "rev-2"
     if name.endswith("-rev-1"):
@@ -779,7 +854,7 @@ mão, e não os trate como indisponíveis: peça a revisão pelo caminho normal.
 """
 
 
-def role_reinforcement_prompt(name, slug, cwd, siblings, lean=False):
+def role_reinforcement_prompt(name, slug, cwd, siblings, lean=False, coordinator_name=None):
     """siblings: lista de nomes dos outros agents do mesmo space (`<slug>-exec`,
     `<slug>-rev`, `<slug>-rev-2`), já sem o próprio `name`. Formata como texto
     corrido pro prompt; lista vazia (space sem colegas, ex. "herdr" sem exec)
@@ -788,18 +863,20 @@ def role_reinforcement_prompt(name, slug, cwd, siblings, lean=False):
     lean_exec = lean and _infer_role(name) == "exec"
     if lean_exec:
         sib_text = "nenhum ligado agora — space enxuto, os demais sobem sob demanda"
+    owner = coordinator_name or review_groups.coordinator_name(slug)
     prompt = ROLE_REINFORCEMENT_PROMPT.format(
         name=name,
         slug=slug,
         cwd=cwd,
         siblings=sib_text,
         role=_infer_role(name) or "não determinado",
+        coordinator_name=owner,
         interactive_ready_caveat=INTERACTIVE_READY_CAVEAT,
     )
     if _infer_role(name) == "scout":
-        exec_name = f"{slug}-exec"
+        exec_name = owner
         prompt += SCOUT_ROLE_NOTE.format(name=name, exec_name=exec_name)
-    prompt += HEADLESS_REVIEWER_NOTE.format(slug=slug)
+    prompt += HEADLESS_REVIEWER_NOTE.format(slug=slug, coordinator_name=owner)
     if lean_exec:
         prompt += LEAN_EXEC_NOTE.format(slug=slug)
     return prompt
@@ -1883,6 +1960,8 @@ def _prompt_native_headless(name, pane_id, text):
         # operation. Separate send-text/send-keys calls had a real race in
         # Codex: the next official seed could concatenate with `/status`.
         return _herdr_allow_empty("pane", "run", pane_id, text)
+    except DeliveryRefusedError as exc:
+        raise ContextResetError(f"guarda recusou comando nativo; composição preservada: {exc}") from exc
     except RuntimeError as exc:
         # If the native operation failed, never leave a slash command in the
         # compose box for the next official prompt.
@@ -1904,6 +1983,8 @@ def _discard_headless_composition(pane_id):
     itself uses atomic ``pane run`` submission. This is deliberately limited to
     reviewer/scout panes, never the human-operated exec pane.
     """
+    # New mesh policy takes precedence over the old headless discard policy.
+    require_can_send(pane_id, expected_pane=pane_id)
     blocked, why = pane_looks_busy_with_human_input(
         pane_id, check_composition=False
     )
@@ -1927,6 +2008,7 @@ def _herdr_allow_empty(*args):
     the key was applied. Recovery callers therefore treat this as best-effort
     cleanup and still rely on the subsequent identity/status boundary.
     """
+    guard_delivery(args)
     try:
         out = subprocess.run(
             herdr_argv(*args), capture_output=True, text=True, timeout=CLI_TIMEOUT_S
@@ -2394,7 +2476,7 @@ def reset_reviewer_context(name, timeout_s=1200):
 
 def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                                 *, expected_agents=None, check_composition=True,
-                                allow_working=False):
+                                allow_working=False, group_binding=None):
     """Manda o prompt e espera cada agent assentar (idle/done) via
     `agent prompt --wait`, um subprocesso concorrente por nome — um agent
     lento ou travado não atrasa a detecção dos outros. Ancorado na submissão,
@@ -2471,6 +2553,19 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
     preflight_observed = {}
 
     def prompt_process(name, text):
+        try:
+            expected = (expected_agents or {}).get(name, {})
+            if group_binding is not None:
+                review_groups.revalidate(group_binding, _group_runtime())
+                review_groups.validate_member(group_binding, name, get_agent_info(name), _group_runtime())
+            require_can_send(name, expected_pane=expected.get("pane_id"))
+            if group_binding is not None:
+                review_groups.revalidate(group_binding, _group_runtime())
+                current = get_agent_info(name)
+                if _dispatch_differences(expected, current, include_lifecycle=False):
+                    raise RuntimeError("identidade mudou durante herdr-can-send")
+        except RuntimeError as exc:
+            raise DispatchPreflightError(name, str(exc)) from exc
         return subprocess.Popen(
             herdr_argv("agent", "prompt", name, text,
                        "--wait", "--until", "idle", "--until", "done",
@@ -2489,10 +2584,23 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                 check_composition=check_composition,
                 allow_working=allow_working,
             )
-    procs = {name: prompt_process(name, text) for name, text in prompts.items()}
-    result = {name: None for name in procs}
-    info = {}
-    settle_ts = {}
+    # Check all recipients before the first submission. Recheck per actual
+    # submission/retry above; a late refusal is a recorded partial dispatch.
+    for name in prompts:
+        try:
+            require_can_send(name, expected_pane=(expected_agents or {}).get(name, {}).get("pane_id"))
+        except RuntimeError as exc:
+            raise DispatchPreflightError(name, str(exc)) from exc
+    procs, result, info, settle_ts = {}, {}, {}, {}
+    for name, text in prompts.items():
+        try:
+            procs[name] = prompt_process(name, text)
+            result[name] = None
+        except DispatchPreflightError as exc:
+            procs[name] = None
+            result[name] = "preflight_aborted"
+            info[name] = exc.as_dict()
+            settle_ts[name] = now_iso()
     blocked_since = dict.fromkeys(procs)
     reenviados = set()   # ping-pong: quem ja teve UMA segunda tentativa
     artifact_pending = {}
@@ -2815,7 +2923,7 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
 
 def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
                           *, expected_agents=None, check_composition=True,
-                          allow_working=False):
+                          allow_working=False, group_binding=None):
     """Run a dispatch while reserving every expected target until settlement.
 
     The reservation spans preflight, prompt submission, retries and artifact
@@ -2824,15 +2932,16 @@ def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
     turn is still settling.
     """
     expected = None if expected_agents is None else dict(expected_agents)
-    try:
-        with _dispatch_submission_locks(expected):
-            return _dispatch_and_wait_all_impl(
-                prompts,
-                timeout_s,
-                required_artifacts,
-                expected_agents=expected,
-                check_composition=check_composition,
-                allow_working=allow_working,
-            )
-    except DispatchLockBusyError as exc:
-        raise DispatchPreflightError(exc.name, str(exc)) from exc
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(review_groups.dispatch_reservation(prompts, _group_runtime(), group_binding))
+            stack.enter_context(_dispatch_submission_locks(expected))
+        except (RuntimeError, OSError) as exc:
+            if isinstance(exc, DispatchPreflightError):
+                raise
+            raise DispatchPreflightError(getattr(exc, "name", next(iter(prompts), "group")), str(exc)) from exc
+        return _dispatch_and_wait_all_impl(
+            prompts, timeout_s, required_artifacts, expected_agents=expected,
+            check_composition=check_composition, allow_working=allow_working,
+            group_binding=group_binding,
+        )

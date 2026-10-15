@@ -29,6 +29,9 @@ def _load():
 class PaneCompositionTests(unittest.TestCase):
     def setUp(self):
         self.core = _load()
+        delivery_guard = mock.patch.object(self.core, "require_can_send", return_value=None)
+        delivery_guard.start()
+        self.addCleanup(delivery_guard.stop)
 
     def _read(self, text, **kwargs):
         result = mock.Mock(returncode=0, stdout=text, stderr="")
@@ -61,6 +64,9 @@ class PaneCompositionTests(unittest.TestCase):
 class ReviewerContextResetTests(unittest.TestCase):
     def setUp(self):
         self.core = _load()
+        delivery_guard = mock.patch.object(self.core, "require_can_send", return_value=None)
+        delivery_guard.start()
+        self.addCleanup(delivery_guard.stop)
         # Exercise the legacy primitive explicitly; production policy remains
         # disabled and is covered by test_disabled_reset_is_explicitly_blocked.
         self.core.AUTOMATIC_REVIEWER_RESET = True
@@ -111,6 +117,7 @@ class ReviewerContextResetTests(unittest.TestCase):
                  ({"rev": "idle"}, {}, {}),
              ]), \
              mock.patch.object(self.core, "api", return_value={}) as api_call, \
+             mock.patch.object(self.core, "guard_delivery"), \
              mock.patch.object(self.core, "_runtime_profile", side_effect=[profile, profile]), \
              mock.patch.object(self.core, "_read_agent_recent", return_value="probe"), \
              mock.patch.object(self.core, "_wait_for_seed_answer", return_value=seed_answer), \
@@ -135,6 +142,7 @@ class ReviewerContextResetTests(unittest.TestCase):
     def test_headless_claude_native_reset_clears_draft_before_command(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(self.core, "api", return_value={}) as api_call, \
+             mock.patch.object(self.core, "guard_delivery"), \
              mock.patch.object(self.core.subprocess, "run", return_value=completed) as run:
             self.core._prompt_native_headless("herdr-sim-rev-2", "wY:p3", "/clear")
         api_call.assert_not_called()

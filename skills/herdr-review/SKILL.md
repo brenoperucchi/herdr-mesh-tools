@@ -82,13 +82,10 @@ aprovação com `verdict_bytes: 0`. O `metrics.json` é publicado por um
 temporário no mesmo diretório e `os.replace`, evitando que uma leitura
 concorrente veja JSON pela metade.
 
-Os panes de `rev-1`, `rev-2` e `scout` são headless. Texto residual na caixa de
-composição, inclusive uma letra digitada por engano, é descartável e não para
-o dispatcher; somente um diálogo real do CLI, recusado pelo canal oficial como
-`agent_blocked`, bloqueia o despacho. O dispatcher não faz reset automático nem
-exige que modelo ou reasoning permaneçam iguais; `herdr-swap` é o caminho
-explícito para recriar o pane com handoff. A guarda contra composição humana
-permanece no `-exec` e no `herdr-swap`.
+Antes de cada entrega, inclusive aos revisores headless, execute
+`herdr-can-send <alvo>`. Só código 0 permite enviar; códigos 1–4 recusam.
+Sugestão automática não é rascunho. Não descarte composição para contornar
+uma recusa. O dispatcher não reseta revisores automaticamente.
 
 Antes de criar os prompts, o dispatcher revalida sob lock curto o snapshot
 capturado de cada alvo: status, pane, workspace, cwd, sessão, revision e
@@ -192,3 +189,16 @@ INCERTEZA/DIVERGÊNCIA, somente o exec consulta o Breno.
 - Não trate `TIMEOUT` ou revisor `BLOCKED` como aprovação.
 - Não decida sozinho que um CONFLITO não procede, mesmo que a rota de
   `herdr-ask` produza uma posição favorável.
+
+
+## Grupo na tab do coordenador
+
+Grupos registrados usam um `coordinator_name` explícito; o nome não precisa
+terminar em `-exec`. Use o slug configurado, sem inferi-lo do label da tab.
+O primeiro grupo é `guardian2`, coordenado por `guardian2-exec`, com raiz real
+`/home/brenoperucchi/Devs/guardian2`. Rode a partir dessa raiz e use o slug
+`guardian2` na chamada normal. Revisores ausentes sobem somente na tab atual
+do coordenador vivo; a raiz de `cwd` e `foreground_cwd` deve coincidir.
+Para fechar o par após o resultado: `herdr-release guardian2 --only reviewers`.
+O grupo recusa liberação de agent ocupado, vínculo divergente ou rodada
+incompleta mesmo com `--force`. Bia não tem grupo registrado nesta entrega.

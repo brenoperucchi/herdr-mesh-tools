@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _herdr_dispatch as core
 import _herdr_migration as migration
+import _herdr_review_groups as review_groups
 
 HERDR = core.HERDR  # compatibilidade para consumidores que importam o módulo
 HOME = os.path.expanduser("~")
@@ -349,6 +350,7 @@ def build_rev_agents(slug, cwd):
 
 
 def api(*args):
+    core.guard_delivery(args)
     out = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"{' '.join(args)}: {out.stderr.strip() or out.stdout.strip()}")
@@ -426,7 +428,7 @@ def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, 
             print(f"  {pane_id}: aviso — falhei mandando reforço de papel pra {name}: {exc}")
 
 
-def find_unnamed_role_base(agents, workspace_id, tab1_id, expected_kind=None):
+def find_unnamed_role_base(agents, workspace_id, tab1_id, expected_kind=None, expected_cwd=None):
     """Encontra um pane de papel headless que perdeu apenas o registro de nome.
 
     Um processo vivo sem ``name`` é uma base de restauração, não uma pane
@@ -440,11 +442,14 @@ def find_unnamed_role_base(agents, workspace_id, tab1_id, expected_kind=None):
         and a.get("tab_id") != tab1_id
         and not a.get("name")
         and (expected_kind is None or a.get("agent") == expected_kind)
+        and (expected_cwd is None or anonymous_project_matches(a, expected_cwd))
+        and not review_groups.protected_candidate(a, agents, core)
     ]
     return candidates[0] if len(candidates) == 1 else None
 
 
-def find_unnamed_reviewer_base(agents, workspace_id, tab1_id, missing_names, existing_names):
+def find_unnamed_reviewer_base(agents, workspace_id, tab1_id, missing_names, existing_names,
+                               expected_cwd=None):
     """Retorna uma base anônima de revisor somente quando a associação é única.
 
     A ordem de ``pane list`` não é evidência de papel. Restauramos um nome
@@ -458,10 +463,117 @@ def find_unnamed_reviewer_base(agents, workspace_id, tab1_id, missing_names, exi
         if a.get("workspace_id") == workspace_id
         and a.get("tab_id") == tab1_id
         and not a.get("name")
+        and (expected_cwd is None or anonymous_project_matches(a, expected_cwd))
+        and not review_groups.protected_candidate(a, agents, core)
     ]
     if len(missing) == 1 and len(candidates) == 1:
         return candidates[0], missing[0]
     return None
+
+
+def anonymous_project_matches(info, cwd):
+    root = core.project_root(cwd)
+    return all(info.get(field) and core.project_root(info[field]) == root
+               for field in ("cwd", "foreground_cwd"))
+
+
+def bootstrap_review_group(group, args):
+    """Only create missing disposable roles; never restore the coordinator."""
+    review_groups.validate_registry(SPACES)
+    names = []
+    if args.with_reviewers:
+        names += [f"{group.slug}-rev-1", f"{group.slug}-rev-2"]
+    if args.with_scout:
+        if not group.scout_kind:
+            raise RuntimeError(f"grupo {group.slug} não declara scout")
+        names.append(f"{group.slug}-scout")
+    for role in args.role:
+        name = f"{group.slug}-{role}"
+        if name not in group.roles():
+            raise RuntimeError(f"papel não declarado: {name}")
+        if name not in names:
+            names.append(name)
+    names = [name for name in group.roles() if name in names]
+    binding = review_groups.resolve_binding(group, core)
+    gate = migration.space_gate_message(binding["root"], group.slug)
+    if gate:
+        raise RuntimeError(gate)
+    from contextlib import nullcontext
+    with (nullcontext() if DRY else review_groups.group_lock(group, core)):
+        review_groups.revalidate(binding, core)
+        members = review_groups.existing_members(binding, core)
+        owner = binding["coordinator"]
+        print(f"grupo {group.slug}: coordenador {group.coordinator_name}, "
+              f"tab {owner['tab_id']}, raiz {binding['root']}")
+        reservations = {n: members.get(n, {"workspace_id": owner["workspace_id"]}) for n in names}
+        with (nullcontext() if DRY else core._dispatch_submission_locks(reservations)):
+            for name in names:
+                review_groups.revalidate(binding, core)
+                order = list(group.roles())
+                predecessors = [n for n in order[:order.index(name)] if n in members]
+                previous = predecessors[-1] if predecessors else None
+                source = members[previous]["pane_id"] if previous else owner["pane_id"]
+                if previous and not DRY:
+                    source_info = review_groups.validate_member(binding, previous, core.get_agent_info(previous), core)
+                    if review_groups.identity(source_info) != review_groups.identity(members[previous]):
+                        raise RuntimeError("identidade do pane de origem mudou antes do split")
+                if name in members:
+                    review_groups.validate_member(binding, name, core.get_agent_info(name), core)
+                    print(f"  {name}: existente, preservando pane e perfil")
+                    source = members[name]["pane_id"]
+                    continue
+                role, kind = group.roles()[name]
+                if role == "rev-1":
+                    extra = REV_EFFORT if kind == "codex" else REV1_ARGS_CLAUDE
+                elif role == "rev-2":
+                    extra = migration.extra_args_for_rev2(kind)
+                else:
+                    extra = SCOUT_ARGS if kind == "codex" else SCOUT_ARGS_CLAUDE
+                extra = core.codex_launch_flags(list(extra)) if kind == "codex" else list(extra)
+                direction = "right" if source == owner["pane_id"] else "down"
+                print(f"  criar {name} ({kind}, {' '.join(extra)}) na tab {owner['tab_id']}")
+                split_command = ["pane", "split", source, "--direction", direction,
+                                 "--cwd", binding["root"], "--no-focus"]
+                created = run(*split_command)
+                if DRY:
+                    members[name] = {"pane_id": f"<novo-pane-{name}>"}
+                    continue
+                pane = created["pane"]["pane_id"]
+                # Do not close a possibly occupied pane on failure. Report the
+                # returned ID so an operator can inspect this partial creation.
+                try:
+                    observed = api("pane", "get", pane)["pane"]
+                    if observed.get("agent") or any(observed.get(f) != owner[f]
+                                                     for f in ("tab_id", "workspace_id")):
+                        raise RuntimeError("split não pertence ao vínculo esperado")
+                    review_groups.revalidate(binding, core)
+                    run("agent", "start", name, "--kind", kind, "--pane", pane, "--", *extra)
+                    core._wait_restored_agent(name)
+                    current = review_groups.validate_member(binding, name, core.get_agent_info(name), core)
+                    if current["pane_id"] != pane:
+                        raise RuntimeError("nome do revisor resolveu para outro pane")
+                    review_groups.revalidate(binding, core)
+                    prompt = core.role_reinforcement_prompt(
+                        name, group.slug, binding["root"],
+                        [group.coordinator_name, *[n for n in group.roles() if n != name]],
+                        coordinator_name=group.coordinator_name,
+                    )
+                    try:
+                        run("agent", "prompt", name, prompt)
+                        print(f"  {name}: criado; hydrated=true")
+                    except core.GroupBindingRefusedError:
+                        raise
+                    except core.DeliveryRefusedError as exc:
+                        # The complete request protocol still applies before any
+                        # later dispatch, which must pass its own guard again.
+                        print(f"  {name}: criado; hidratação recusada pela guarda; "
+                              f"hydrated=false; {exc}")
+                    members[name] = current
+                    source = pane
+                except RuntimeError as exc:
+                    raise RuntimeError(f"grupo {group.slug}: criação parcial em {pane}; "
+                                       f"pane preservado para inspeção: {exc}") from exc
+    return 0
 
 
 def main():
@@ -474,14 +586,30 @@ def main():
                       help="processa somente o workspace com este label")
     alvo.add_argument("--slug", metavar="SLUG",
                       help="processa somente a entrada cujo prefixo de agents é este slug")
+    alvo.add_argument("--group", metavar="SLUG", help="grupo na tab do coordenador existente")
     ap.add_argument("--with-reviewers", action="store_true",
                     help="sobe tambem os REVISORES dos spaces enxutos (`lean`) nesta execucao; "
                          "e' o que os dispatchers usam para ligar sob demanda")
     ap.add_argument("--with-scout", action="store_true",
                     help="sobe tambem o SCOUT dos spaces enxutos nesta execucao (so quando "
                          "alguem o requisitou: `--with-reviewers` nao o liga)")
+    ap.add_argument("--role", action="append", default=[], choices=["rev-1", "rev-2", "scout"],
+                    help="cria somente este papel de um grupo (repetível)")
     args = ap.parse_args()
     DRY = args.dry_run
+
+    group = review_groups.get_group(args.group or args.slug)
+    if args.group and group is None:
+        ap.error(f"grupo não registrado: {args.group}")
+    if group is not None:
+        try:
+            return bootstrap_review_group(group, args)
+        except RuntimeError as exc:
+            print(f"erro: {exc}", file=sys.stderr)
+            return 1
+
+    if args.role:
+        ap.error("--role exige um grupo registrado")
 
     workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
     panes_by_ws = {}
@@ -585,7 +713,7 @@ def main():
         ]
         unnamed_reviewer = find_unnamed_reviewer_base(
             agents, ws_id, tab1_id, missing_reviewer_names,
-            set(named_tab_agents),
+            set(named_tab_agents), expected_cwd=cwd,
         )
         assigned = set()
         if unnamed_reviewer is not None:
@@ -623,7 +751,7 @@ def main():
             if scout_name in existing_agent_names:
                 print(f"  {scout_name}: já existe (tab própria), pulando")
             else:
-                base = find_unnamed_role_base(agents, ws_id, tab1_id)
+                base = find_unnamed_role_base(agents, ws_id, tab1_id, expected_cwd=cwd)
                 if base is not None:
                     # O processo já existe e pode ter um perfil escolhido à
                     # mão. Só restauramos o metadado de nome; não reiniciamos

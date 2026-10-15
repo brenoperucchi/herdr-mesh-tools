@@ -25,10 +25,12 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from importlib.machinery import SourceFileLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core  # noqa: E402
+import _herdr_review_groups as review_groups
 
 RESULT_FILES = ("verdict.md", "answer.md")
 REV_SUFFIXES = ("-rev", "-rev-1", "-rev-2")
@@ -106,11 +108,13 @@ def state_dir():
         os.path.expanduser("~"), ".local", "state", "herdr-mesh")
 
 
-def registrar(info, motivo):
+def registrar(info, motivo, group=None):
     os.makedirs(state_dir(), exist_ok=True)
     reg = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": info.get("name"),
            "pane": info.get("pane_id"), "kind": info.get("agent"), "cwd": info.get("cwd"),
            "session": (info.get("agent_session") or {}).get("value"), "motivo": motivo}
+    if group:
+        reg["group"] = group
     with open(os.path.join(state_dir(), "released.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(reg, ensure_ascii=False) + "\n")
 
@@ -123,6 +127,9 @@ def fechar(info):
 
 def liberar(slug, agents, only, force, dry_run, spaces=None):
     """Retorna lista de dicts por agent: {name, pane, acao, motivos, avisos}."""
+    group = review_groups.get_group(slug)
+    if group is not None:
+        return liberar_grupo(group, only, force, dry_run)
     saida = []
     for info in targets(slug, agents, only):
         root = core.project_root(info.get("cwd") or ".")
@@ -143,6 +150,70 @@ def liberar(slug, agents, only, force, dry_run, spaces=None):
     return saida
 
 
+def group_result_state(root, slug, name):
+    state = result_state(root, slug, name)
+    if state[0] != "ok":
+        return state
+    metrics_path = os.path.join(os.path.dirname(os.path.dirname(state[1])), "metrics.json")
+    try:
+        with open(metrics_path, encoding="utf-8") as stream:
+            metrics = json.load(stream)
+        status = metrics["reviewers"][name]["status"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "pendente", metrics_path, state[2]
+    if status not in ("idle", "done"):
+        return "pendente", metrics_path, state[2]
+    return state
+
+
+def liberar_grupo(group, only, force, dry_run):
+    """Group -> target locks, and no --force bypass of identity/lifecycle."""
+    output = []
+    try:
+        with (nullcontext() if dry_run else review_groups.group_lock(group, core)):
+            binding = review_groups.resolve_binding(group, core)
+            members = review_groups.existing_members(binding, core)
+            members = {n: a for n, a in members.items()
+                       if only == "all" or (n.endswith("-scout") == (only == "scout"))}
+            with (nullcontext() if dry_run else core._dispatch_submission_locks(members)):
+                for name, expected in members.items():
+                    item = {"name": name, "pane": expected["pane_id"], "motivos": [],
+                            "avisos": [], "group": group.slug, "resultado": None}
+                    try:
+                        review_groups.revalidate(binding, core)
+                        current = review_groups.validate_member(binding, name, core.get_agent_info(name), core)
+                        if core._dispatch_differences(expected, current):
+                            raise RuntimeError("identidade/estado mudou antes do release")
+                        state = group_result_state(binding["root"], group.slug, name)
+                        item["resultado"] = state[1]
+                        reasons, warnings = avaliar(core.effective_status(current),
+                                                   core.classify_composition(current["pane_id"]), state)
+                        item["avisos"] = warnings
+                        if reasons:
+                            raise RuntimeError("; ".join(reasons))
+                        core.require_can_send(name, expected_pane=current["pane_id"])
+                        review_groups.revalidate(binding, core)
+                        latest = core.get_agent_info(name)
+                        if core._dispatch_differences(current, latest):
+                            raise RuntimeError("identidade/estado mudou durante guarda de release")
+                        if dry_run:
+                            item["acao"] = "fecharia"
+                        else:
+                            registrar(latest, "group release", group.slug)
+                            ok, msg = fechar(latest)
+                            item["acao"] = "fechado" if ok else f"falha ao fechar: {msg}"
+                        if force:
+                            item["avisos"].append("--force não ignora guardas em grupos")
+                    except RuntimeError as exc:
+                        item["acao"] = "recusado"
+                        item["motivos"].append(str(exc))
+                    output.append(item)
+    except RuntimeError as exc:
+        output.append({"name": group.slug, "pane": None, "acao": "recusado",
+                       "motivos": [str(exc)], "avisos": [], "resultado": None})
+    return output
+
+
 def status(spaces, agents):
     """Revisores/scout ligados por space, com a idade da ultima rodada de cada um."""
     linhas = []
@@ -159,6 +230,11 @@ def status(spaces, agents):
             idade = None if not achadas else (time.time() - max(achadas)) / 3600
             linhas.append({"name": info["name"], "space": entry[0], "enxuto": lean,
                            "status": core.effective_status(info), "ultima_rodada_h": idade})
+    for group in review_groups.GROUPS.values():
+        for info in agents:
+            if info.get("name") in group.roles():
+                linhas.append({"name": info["name"], "space": group.slug, "enxuto": True,
+                               "status": core.effective_status(info), "ultima_rodada_h": None})
     return linhas
 
 
@@ -204,7 +280,7 @@ def main():
                 print(f"    ! aviso: {a}")
         if entry is not None and itens and not (len(entry) > 5 and isinstance(entry[5], dict) and entry[5].get("lean")):
             print(f"nota: o space '{args.slug}' nao e enxuto; um `herdr-bootstrap` recria o que foi fechado.")
-    return 1 if any(it["acao"] == "recusado" for it in itens) else 0
+    return 1 if any(it["acao"] == "recusado" or it["acao"].startswith("falha") for it in itens) else 0
 
 
 if __name__ == "__main__":

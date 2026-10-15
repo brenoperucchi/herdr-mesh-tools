@@ -30,6 +30,9 @@ def _load():
 class CodexSettleTests(unittest.TestCase):
     def setUp(self):
         self.core = _load().core
+        delivery_guard = mock.patch.object(self.core, "require_can_send", return_value=None)
+        delivery_guard.start()
+        self.addCleanup(delivery_guard.stop)
         self.clock = FakeClock()
         for patcher in (
             mock.patch.object(self.core.time, "time", self.clock.time),

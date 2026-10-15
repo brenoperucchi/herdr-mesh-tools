@@ -45,6 +45,9 @@ def _agent_info(*, status="idle", seq=10, pane="w:p1", session="s1", revision=3)
 class DispatchPreflightTests(unittest.TestCase):
     def setUp(self):
         self.core = _load()
+        delivery_guard = mock.patch.object(self.core, "require_can_send", return_value=None)
+        delivery_guard.start()
+        self.addCleanup(delivery_guard.stop)
 
     def _settled_proc(self, status="idle"):
         proc = mock.Mock()

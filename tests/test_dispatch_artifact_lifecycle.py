@@ -41,6 +41,9 @@ class FakeClock:
 class DispatchArtifactLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.core = _load("_herdr_dispatch.py")
+        delivery_guard = mock.patch.object(self.core, "require_can_send", return_value=None)
+        delivery_guard.start()
+        self.addCleanup(delivery_guard.stop)
         self.clock = FakeClock()
         self.time_patch = mock.patch.object(self.core.time, "time", self.clock.time)
         self.sleep_patch = mock.patch.object(self.core.time, "sleep", self.clock.sleep)

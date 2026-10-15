@@ -43,9 +43,9 @@ class RoleAttestationTests(unittest.TestCase):
             "claude-bridge-exec",
             "artifact do colega cego",
             "pare e registre a inconsistência",
-            "Panes headless de revisão",
-            "letra isolada digitada por engano",
-            "não deve\nparar o fluxo",
+            "herdr-can-send <alvo>",
+            "Só código 0",
+            "Não descarte texto",
         ):
             self.assertIn(required, prompt)
 
@@ -186,6 +186,7 @@ class RoleAttestationTests(unittest.TestCase):
             diff_instruction="x", verdict_dir="/x", sibling_dir="/y",
             interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
             solution_contract_reviewer=self.core.SOLUTION_CONTRACT_REVIEWER,
+            coordinator_name="foo-exec",
         )
         self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, review_request)
 
@@ -193,6 +194,7 @@ class RoleAttestationTests(unittest.TestCase):
             verdict_dir="/x", prior_verdict="x", head_sha="h", base_ref="b",
             interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
             solution_contract_reviewer=self.core.SOLUTION_CONTRACT_REVIEWER,
+            coordinator_name="foo-exec",
         )
         self.assertIn(self.core.SOLUTION_CONTRACT_REVIEWER, verify_request)
 
@@ -200,6 +202,7 @@ class RoleAttestationTests(unittest.TestCase):
             verdict_dir="/x", isolation_note="", context_instruction="",
             interactive_ready_caveat=self.core.INTERACTIVE_READY_CAVEAT,
             solution_contract_ask=self.core.SOLUTION_CONTRACT_ASK,
+            coordinator_name="foo-exec",
         )
         self.assertIn(self.core.INTERACTIVE_READY_CAVEAT, ask_request)
 

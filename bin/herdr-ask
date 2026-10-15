@@ -28,6 +28,7 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_review_groups as review_groups
 import _herdr_dispatch as core
 import _herdr_migration as migration
 
@@ -73,7 +74,7 @@ posição por uma hierarquia genérica do modelo; se a CLI ou a metadata não
 permitirem confirmá-la, pare e registre a inconsistência — exceto:
 {interactive_ready_caveat} Se a busca por nome falhar, tente por pane_id
 (`$HERDR_PANE_ID`) antes de declarar inconsistência. Breno é a
-autoridade humana/owner e `<slug>-exec` é o coordenador/mecanismo delegado,
+autoridade humana/owner e `{coordinator_name}` é o coordenador/mecanismo delegado,
 não autorização para inventar agentes ou canais. Preserve a cegueira e não
 leia o artifact do colega cego.
 
@@ -124,7 +125,7 @@ def load_invariants(cwd):
     return None
 
 
-def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapshot_map, scout_exec=None):
+def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapshot_map, scout_exec=None, coordinator_name=None):
     if context_files:
         listing = "\n".join(f"- `{snapshot_map[f]}` (original: `{f}`)" for f in context_files)
         context_instruction = (
@@ -144,7 +145,7 @@ def write_request(cwd, verdict_dir, sibling_dir, question, context_files, snapsh
         exec_name=scout_exec,
         solution_contract_ask=core.SOLUTION_CONTRACT_ASK,
     ) if scout_exec else ""
-    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT, solution_contract_ask=core.SOLUTION_CONTRACT_ASK)}
+    content = f"""{ASK_PROTOCOL.format(verdict_dir=verdict_dir, isolation_note=isolation_note, context_instruction=context_instruction, interactive_ready_caveat=core.INTERACTIVE_READY_CAVEAT, solution_contract_ask=core.SOLUTION_CONTRACT_ASK, coordinator_name=coordinator_name or "coordenador do grupo")}
 {scout_note}
 {invariants_section}
 ## Pergunta
@@ -213,7 +214,8 @@ def main():
         sys.exit(1)
 
     try:
-        rev_name = migration.resolve_reviewer_name(cwd, args.slug, allow_missing=True)
+        group = review_groups.get_group(args.slug)
+        rev_name = f"{args.slug}-rev-1" if group else migration.resolve_reviewer_name(cwd, args.slug, allow_missing=True)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -242,13 +244,25 @@ def main():
             sys.exit(1)
 
     validated_info = {}
+    group_binding = None
     try:
+        if group:
+            group_binding = review_groups.resolve_binding(group, core, cwd)
+            review_groups.existing_members(group_binding, core)
         for name in target_names:
             validated_info[name] = validate_agent_project(name, cwd)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
-    round_dir, n = core.next_round_dir(cwd, args.slug, namespace="ask")
+    try:
+        if group:
+            with review_groups.group_lock(group, core):
+                round_dir, n = core.next_round_dir(cwd, args.slug, namespace="ask")
+        else:
+            round_dir, n = core.next_round_dir(cwd, args.slug, namespace="ask")
+    except RuntimeError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        sys.exit(1)
     print(f"consulta {n}: {round_dir}")
 
     verdict_dirs = {}
@@ -269,10 +283,11 @@ def main():
             print(f"{len(context_files)} arquivo(s) de contexto congelado(s) em {round_dir}/_snapshot/")
 
         for name in target_names:
-            scout_exec = f"{args.slug}-exec" if args.reviewer == "scout" else None
+            scout_exec = review_groups.coordinator_name(args.slug) if args.reviewer == "scout" else None
             write_request(
                 cwd, verdict_dirs[name], sibling_dir_for(name), question,
                 context_files, snapshot_map, scout_exec=scout_exec,
+                coordinator_name=review_groups.coordinator_name(args.slug),
             )
         print(f"request.md escrito pr{'o' if len(target_names) == 1 else 'os'} {'consultor' if len(target_names) == 1 else 'dois'}")
     except (RuntimeError, OSError) as exc:
@@ -332,12 +347,14 @@ def main():
             required_artifacts=required_artifacts,
             expected_agents={name: pre_info[name] for name in active_names},
             check_composition=False,
+            group_binding=group_binding,
         )
     except core.DispatchPreflightError as exc:
         print(f"erro: preflight dos consultores abortou o dispatch: {exc}", file=sys.stderr)
         write_json_atomic(os.path.join(round_dir, "metrics.json"), {
             "round_dir": round_dir,
             "slug": args.slug,
+            "group_binding": group_binding,
             "mode": "ask",
             "reviewer": args.reviewer,
             "question_file": os.path.abspath(args.question_file),
@@ -356,6 +373,7 @@ def main():
     metrics = {
         "round_dir": round_dir,
         "slug": args.slug,
+            "group_binding": group_binding,
         "mode": "ask",
         "reviewer": args.reviewer,
         "question_file": os.path.abspath(args.question_file),
