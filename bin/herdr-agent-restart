@@ -33,6 +33,7 @@ from importlib.machinery import SourceFileLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core  # noqa: E402
 import _herdr_probe_cache as probe_cache  # noqa: E402
+from _herdr_restart_argv import codex_options, explicit_cwds
 
 EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 MODEL_OK = re.compile(r"^(claude-[a-z0-9.-]+|sonnet-5|gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*)$")
@@ -137,25 +138,10 @@ def start_args(kind, session, model, effort, old_argv=None):
     if kind == "claude":
         return ["--resume", session, "--model", model, "--effort", effort]
     if kind == "codex":
-        extra = []
-        # preserva -c <chave>=<valor> e flags soltas do lancamento anterior, menos o que trocamos
-        old = list(old_argv or [])
-        if "resume" in old:
-            old = old[old.index("resume") + 2:]
-        i = 0
-        while i < len(old):
-            a = old[i]
-            if a in ("-m", "--model"):
-                i += 2
-                continue
-            if a == "-c" and i + 1 < len(old):
-                if not old[i + 1].startswith("model_reasoning_effort="):
-                    extra += ["-c", old[i + 1]]
-                i += 2
-                continue
-            if a.startswith("-"):
-                extra.append(a)
-            i += 1
+        try:
+            extra = codex_options(old_argv)
+        except ValueError as exc:
+            raise SystemExit(f"argv Codex recusado: {exc}") from exc
         base = ["resume", session, "-m", model, "-c", f"model_reasoning_effort={effort}"]
         # agents.max_depth=0 e --no-daemon (Herdr >= 0.9.4) em todo restart, venham ou nao do argv antigo
         extra = core.codex_launch_flags(extra)
@@ -325,12 +311,24 @@ def log_restart(reg):
 
 def reiniciar(info, kind, session, model, effort, old_pid, old_argv):  # old_pid None = agent ja saiu
     pane, name = info["pane_id"], info["name"]
+    # Validate the complete launch contract BEFORE any SIGTERM.
+    try:
+        extra = start_args(kind, session, model, effort, old_argv)
+        if kind == "codex":
+            for cwd in explicit_cwds(extra):
+                if not os.path.isabs(cwd):
+                    raise ValueError("-C/--cd relativo não pode ser preservado com segurança")
+                root = core.project_root(cwd)
+                if any(not info.get(f) or core.project_root(info[f]) != root
+                       for f in ("cwd", "foreground_cwd")):
+                    raise ValueError("-C/--cd diverge da raiz observada do agent")
+    except (SystemExit, ValueError) as exc:
+        return False, f"restart recusado antes de encerrar o processo: {exc}"
+    args = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *extra]
     if old_pid is not None:
         if not encerrar(old_pid):
             return False, f"o processo {old_pid} nao saiu com SIGTERM; nada mais foi feito"
         time.sleep(1.5)
-    args = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "90000", "--",
-            *start_args(kind, session, model, effort, old_argv)]
     ultimo = ""
     for _ in range(6):
         r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)

@@ -204,3 +204,66 @@ class LedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CodexLaunchContractTests(unittest.TestCase):
+    def setUp(self):
+        self.m = _load()
+
+    def args(self, argv):
+        return self.m.start_args('codex', 'NEW', 'gpt-6.1-sol', 'low', argv)
+
+    def test_bia_sandbox_cwd_and_search_values_survive(self):
+        argv=['codex','-s','workspace-write','-C','/home/brenoperucchi/Devs/paperclip/agents/bia',
+              '--search','-c','agents.max_depth=0','--no-daemon']
+        self.assertEqual(self.args(argv),['resume','NEW','-m','gpt-6.1-sol','-c','model_reasoning_effort=low',
+                         *argv[1:]])
+
+    def test_global_flags_before_resume_and_old_prompt_not_replayed(self):
+        a=self.args(['/usr/local/bin/codex','-s','workspace-write','-C','/root',
+                     'resume','OLD','--search','old prompt'])
+        self.assertIn('workspace-write',a);self.assertIn('/root',a);self.assertIn('--search',a)
+        self.assertNotIn('OLD',a);self.assertNotIn('old prompt',a)
+
+    def test_config_value_resume_is_not_a_subcommand(self):
+        a=self.args(['codex','-p','resume','-c','key="value with = and spaces"','initial prompt'])
+        self.assertIn('resume',a[6:]);self.assertIn('key="value with = and spaces"',a)
+        self.assertNotIn('initial prompt',a)
+
+    def test_long_equal_and_attached_short_forms_preserve_values(self):
+        a=self.args(['codex','--model=old','--config=model_reasoning_effort="max"',
+                     '-sworkspace-write','--cd=/root','--config','other=1'])
+        self.assertNotIn('--model=old',a)
+        self.assertNotIn('--config=model_reasoning_effort="max"',a)
+        self.assertIn('-sworkspace-write',a);self.assertIn('--cd=/root',a);self.assertIn('other=1',a)
+
+    def test_old_model_config_is_removed_as_well(self):
+        a=self.args(['codex','-c','model="old"','-c','model_reasoning_effort = "max"'])
+        self.assertNotIn('model="old"',a)
+        self.assertEqual(sum(x.startswith('model_reasoning_effort=') for x in a),1)
+
+    def test_attachments_selectors_and_delimited_prompt_not_replayed(self):
+        a=self.args(['codex','resume','--last','--all','--include-non-interactive',
+                     '-i','a.png','b.png','old prompt','--search','--','--unknown prompt'])
+        for unwanted in ('--last','--all','--include-non-interactive','a.png','b.png','old prompt','--unknown prompt'):
+            self.assertNotIn(unwanted,a)
+        self.assertIn('--search',a)
+
+    def test_normalization_is_idempotent(self):
+        first=self.args(['codex','-s','workspace-write','-C','/root','--search'])
+        self.assertEqual(self.args(first),first)
+
+    def test_unsupported_or_incomplete_contract_is_refused(self):
+        for argv in (['node','wrapper.js'],['codex','exec','echo'],['codex','--future'],
+                     ['codex','--worktree'],['codex','-C'],['codex','--config','broken']):
+            with self.subTest(argv=argv),self.assertRaises(SystemExit): self.args(argv)
+
+    def test_invalid_contract_never_stops_old_process(self):
+        info={'pane_id':'w:p1','name':'acervo-bia','cwd':'/root','foreground_cwd':'/root'}
+        for argv in (['codex','--future'],['codex','-C','relative'],['codex','-C','/another']):
+            with self.subTest(argv=argv),mock.patch.object(self.m,'encerrar') as stop, \
+                 mock.patch.object(self.m.subprocess,'run') as run:
+                # Avoid invoking git inside the pure failure-path assertion.
+                with mock.patch.object(core,'project_root',side_effect=lambda p:p):
+                    ok,message=self.m.reiniciar(info,'codex','S','gpt-6.1-sol','low',123,argv)
+                self.assertFalse(ok);self.assertIn('antes de encerrar',message)
+                stop.assert_not_called();run.assert_not_called()
