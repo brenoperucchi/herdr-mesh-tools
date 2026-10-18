@@ -33,11 +33,15 @@ class ReviewGroup:
 
 GROUPS = {
     "guardian2": ReviewGroup(
-        "guardian2", "guardian2-exec", "/home/brenoperucchi/Devs/guardian2"
+        "guardian2", "guardian2-exec", "/home/brenoperucchi/Devs/guardian2", scout_kind="codex"
     ),
     # Caio (dev júnior, espelho do Guardian 2), worktree própria; Breno 18/10 08:06
     "caio": ReviewGroup(
-        "caio", "guardian2-caio", "/home/brenoperucchi/Devs/guardian2-espelho"
+        "caio", "guardian2-caio", "/home/brenoperucchi/Devs/guardian2-espelho", scout_kind="codex"
+    ),
+    # Supervisor (Xavier) revisa as próprias mudanças no conector; Breno 18/10 14:09
+    "supervisor": ReviewGroup(
+        "supervisor", "guardian-supervisor", "/home/brenoperucchi/Devs/paperclip/connector", scout_kind="codex"
     ),
 }
 
