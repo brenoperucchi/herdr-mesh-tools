@@ -35,6 +35,10 @@ GROUPS = {
     "guardian2": ReviewGroup(
         "guardian2", "guardian2-exec", "/home/brenoperucchi/Devs/guardian2"
     ),
+    # Caio (dev júnior, espelho do Guardian 2), worktree própria; Breno 18/10 08:06
+    "caio": ReviewGroup(
+        "caio", "guardian2-caio", "/home/brenoperucchi/Devs/guardian2-espelho"
+    ),
 }
 
 
