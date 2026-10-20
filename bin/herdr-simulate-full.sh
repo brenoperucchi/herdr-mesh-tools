@@ -5,7 +5,11 @@
 # sintético e é enviado por --files; nenhum arquivo do projeto é alterado.
 #
 # Rode dentro do pane <slug>-exec. O scout é acionado automaticamente depois
-# das duas rodadas, reproduzindo a política do fluxo real.
+# das rodadas de correção, reproduzindo a política do fluxo real.
+#
+# As duas rodadas aqui são só o cenário fixo desta simulação, não o limite da
+# política: o limite real é de 6 rodadas de correção antes da terceira análise
+# do scout (ver skills/herdr-review/SKILL.md).
 set -Eeuo pipefail
 
 usage() {

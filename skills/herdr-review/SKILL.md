@@ -1,6 +1,6 @@
 ---
 name: herdr-review
-description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável, com terceira análise automática pelo <slug>-scout quando o exec julgar necessário após duas rodadas. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
+description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável, com terceira análise automática pelo <slug>-scout quando o exec julgar necessário após seis rodadas. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
 ---
 
 # herdr-review
@@ -127,7 +127,7 @@ Monte uma tabela por achado, em três classes:
 
 ## ESCALONAMENTO — terceira análise automática pelo scout
 
-`rev-1` e `rev-2` têm no máximo duas rodadas de correção. Se, depois delas,
+`rev-1` e `rev-2` têm no máximo seis rodadas de correção. Se, depois delas,
 você julgar necessária uma análise adicional para uma disputa, indecisão ou
 achado aberto, chame automaticamente o scout. Não crie pane ou agent novo e
 não use AgentRelay nem o mecanismo nativo de subagentes da sua CLI. A chamada
@@ -171,8 +171,8 @@ análise automática do scout antes de consultar o Breno — nunca decida sozinh
 que um achado não procede.
 
 Se corrigiu algo, pode rodar `herdr-review-dispatch` de novo pra uma nova rodada
-(cria `<slug>-2`, etc. automaticamente). **Máximo 2 rodadas de correção** — na
-terceira, se necessária, use uma única análise automática do scout em vez de
+(cria `<slug>-2`, etc. automaticamente). **Máximo 6 rodadas de correção** — depois
+delas, se necessária, use uma única análise automática do scout em vez de
 redisparar `rev-1`/`rev-2`. Depois do scout, qualquer nova necessidade de
 análise ou divergência/incerteza volta ao Breno.
 

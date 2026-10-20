@@ -1,6 +1,6 @@
 ---
 name: herdr-ask
-description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, ou a terceira análise automática do <slug>-scout quando o exec julgar necessário após duas rodadas. Use para uma pergunta de design ABERTA — não uma revisão de código. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
+description: "Dispara uma consulta de design cega e paralela pros dois consultores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, ou a terceira análise automática do <slug>-scout quando o exec julgar necessário após seis rodadas. Use para uma pergunta de design ABERTA — não uma revisão de código. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
 ---
 
 # herdr-ask
@@ -123,7 +123,7 @@ bloqueio operacional, sem enviar uma consulta parcial.
 ## Terceira análise automática pelo scout
 
 Quando `herdr-review` encontrar uma disputa que o exec não consiga resolver,
-ou quando duas rodadas de correção terminarem com um achado aberto, o exec
+ou quando seis rodadas de correção terminarem com um achado aberto, o exec
 pode julgar necessária uma terceira análise. Nesse caso, escreva uma pergunta
 focada e execute automaticamente:
 

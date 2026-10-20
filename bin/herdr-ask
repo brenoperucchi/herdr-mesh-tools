@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """herdr-ask <slug> — dispara uma consulta de design cega e paralela pros dois
 revisores (<slug>-rev-1, <slug>-rev-2), ou uma consulta única ao scout para
-escalonamento automático após as duas rodadas, de um space do Herdr. Mesma mecânica do
+escalonamento automático após as seis rodadas, de um space do Herdr. Mesma mecânica do
 herdr-review-dispatch (isolamento por diretório, congelamento de contexto,
 `agent prompt --wait` concorrente), formato de resposta diferente: não é bug
 hunt, não tem achado atômico P0-P3 nem APPROVE — é uma pergunta de design
@@ -100,7 +100,7 @@ discordância factual, siga apenas a rota aprovada de `herdr-ask`.
 SCOUT_ESCALATION_NOTE = """## Terceira análise automática pelo scout
 
 Você é o scout consultado automaticamente pelo `{exec_name}` quando, depois
-de no máximo duas rodadas de correção de `rev-1`/`rev-2`, ele julgar necessária
+de no máximo seis rodadas de correção de `rev-1`/`rev-2`, ele julgar necessária
 uma análise adicional. Esta chamada não precisa de autorização prévia do Breno e não é uma terceira rodada de correção dos revisores. Analise apenas a
 pergunta e o material fornecido, e escreva a resposta em `answer.md` para o
 `-exec`.
@@ -183,7 +183,7 @@ def main():
     ap.add_argument("slug")
     ap.add_argument("--question-file", required=True, help="arquivo com a pergunta de design (markdown, pode ser longo)")
     ap.add_argument("--context", nargs="+", default=None, help="arquivos de contexto — congelados no disparo, como --files do herdr-review-dispatch")
-    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2", "scout"], default=None, help="consulta só 1 (default: os dois); 'scout' é a terceira análise automática após duas rodadas")
+    ap.add_argument("--reviewer", choices=["rev", "rev-1", "rev-2", "scout"], default=None, help="consulta só 1 (default: os dois); 'scout' é a terceira análise automática após seis rodadas")
     ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por consultor (default 1200)")
     args = ap.parse_args()
 

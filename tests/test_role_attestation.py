@@ -68,7 +68,7 @@ class RoleAttestationTests(unittest.TestCase):
 
         for required in (
             self.core.EXEC_HYDRATION_MARKER,
-            "no máximo duas rodadas de correção",
+            "no máximo seis rodadas de correção",
             "herdr-ask --reviewer scout",
             "sem pedir autorização prévia ao Breno",
             "devolve somente para este exec",

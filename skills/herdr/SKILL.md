@@ -52,7 +52,7 @@ skills `herdr-review` (código já pronto, pra revisar) ou `herdr-ask`
 (pergunta de design ABERTA, antes de construir) — nunca uma pela outra, e
 nunca um atalho fora das duas. O fluxo normal usa os panes reais e vivos
 `<slug>-rev-1` e `<slug>-rev-2`; uma indecisão ou um achado aberto depois do
-limite de duas rodadas usa, se o exec julgar necessário, uma terceira análise
+limite de seis rodadas usa, se o exec julgar necessário, uma terceira análise
 automática com `herdr-ask --reviewer scout`. O dispatcher não reseta
 automaticamente rev-1, rev-2 ou scout e não bloqueia pela troca de modelo ou
 reasoning; a recreação deliberada é feita por `herdr-swap` com handoff. O

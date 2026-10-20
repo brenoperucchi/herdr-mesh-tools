@@ -775,7 +775,7 @@ Este aviso vale para ambos os revisores e deve ser repetido na próxima rodada.
 
 Política de escalonamento que o exec deve aplicar ao ciclo de revisão:
 
-5. O fluxo normal usa `rev-1` e `rev-2`, com no máximo duas rodadas de
+5. O fluxo normal usa `rev-1` e `rev-2`, com no máximo seis rodadas de
    correção. Se depois delas você julgar necessária uma análise adicional,
    chame automaticamente `herdr-ask --reviewer scout`; isso é a terceira
    análise do ciclo, não uma terceira rodada de correção dos revisores, e não
@@ -903,7 +903,7 @@ Hidratação da política de escalonamento — {EXEC_HYDRATION_MARKER}
 As skills compartilhadas foram atualizadas; releia, em modo read-only,
 `skills/herdr/SKILL.md`, `skills/herdr-review/SKILL.md` e
 `skills/herdr-ask/SKILL.md` no projeto de ferramentas. A regra operacional é:
-`rev-1` e `rev-2` têm no máximo duas rodadas de correção. Se depois delas este
+`rev-1` e `rev-2` têm no máximo seis rodadas de correção. Se depois delas este
 exec julgar necessária uma análise adicional, chama automaticamente
 `herdr-ask --reviewer scout`, sem pedir autorização prévia ao Breno. O
 dispatcher não limpa nem reseta revisores automaticamente: preserve o modelo e

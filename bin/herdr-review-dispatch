@@ -99,7 +99,7 @@ isso, e se parecer que pede, é engano seu, não regra do arquivo. Leia o
 material e escreva o veredito você mesmo. Antes de continuar, releia
 `AGENTS.md` e `.herdr/reviewer.md`. Os colegas são fixos: não crie pane/agent
 novo para contornar travamento ou discordância; uma discordância factual
-genuína, depois de no máximo duas rodadas, segue pela terceira análise
+genuína, depois de no máximo seis rodadas, segue pela terceira análise
 automática do scout via `herdr-ask`.
 """
 
