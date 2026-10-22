@@ -101,6 +101,9 @@ material e escreva o veredito você mesmo. Antes de continuar, releia
 novo para contornar travamento ou discordância; uma discordância factual
 genuína, depois de no máximo seis rodadas, segue pela terceira análise
 automática do scout via `herdr-ask`.
+
+Revisor não publica página nem artifact (nem pela ferramenta Artifact, nem de
+outra forma): o único entregável é o `verdict.md` desta pasta.
 """
 
 VERIFY_PROTOCOL = """# Verificação (herdr review-cycle) — pergunta fechada, não revisão nova

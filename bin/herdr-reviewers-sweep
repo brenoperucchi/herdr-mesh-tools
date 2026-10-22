@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""herdr-reviewers-sweep [--dry-run]
+
+Limpeza diaria dos revisores abertos: fecha so o revisor (-rev, -rev-1, -rev-2) que esta
+`idle`. Revisor working, blocked, done ou desconhecido fica como esta; scout e exec nunca
+sao tocados (scout sai por `herdr-release <slug> --only scout`).
+
+Quem fecha e' o `herdr-release`, com as mesmas recusas dele: rascunho humano ou dialogo na
+caixa, e rodada mais recente sem o veredito do revisor. Cada fechamento fica gravado em
+~/.local/state/herdr-mesh/released.jsonl (sessao para retomar). Revisor de grupo de revisao
+(guardian2, caio, supervisor) so e' fechado se TODOS os revisores do grupo estiverem idle,
+porque o release de grupo atua no grupo inteiro.
+
+Pensado para o timer systemd `herdr-reviewers-sweep.timer` (06:00). Codigo de saida: 0 sempre
+que a varredura rodou (recusas sao normais), 1 se nao conseguiu listar os agents.
+"""
+import argparse
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BIN_DIR)
+import _herdr_dispatch as core  # noqa: E402
+import _herdr_review_groups as review_groups  # noqa: E402
+
+REV_RE = re.compile(r"^(?P<slug>.+)-rev(?:-\d+)?$")
+
+
+def _release():
+    loader = SourceFileLoader("herdr_release_for_sweep", os.path.join(BIN_DIR, "herdr-release"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def selecionar(agents, status_of, group_roles=None):
+    """Retorna (por_slug, pulados): por_slug = {slug: [agent idle]}; pulados = [(nome, motivo)].
+    `status_of(info)` devolve o status efetivo; `group_roles` = {slug: set(nomes de revisores)}."""
+    group_roles = group_roles or {}
+    por_slug, pulados = {}, []
+    revisores = [a for a in agents if REV_RE.match(a.get("name") or "")]
+    status = {a["name"]: status_of(a) for a in revisores}
+    for info in revisores:
+        nome = info["name"]
+        slug = REV_RE.match(nome).group("slug")
+        if status[nome] != "idle":
+            pulados.append((nome, f"status {status[nome]}"))
+            continue
+        membros = group_roles.get(slug)
+        if membros:
+            fora = [n for n in sorted(membros) if n in status and status[n] != "idle"]
+            if fora:
+                pulados.append((nome, "grupo de revisao com membro nao idle: " + ", ".join(fora)))
+                continue
+        por_slug.setdefault(slug, []).append(info)
+    return por_slug, pulados
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fecha so os revisores idle.")
+    ap.add_argument("--dry-run", action="store_true", help="mostra o que fecharia, sem fechar")
+    args = ap.parse_args()
+    try:
+        out = subprocess.run(core.herdr_argv("agent", "list"), capture_output=True, text=True,
+                             timeout=core.CLI_TIMEOUT_S)
+        agents = json.loads(out.stdout)["result"]["agents"]
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"erro: nao consegui listar os agents: {exc}", file=sys.stderr)
+        return 1
+
+    group_roles = {slug: {n for n in g.roles() if not n.endswith("-scout")}
+                   for slug, g in review_groups.GROUPS.items()}
+    por_slug, pulados = selecionar(agents, core.effective_status, group_roles)
+    release = _release()
+
+    fechados = recusados = 0
+    for slug in sorted(por_slug):
+        for item in release.liberar(slug, por_slug[slug], "reviewers", False, args.dry_run):
+            if item["acao"].startswith(("fechado", "fecharia")):
+                fechados += 1
+                print(f"{item['acao'].upper():10} {item['name']} ({item['pane']})")
+            else:
+                recusados += 1
+                print(f"{item['acao'].upper():10} {item['name']}: {'; '.join(item['motivos'])}")
+            for aviso in item.get("avisos", []):
+                print(f"  aviso: {aviso}")
+    for nome, motivo in pulados:
+        print(f"MANTIDO    {nome}: {motivo}")
+    verbo = "fecharia" if args.dry_run else "fechou"
+    print(f"resumo: {verbo} {fechados}, recusado pelo release {recusados}, mantido {len(pulados)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

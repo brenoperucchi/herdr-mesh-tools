@@ -94,6 +94,9 @@ operacional obrigatório: não use AgentRelay nem subagentes nativos, não crie
 agent/pane novo para contornar fricção e, se a consulta tratar de uma
 discordância factual, siga apenas a rota aprovada de `herdr-ask`.
 
+Quem responde não publica página nem artifact (nem pela ferramenta Artifact,
+nem de outra forma): o único entregável é o `answer.md` desta pasta.
+
 {context_instruction}
 """
 
