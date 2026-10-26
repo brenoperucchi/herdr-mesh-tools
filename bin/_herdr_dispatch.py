@@ -843,6 +843,34 @@ def _infer_role(name):
     return None
 
 
+AGENT_REPLY_NOTE = """
+
+Mensagens entre agents são BIDIRECIONAIS (regra do Breno, 2026-10-13): quando outro agent lhe
+pede informação ou uma resposta (`[de <agent>, ...]`), responda DIRETO a ele: rode
+`herdr-can-send <remetente>` e, com código 0, `herdr agent prompt <remetente> "..."`. Não segure a
+resposta esperando o Breno nem pergunte a ele "posso mandar?". Só fica com o Breno o que for decisão
+dele (gasto, publicar ou expor, apagar, mudar escopo). Formato:
+`[de <seu-nome> para <remetente>] Assunto: <assunto>` e, na linha seguinte, a resposta em si. Se não
+puder responder, diga ao remetente o que falta e com quem está. Detalhes na skill `herdr`.
+
+Conversas com cabeçalho herdr-message e ID de pedido usam retorno persistente. Use o
+Reply-Command entregue, preservando --route e --state-dir; não reconstrua uma rota padrão. No contexto
+padrão, o comando é
+`/home/brenoperucchi/Devs/herdr-mesh-tools/bin/herdr-message reply <ID> --file <arquivo-absoluto> --key reply:<ID>`.
+O retorno reply_recorded confirma gravação, não entrega; a outbox assume a entrega quando a origem
+estiver disponível. Escrever só no próprio buffer não registra retorno. Não use --wait, sleep em
+foreground ou loop do agent para aguardar o colega. Para novos pedidos acompanhados, com supervisor
+saudável, use o mesmo CLI com `send <alvo> --subject <assunto> --file <arquivo-absoluto> --key <chave>`;
+queued confirma persistência. worker_unavailable é falha explícita, não autorização para iniciar
+serviço. Se send falhou com worker_unavailable, nada foi enfileirado: use o canal legado guardado
+(herdr-can-send código 0 e herdr agent prompt) se precisar enviar agora. Se a guarda recusar, preserve
+texto e informe a pendência, sem loop bloqueante. Depois de queued/reply_recorded ou resultado
+incerto, não faça fallback manual nem repita; consulte status. A entrega acompanhada só é operacional
+após ativação aprovada por Breno. Mensagens sem ID seguem o legado, sem acompanhamento retroativo.
+herdr-ask/herdr-review mantêm seus próprios contratos de artefatos e cegueira.
+"""
+
+
 LEAN_EXEC_NOTE = """
 
 Space ENXUTO (decisão do Breno, 2026-10-03): neste space só o exec fica ligado. Os
@@ -877,6 +905,7 @@ def role_reinforcement_prompt(name, slug, cwd, siblings, lean=False, coordinator
         exec_name = owner
         prompt += SCOUT_ROLE_NOTE.format(name=name, exec_name=exec_name)
     prompt += HEADLESS_REVIEWER_NOTE.format(slug=slug, coordinator_name=owner)
+    prompt += AGENT_REPLY_NOTE
     if lean_exec:
         prompt += LEAN_EXEC_NOTE.format(slug=slug)
     return prompt

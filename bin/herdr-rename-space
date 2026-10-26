@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""herdr-rename-space --de LABEL --label NOVO --slug NOVO --dir NOVA_PASTA [--dir-antigo P] [--absorver P ...] [--apply]
+
+Troca o nome e/ou a pasta de UM space e leva junto o que o identifica: pasta, histórico do Claude e
+do Codex (para as sessões continuarem achaveis), nomes dos agents, label do workspace e os registros
+do mesh (SPACES, inventário, Guardian, units do systemd). Sem --apply só mostra o plano (dry-run).
+
+    herdr-rename-space --de claude-bridge --label guardian --slug guardian \\
+        --dir ~/Devs/guardian --dir-antigo ~/Devs/claude-bridge --absorver ~/.claude-bridge
+
+Um space por vez. Todos os agents do space precisam estar parados na caixa (idle/done, sem rascunho
+humano nem diálogo): são encerrados por SIGTERM (nunca por `/exit` digitado), a pasta e o histórico
+mudam, e cada agent volta no MESMO pane com `agent start ... resume <sessão>` na pasta nova.
+
+--dir-antigo  pasta que muda (default: o cwd do exec). Use quando o exec roda em outra pasta que a raiz.
+--absorver    outra pasta cujo HISTÓRICO (Claude/Codex) passa a valer na pasta nova (repetível). Se a
+              pasta ainda existe (ex.: um diretório de runtime), só o histórico migra; se não existe
+              mais, os registros dela (units, inventário, confiança) também são trocados.
+--sem-units   não reinicia as units do systemd que mudaram.
+--retomar F   continua uma execução interrompida (F = arquivo de estado impresso na falha).
+
+O que é escrito, sempre com backup em ~/.local/state/herdr-mesh/rename-<data>/ e prefixo de caminho
+inteiro (nunca substring): pasta (mv, git worktree repair), ~/.claude/projects, history.jsonl,
+~/.claude.json, ~/.codex (state_5.sqlite, rollouts, config.toml), units, symlinks, SPACES do
+herdr-bootstrap, config/*.json do inventário e a lista `foco` do Guardian. O resto (docs, scripts,
+plugins.json do Herdr) só é LISTADO no fim, para revisão.
+"""
+import argparse
+import datetime
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_dispatch as core  # noqa: E402
+import _herdr_probe_cache as probe_cache  # noqa: E402
+import _herdr_rename as rn  # noqa: E402
+
+HOME = os.path.realpath(os.environ.get("HERDR_RENAME_HOME") or os.path.expanduser("~"))
+STATE_DIR = os.environ.get("HERDR_MESH_STATE_DIR") or os.path.join(HOME, ".local", "state", "herdr-mesh")
+BIN = os.path.dirname(os.path.realpath(__file__))
+BOOTSTRAP = os.path.join(BIN, "herdr-bootstrap")
+INVENTORY_DIR = os.environ.get("HERDR_INVENTORY_DIR") or os.path.join(HOME, "Devs", "inventory")
+GUARDIAN_FASES = os.environ.get("HERDR_GUARDIAN_FASES") or os.path.join(
+    HOME, "Devs", "guardian", "guardian", "visao-fases.json")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def restart_mod():
+    return SourceFileLoader("herdr_agent_restart_for_rename", os.path.join(BIN, "herdr-agent-restart")).load_module()
+
+
+def absoluto(p):
+    return os.path.abspath(os.path.expanduser(p))
+
+
+def api_lista(*args):
+    r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+    return json.loads(r.stdout)["result"]
+
+
+# ------------------------------------------------------------------ plano
+def levantar(a):
+    """Fatos do space (workspace, agents, perfis) + recusas. Nao escreve nada."""
+    rs = restart_mod()
+    ws = next((w for w in api_lista("workspace", "list")["workspaces"]
+               if w["label"].lower() == a.de.lower()), None)
+    if not ws:
+        raise SystemExit(f"workspace '{a.de}' nao encontrado (herdr workspace list)")
+    agents = [x for x in rs.agentes() if x.get("workspace_id") == ws["workspace_id"]]
+    execs = [x for x in agents if (x.get("name") or "").endswith("-exec")]
+    if len(execs) != 1:
+        raise SystemExit(f"esperava 1 *-exec no workspace {a.de}, achei {len(execs)}")
+    exec_ag = execs[0]
+    slug_velho = exec_ag["name"][: -len("-exec")]
+    slug_novo = a.slug or slug_velho
+    procs, cache = rs.processos(), probe_cache.ler()
+    recusas, lista = [], []
+    for ag in sorted(agents, key=lambda x: x.get("name") or ""):
+        nome = ag.get("name")
+        if not nome:
+            recusas.append(f"agent sem nome no pane {ag['pane_id']} (rode herdr-fix-names)")
+            continue
+        if not (nome == slug_velho or nome.startswith(slug_velho + "-")):
+            recusas.append(f"{nome}: nao segue o slug '{slug_velho}' (nao sei renomear)")
+            continue
+        if ag["agent"] not in ("claude", "codex"):
+            recusas.append(f"{nome}: kind {ag['agent']} sem suporte no rename")
+            continue
+        pid, _, argv = procs.get(ag["pane_id"], (None, ag["agent"], []))
+        sessao = rs.sessao_de(ag, argv)
+        if pid is None or not sessao:
+            recusas.append(f"{nome}: sem processo vivo ou sem sessao registrada")
+            continue
+        for m in rs.checar_seguranca(ag):
+            recusas.append(f"{nome}: {m}")
+        model, effort, fonte = rs.resolve_profile(nome, ag["agent"], argv, cache.get(nome), None, None, None)
+        lista.append({"nome": nome, "novo_nome": slug_novo + nome[len(slug_velho):], "pane": ag["pane_id"],
+                      "kind": ag["agent"], "sessao": sessao, "pid": pid, "argv": argv,
+                      "model": model, "effort": effort, "fonte": fonte, "cwd": ag.get("cwd")})
+    dir_antigo = absoluto(a.dir_antigo) if a.dir_antigo else absoluto(exec_ag["cwd"])
+    return {"ws": ws, "slug_velho": slug_velho, "dir_antigo": dir_antigo, "agentes": lista, "recusas": recusas}
+
+
+def checar_destino(a, f, recusas):
+    novo, velho = absoluto(a.dir), f["dir_antigo"]
+    moverdir = os.path.realpath(velho) != os.path.realpath(novo)
+    if moverdir:
+        if not os.path.isdir(velho):
+            recusas.append(f"pasta antiga nao existe: {velho}")
+        elif os.path.lexists(novo):
+            recusas.append(f"destino ja existe: {novo}")
+        elif not os.path.isdir(os.path.dirname(novo)):
+            recusas.append(f"pasta-mae do destino nao existe: {os.path.dirname(novo)}")
+        elif os.path.isdir(velho) and os.stat(velho).st_dev != os.stat(os.path.dirname(novo)).st_dev:
+            recusas.append("destino em outro sistema de arquivos (o mv deixaria de ser atomico)")
+    # outro pane com cwd dentro da pasta que vai mudar
+    if moverdir:
+        meus = {x["pane"] for x in f["agentes"]}
+        for p in api_lista("pane", "list")["panes"]:
+            cwd = p.get("cwd") or ""
+            if p["pane_id"] not in meus and (cwd == velho or cwd.startswith(velho + "/")):
+                recusas.append(f"o pane {p['pane_id']} ({p.get('workspace_id')}) tem cwd dentro de {velho}")
+    if os.environ.get("HERDR_PANE_ID") in {x["pane"] for x in f["agentes"]}:
+        recusas.append("este comando esta rodando num pane do proprio space")
+    return moverdir
+
+
+def pares_e_gone(a, f):
+    novo, velho = absoluto(a.dir), f["dir_antigo"]
+    absorv = [absoluto(p) for p in (a.absorver or [])]
+    mapa = rn.Mapa([(velho, novo)] + [(p, novo) for p in absorv])
+    gone = []
+    if velho != novo:
+        gone.append(velho)
+    gone += [p for p in absorv if p != novo and not os.path.exists(p)]
+    return mapa, gone
+
+
+def rel_home(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+# ------------------------------------------------------------------ registros do mesh
+def edita_spaces(a, f, novo_dir, aplicar, bkp):
+    """Bloco do space na tabela SPACES do herdr-bootstrap: label, exec/scout, slug e cwd."""
+    src = open(BOOTSTRAP, encoding="utf-8").read()
+    linhas = src.splitlines(keepends=True)
+    ini = next((i for i, l in enumerate(linhas) if re.match(r'\s*\("' + re.escape(a.de) + r'",', l)), None)
+    if ini is None:
+        return {"achou": False, "avisos": [f'bloco ("{a.de}", ...) nao esta na tabela SPACES']}
+    recuo = re.match(r"\s*", linhas[ini]).group(0)
+    fim = ini + 1
+    # o bloco acaba na proxima entrada/comentario NO MESMO recuo (as linhas do scout vem mais recuadas)
+    while fim < len(linhas) and not linhas[fim].startswith("]") and not (
+            linhas[fim].startswith(recuo) and re.match(r"[(#]", linhas[fim][len(recuo):])):
+        fim += 1
+    bloco = "".join(linhas[ini:fim])
+    sv, sn = f["slug_velho"], a.slug
+    novo = bloco.replace(f'("{a.de}",', f'("{a.label}",', 1)
+    novo = novo.replace(f'"{sv}-exec"', f'"{sn}-exec"').replace(f'"{sv}-scout"', f'"{sn}-scout"')
+    novo = re.sub(r'"' + re.escape(sv) + r'"(?=,\s*\{|\s*,|\s*\))', f'"{sn}"', novo)
+    rel = novo_dir[len(HOME) + 1:] if novo_dir.startswith(HOME + "/") else None
+    avisos = []
+    if rel:
+        m = re.search(r'f"\{HOME\}/([^"]*)"', novo)
+        if m:
+            if m.group(1) != rel:
+                avisos.append(f"cwd da tabela mudou de {m.group(1)} para {rel}")
+            novo = novo[:m.start()] + f'f"{{HOME}}/{rel}"' + novo[m.end():]
+        else:
+            avisos.append("nao achei o f\"{HOME}/...\" do cwd no bloco; ajuste a mao")
+    else:
+        avisos.append("a nova pasta esta fora de $HOME; ajuste o cwd do bloco a mao")
+    out = {"achou": True, "muda": novo != bloco, "avisos": avisos, "antes": bloco, "depois": novo}
+    if aplicar and novo != bloco:
+        rn.backup(None, BOOTSTRAP, bkp)
+        rn.gravar_atomico(BOOTSTRAP, "".join(linhas[:ini]) + novo + "".join(linhas[fim:]))
+    return out
+
+
+def edita_registros(a, f, gone, novo_dir, aplicar, bkp):
+    """Textos que citam a pasta antiga: inventario (categories/projects.json) e foco do Guardian."""
+    rel = {"inventario": [], "guardian": 0, "spaces": None}
+    rel["spaces"] = edita_spaces(a, f, novo_dir, aplicar, bkp)
+    cfg = os.path.join(INVENTORY_DIR, "config")
+    for nome in ("categories.json", "projects.json"):
+        p = os.path.join(cfg, nome)
+        if not os.path.exists(p):
+            continue
+
+        def fn(t):
+            total = 0
+            for g in gone:
+                t, n = rn.substitui_caminho(t, rel_home(g), rel_home(novo_dir))
+                total += n
+            return t, total
+        n = rn.edita_texto(p, fn, bkp, aplicar)
+        if n:
+            if aplicar:
+                json.load(open(p, encoding="utf-8"))     # continua JSON valido
+            rel["inventario"].append((p, n))
+    fases = GUARDIAN_FASES
+    for g in gone:                                         # o repo do Guardian pode ser a propria pasta que mudou
+        m = rn.Mapa([(g, novo_dir)]).aplica(fases)
+        if m and aplicar:
+            fases = m
+    if os.path.exists(fases) or os.path.exists(GUARDIAN_FASES):
+        alvo = fases if os.path.exists(fases) else GUARDIAN_FASES
+        def troca_nomes(t):
+            total = 0
+            for ag in f["agentes"]:
+                if ag["nome"] != ag["novo_nome"]:
+                    total += t.count(f'"{ag["nome"]}"')
+                    t = t.replace(f'"{ag["nome"]}"', f'"{ag["novo_nome"]}"')
+            return t, total
+        rel["guardian"] = rn.edita_texto(alvo, troca_nomes, bkp, aplicar)
+    return rel
+
+
+# ------------------------------------------------------------------ execucao
+def parar_agents(f, rs):
+    for ag in f["agentes"]:
+        if not rs.encerrar(ag["pid"]):
+            raise RuntimeError(f"{ag['nome']}: o processo {ag['pid']} nao saiu com SIGTERM")
+    time.sleep(1.5)
+
+
+def religar(a, f, rs, novo_dir):
+    saida = []
+    for ag in f["agentes"]:
+        pane, nome = ag["pane"], ag["novo_nome"]
+        subprocess.run(core.herdr_argv("pane", "run", pane, f"cd {shell_quote(novo_dir)}"),
+                       capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+        time.sleep(1.0)
+        args = ["agent", "start", nome, "--kind", ag["kind"], "--pane", pane, "--timeout", "90000", "--",
+                *rs.start_args(ag["kind"], ag["sessao"], ag["model"], ag["effort"], ag["argv"])]
+        ultimo, ok = "", False
+        for _ in range(6):
+            r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)
+            ultimo = (r.stderr or r.stdout).strip()
+            if r.returncode == 0:
+                ok = True
+                break
+            time.sleep(2.5)
+        extra = rs.tratar_dialogos(pane, ag["kind"]) if ok else []
+        trust = ok and ag["kind"] == "claude" and "Yes, I trust this folder" in rs.tela(pane)
+        saida.append({"nome": nome, "pane": pane, "ok": ok, "erro": None if ok else ultimo[:160],
+                      "dialogos": extra, "trust": trust})
+    return saida
+
+
+def nomes_agents(f):
+    return [(ag["nome"], ag["novo_nome"]) for ag in f["agentes"]]
+
+
+def shell_quote(p):
+    return "'" + p.replace("'", "'\\''") + "'"
+
+
+def salvar_estado(estado):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    rn.gravar_atomico(estado["arquivo"], json.dumps(estado, indent=2, ensure_ascii=False))
+
+
+def executar(a, f, mapa, gone, moverdir, novo_dir, estado):
+    rs = restart_mod()
+    bkp = estado["backup"]
+    feitas = estado["fases"]
+
+    def fase(nome, fn):
+        if nome in feitas:
+            return
+        print(f"== {nome}", flush=True)
+        try:
+            fn()
+        except Exception as e:      # noqa: BLE001 - o estado fica gravado para --retomar
+            salvar_estado(estado)
+            raise SystemExit(f"FALHOU na fase '{nome}': {e}\n  estado: {estado['arquivo']}\n"
+                             f"  continue com: herdr-rename-space --retomar {estado['arquivo']} --apply")
+        feitas.append(nome)
+        salvar_estado(estado)
+
+    def mover():
+        if moverdir:
+            os.rename(f["dir_antigo"], novo_dir)
+            if os.path.exists(os.path.join(novo_dir, ".git")):
+                ok, msg = rn.git_worktree_repair(novo_dir, rn.worktrees_do_git(novo_dir))
+                print(f"   git worktree repair: {'ok' if ok else 'FALHOU'} {msg[:200]}")
+
+    def historico():
+        c = rn.migra_historico_claude(HOME, mapa, bkp, True)
+        print(f"   claude: {len(c['pastas'])} pasta(s) de projeto, {c['cwd_trocados']} cwd, history {c['history_trocas']}; "
+              f"conflitos: {len(c['conflitos'])}")
+        for x in c["conflitos"]:
+            print("   CONFLITO", x)
+        j = rn.migra_claude_json(HOME, mapa, set(gone), bkp, True)
+        print(f"   ~/.claude.json: {len(j['chaves'])} chave(s)")
+        k = rn.migra_codex(HOME, mapa, bkp, True, renomear_config=set(gone))
+        print(f"   codex: {k['threads']} thread(s), {k['rollouts_trocas']} cwd em rollouts, config {len(k['config'])} bloco(s)")
+
+    def sistema():
+        for g in gone:
+            un = rn.units_afetadas(HOME, g, novo_dir, bkp, True)
+            sl = rn.symlinks_para(HOME, g, novo_dir, True)
+            print(f"   units: {[u for u, _ in un]}  symlinks: {len(sl)}")
+            estado["units"] = sorted(set(estado.get("units", []) + [u for u, _ in un]))
+        nn = rn.units_com_nomes(HOME, nomes_agents(f), bkp, True)
+        print(f"   units com nome de agent: {[u for u, _ in nn]}")
+        estado["units"] = sorted(set(estado.get("units", []) + [u for u, _ in nn]))
+        if estado["units"]:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], timeout=60)
+
+    def registros():
+        r = edita_registros(a, f, gone, novo_dir, True, bkp)
+        print(f"   SPACES: {'ok' if r['spaces'].get('muda') else 'sem mudanca'} {r['spaces'].get('avisos', [])}")
+        print(f"   inventario: {[os.path.basename(p) for p, _ in r['inventario']]}  guardian foco: {r['guardian']}")
+
+    def herdr_nomes():
+        if a.label != a.de:
+            subprocess.run(core.herdr_argv("workspace", "rename", f["ws"]["workspace_id"], a.label),
+                           capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
+
+    def religar_fase():
+        res = religar(a, f, rs, novo_dir)
+        estado["religar"] = res
+        for r in res:
+            print(f"   {r['nome']} ({r['pane']}): {'ok' if r['ok'] else 'FALHA ' + str(r['erro'])}"
+                  f"{'  [aprove a confianca na mao]' if r['trust'] else ''}")
+        if not all(r["ok"] for r in res):
+            raise RuntimeError("algum agent nao voltou; o historico ja esta migrado (use `herdr-agent-restart`)")
+
+    def units_restart():
+        if a.sem_units:
+            return
+        ativas = [u for u in estado.get("units", []) if u.endswith(".service")
+                  and subprocess.run(["systemctl", "--user", "is-active", "--quiet", u]).returncode == 0]
+        for u in ativas:
+            r = subprocess.run(["systemctl", "--user", "restart", u], capture_output=True, text=True, timeout=120)
+            print(f"   restart {u}: {'ok' if r.returncode == 0 else 'FALHOU ' + r.stderr.strip()[:120]}")
+
+    fase("parar agents", lambda: parar_agents(f, rs))
+    fase("mover pasta", mover)
+    fase("historico Claude/Codex", historico)
+    fase("units e symlinks", sistema)
+    fase("registros do mesh", registros)
+    fase("nomes no Herdr", herdr_nomes)
+    fase("religar agents", religar_fase)
+    fase("restart das units", units_restart)
+
+
+def relatorio_restantes(a, f, gone, novo_dir):
+    velhos = [rel_home(g) for g in gone] + gone + [f["slug_velho"] + "-exec"]
+    raizes = [os.path.join(HOME, "Devs"), os.path.join(HOME, ".config"), os.path.join(HOME, ".local", "bin"),
+              os.path.join(HOME, ".claude", "settings.json"), os.path.join(HOME, ".claude", "CLAUDE.md"),
+              os.path.join(HOME, ".codex", "config.toml"), os.path.join(HOME, ".codex", "AGENTS.md"),
+              os.path.join(HOME, ".codex", "hooks.json")]
+    return rn.referencias_restantes(sorted(set(velhos)), raizes,
+                                    excluir=("node_modules", ".git", "__pycache__", ".venv", "review",
+                                             "session-snapshots", "handoff", "backups"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Renomeia/move UM space e leva o historico junto.")
+    ap.add_argument("--de", help="label atual do workspace")
+    ap.add_argument("--label", help="label novo (default: o mesmo)")
+    ap.add_argument("--slug", help="slug novo: o exec vira <slug>-exec (default: o atual)")
+    ap.add_argument("--dir", help="pasta nova do projeto (default: a atual)")
+    ap.add_argument("--dir-antigo", help="pasta que muda (default: o cwd do exec)")
+    ap.add_argument("--absorver", action="append", default=[], help="outra pasta cujo historico migra (repetivel)")
+    ap.add_argument("--apply", action="store_true", help="executa (sem isto: so o plano)")
+    ap.add_argument("--sem-units", action="store_true", help="nao reinicia as units alteradas")
+    ap.add_argument("--retomar", metavar="ARQUIVO")
+    a = ap.parse_args()
+
+    estado = None
+    if a.retomar:
+        estado = json.load(open(a.retomar, encoding="utf-8"))
+        for k, v in estado["args"].items():
+            setattr(a, k, v)
+        a.apply = True
+    if not a.de:
+        ap.error("--de e' obrigatorio")
+    a.label = a.label or a.de
+    core.require_herdr_pane()
+    if estado:
+        f = estado["facts"]               # os agents ja foram encerrados: vale o que foi gravado
+        moverdir, recusas = estado["moverdir"], []
+    else:
+        f = levantar(a)
+        a.slug = a.slug or f["slug_velho"]
+        if not SLUG_RE.match(a.slug):
+            raise SystemExit(f"slug invalido '{a.slug}': use minusculas, digitos e hifen")
+        a.dir = a.dir or f["dir_antigo"]
+        recusas = list(f["recusas"])
+        moverdir = checar_destino(a, f, recusas)
+    novo_dir = absoluto(a.dir)
+    mapa, gone = pares_e_gone(a, f)
+
+    bkp = estado["backup"] if estado else os.path.join(STATE_DIR, f"rename-{rn.agora()}")
+    if not estado:
+        print(f"space   : {a.de} -> {a.label}   exec: {f['slug_velho']}-exec -> {a.slug}-exec")
+        print(f"pasta   : {f['dir_antigo']}" + (f"  ->  {novo_dir}" if moverdir else "  (nao muda)"))
+        for p in a.absorver:
+            print(f"absorve : historico de {absoluto(p)} ({'registros tambem' if not os.path.exists(absoluto(p)) else 'a pasta continua existindo: so o historico'})")
+        for ag in f["agentes"]:
+            print(f"agent   : {ag['nome']:24} -> {ag['novo_nome']:26} {ag['pane']:8} {ag['kind']:6} sessao {ag['sessao'][:8]} "
+                  f"{ag['model']}/{ag['effort']}")
+
+        c = rn.migra_historico_claude(HOME, mapa, bkp, False)
+        j = rn.migra_claude_json(HOME, mapa, set(gone), bkp, False)
+        k = rn.migra_codex(HOME, mapa, bkp, False, renomear_config=set(gone))
+        print(f"claude  : {len(c['pastas'])} pasta(s) de projeto, {c['cwd_trocados']} cwd em sessoes, "
+              f"{c['history_trocas']} em history.jsonl, {len(j['chaves'])} chave(s) em ~/.claude.json, conflitos {len(c['conflitos'])}")
+        for p in c["pastas"]:
+            print(f"          {os.path.basename(p['de'])} -> {os.path.basename(p['para'])}")
+        for x in c["conflitos"]:
+            print(f"          CONFLITO {x}")
+        print(f"codex   : {k['threads']} thread(s), {k['rollouts_trocas']} cwd em rollouts, "
+              f"{len(k['config'])} bloco(s) em config.toml")
+        un, sl = [], []
+        for g in gone:
+            un += rn.units_afetadas(HOME, g, novo_dir, bkp, False)
+            sl += rn.symlinks_para(HOME, g, novo_dir, False)
+        nn = rn.units_com_nomes(HOME, nomes_agents(f), bkp, False)
+        print(f"sistema : units {[u for u, _ in un]}, symlinks {len(sl)}; units com nome de agent {[u for u, _ in nn]}")
+        reg = edita_registros(a, f, gone, novo_dir, False, bkp)
+        sp = reg["spaces"]
+        print(f"mesh    : SPACES {'muda' if sp.get('muda') else 'sem mudanca/nao achou'} {sp.get('avisos', [])}; "
+              f"inventario {[os.path.basename(p) for p, _ in reg['inventario']]}; guardian foco {reg['guardian']}")
+        if sp.get("muda"):
+            for l in difflib.unified_diff(sp["antes"].splitlines(), sp["depois"].splitlines(), lineterm="", n=0):
+                if l[:1] in "+-" and l[:3] not in ("+++", "---"):
+                    print(f"          SPACES {l.strip()[:150]}")
+
+    if recusas:
+        print("\nBLOQUEADO:")
+        for r in recusas:
+            print(f"  - {r}")
+        return 1
+    if not a.apply:
+        print("\ndry-run: nada foi escrito. Confira e rode de novo com --apply.")
+        print("restantes (so listados, nao editados):")
+        for p, v in list(relatorio_restantes(a, f, gone, novo_dir).items())[:25]:
+            print(f"  {p}  <- {', '.join(v)}")
+        return 0
+
+    if not estado:
+        estado = {"arquivo": os.path.join(STATE_DIR, f"rename-{a.de}-{rn.agora()}.json"), "backup": bkp,
+                  "fases": [], "units": [], "moverdir": moverdir, "facts": f,
+                  "args": {"de": a.de, "label": a.label, "slug": a.slug, "dir": a.dir,
+                           "dir_antigo": a.dir_antigo, "absorver": a.absorver, "sem_units": a.sem_units}}
+        salvar_estado(estado)
+    executar(a, f, mapa, gone, moverdir, novo_dir, estado)
+    print("\nrestantes (so listados, nao editados):")
+    for p, v in list(relatorio_restantes(a, f, gone, novo_dir).items())[:40]:
+        print(f"  {p}  <- {', '.join(v)}")
+    with open(os.path.join(STATE_DIR, "renames.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "de": a.de,
+                             "label": a.label, "slug": a.slug, "dir": novo_dir, "estado": estado["arquivo"]},
+                            ensure_ascii=False) + "\n")
+    print(f"\nFEITO. backup e estado: {estado['backup']}  {estado['arquivo']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

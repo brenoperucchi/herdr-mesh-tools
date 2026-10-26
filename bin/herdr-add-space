@@ -326,7 +326,7 @@ def ensure_board(cwd):
 INVENTORY_DIR = os.path.realpath(os.path.expanduser(
     os.environ.get("HERDR_INVENTORY_DIR") or "~/Devs/inventory"))
 GUARDIAN_FASES = os.path.realpath(os.path.expanduser(
-    os.environ.get("HERDR_GUARDIAN_FASES") or "~/Devs/claude-bridge/guardian/visao-fases.json"))
+    os.environ.get("HERDR_GUARDIAN_FASES") or "~/Devs/guardian/guardian/visao-fases.json"))
 # Em teste (qualquer override) os coletores reais nao rodam.
 _REGISTROS_ISOLADOS = bool(os.environ.get("HERDR_INVENTORY_DIR")
                            or os.environ.get("HERDR_GUARDIAN_FASES"))

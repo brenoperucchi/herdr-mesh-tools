@@ -1,0 +1,18 @@
+# Proposal only. Not installed or enabled by this repository.
+[Unit]
+Description=Herdr durable message outbox
+After=herdr.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Devs/herdr-mesh-tools
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStart=%h/Devs/herdr-mesh-tools/bin/herdr-message --socket %h/.config/herdr/herdr.sock worker --interval 2
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

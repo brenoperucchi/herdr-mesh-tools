@@ -65,7 +65,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_sem_nada_usa_a_matriz_do_papel(self):
         self.assertEqual(self.m.resolve_profile("x-exec", "claude", [], None, None)[:2], ("claude-sonnet-5-5", "low"))
-        self.assertEqual(self.m.resolve_profile("x-rev-1", "codex", [], None, None)[:2], ("gpt-6.1-sol", "low"))
+        self.assertEqual(self.m.resolve_profile("x-rev-1", "codex", [], None, None)[:2], ("gpt-6.1-sol", "high"))
         self.assertEqual(self.m.resolve_profile("x-scout", "codex", [], None, None)[:2], ("gpt-6.1-sol", "xhigh"))
         self.assertEqual(self.m.resolve_profile("x-rev-2", "claude", [], None, None)[:2], ("claude-opus-5-5", "high"))
 

@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Asynchronous, durable conversations through the existing guarded Herdr CLI."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _herdr_message_ledger import Ledger, MessageError, encode, same_endpoint
+from _herdr_message_runtime import Runtime
+from _herdr_message_worker import Worker, healthy
+
+
+def body(args):
+    if args.file:
+        p = Path(args.file)
+        if not p.is_absolute():
+            raise MessageError('body file must use an absolute path')
+        with p.open('rb') as f:
+            raw = f.read(65537)
+    else:
+        raw = sys.stdin.buffer.read(65537)
+    if len(raw) > 65536:
+        raise MessageError('body_too_large')
+    return raw.decode('utf-8')
+
+
+def participant(db, mid, caller):
+    m = db.get(mid)
+    if not (same_endpoint(caller, m['sender']) or same_endpoint(caller, m['destination'])):
+        raise MessageError('conversation_not_owned_by_caller')
+    return m
+
+
+def execute(args, db, runtime):
+    if args.command == 'worker':
+        Worker(db, runtime).run(interval=args.interval)
+        return dict(code='worker_stopped')
+    if args.command == 'reconcile':
+        Worker(db, runtime).run(once=True)
+        return dict(code='reconciled')
+    if args.command == 'health':
+        return dict(code='worker_healthy' if healthy(db) else 'worker_unavailable')
+    caller = runtime.caller()
+    if args.command == 'send':
+        if not healthy(db):
+            raise MessageError('worker_unavailable: nothing enqueued; supervisor requires approval/activation')
+        target = runtime.get(args.target)
+        message = db.send(caller, target, args.subject, body(args), args.key,
+                          requires_reply=not args.notice, send_timeout=args.send_timeout,
+                          reply_timeout=args.reply_timeout)
+        return dict(code='queued' if message['transport'] in ('queued', 'deferred') else message['transport'],
+                    id=message['id'], transport=message['transport'], requires_reply=bool(message['requires_reply']))
+    if args.command == 'reply':
+        message = db.reply(args.id, caller, body(args), args.key)
+        return dict(code='reply_recorded', id=message['id'], request_id=args.id,
+                    transport=message['transport'], worker_healthy=healthy(db))
+    if args.command in ('status', 'inbox'):
+        if args.id:
+            participant(db, args.id, caller)
+            return dict(code='status', conversation=db.status(args.id), worker_healthy=healthy(db))
+        ids = db.db.execute("SELECT id FROM messages WHERE kind='request' AND (sender=? OR destination=?) ORDER BY created DESC LIMIT 100",
+                            (encode(caller), encode(caller)))
+        return dict(code='status', conversations=[db.status(row[0]) for row in ids], worker_healthy=healthy(db))
+    if args.command == 'show':
+        participant(db, args.id, caller)
+        return dict(code='body', id=args.id, body=db.body(args.id))
+    raise MessageError('unknown command')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog='send/reply return after persistence. No --wait; do not sleep waiting for a peer.')
+    parser.add_argument('--route', help='frozen routing JSON emitted by the worker for reply commands')
+    parser.add_argument('--socket', help='explicit local Herdr socket; also fixes ledger routing scope')
+    parser.add_argument('--session', help='explicit isolated Herdr session, translated to --session on every call')
+    parser.add_argument('--state-dir', help='private ledger directory; default is per routing scope')
+    commands = parser.add_subparsers(dest='command', required=True)
+    send = commands.add_parser('send', help='enqueue a request and return queued with its ID')
+    send.add_argument('target')
+    send.add_argument('--subject', required=True)
+    send.add_argument('--key', required=True, help='stable unique key; repeat only for the same frozen request')
+    send.add_argument('--notice', action='store_true', help='no reply obligation')
+    send.add_argument('--send-timeout', type=float, default=900)
+    send.add_argument('--reply-timeout', type=float, default=900)
+    reply = commands.add_parser('reply', help='persist final reply without waiting for origin')
+    reply.add_argument('id')
+    reply.add_argument('--key', required=True)
+    for cmd in (send, reply):
+        source = cmd.add_mutually_exclusive_group(required=True)
+        source.add_argument('--file')
+        source.add_argument('--stdin', action='store_true')
+    for name in ('status', 'inbox'):
+        cmd = commands.add_parser(name, help='metadata of conversations owned by the observed caller')
+        cmd.add_argument('id', nargs='?')
+    show = commands.add_parser('show', help='show body to the observed participants')
+    show.add_argument('id')
+    worker = commands.add_parser('worker', help='foreground entrypoint for an approved supervisor, not for caller-side waiting')
+    worker.add_argument('--interval', type=float, default=2)
+    commands.add_parser('reconcile', help='one exclusive reconciliation pass; no service installation')
+    commands.add_parser('health', help='supervisor health; no message bodies')
+    args = parser.parse_args(argv)
+    try:
+        if args.socket:
+            os.environ['HERDR_SOCKET_PATH'] = str(Path(args.socket).absolute())
+        if args.session:
+            os.environ['HERDR_SESSION'] = args.session
+        try:
+            route = json.loads(args.route) if args.route is not None else None
+        except ValueError as exc:
+            raise MessageError('invalid_route') from exc
+        if args.route is not None and (args.socket is not None or args.session is not None):
+            raise MessageError('route cannot be mixed with socket/session')
+        runtime = Runtime(route=route)
+        state = args.state_dir or str(Path.home() / '.local/state/herdr-message' / runtime.scope)
+        if args.command == 'worker' and (not 0.1 <= args.interval <= 30):
+            raise MessageError('worker interval must be between 0.1 and 30 seconds')
+        with Ledger(state, runtime.scope) as db:
+            result = execute(args, db, runtime)
+        print(json.dumps(result, ensure_ascii=False))
+        return 3 if result['code'] == 'worker_unavailable' else 0
+    except (MessageError, OSError, UnicodeError, sqlite3.Error) as exc:
+        # Never print subprocess output, payload or human composition in errors.
+        detail = str(exc) if isinstance(exc, MessageError) else type(exc).__name__
+        print(json.dumps(dict(code='error', detail=detail)), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

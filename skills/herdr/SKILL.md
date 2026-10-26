@@ -329,6 +329,30 @@ exige uma pane disponível/vazia e perde qualquer trabalho em andamento —
 não use isso como reparo ao vivo de uma sessão ativa só por causa deste
 campo.
 
+## Mensagens entre agents são bidirecionais: responda direto ao remetente
+
+Regra do Breno (2026-10-13), vale para todo agent do mesh. Quando outro agent lhe pede informação,
+uma consulta ou uma resposta (mensagem do tipo `[de <agent>, ...]`), **você responde DIRETO a ele**,
+sem segurar a resposta esperando o Breno e sem perguntar a ele "posso mandar?". Motivo: um agent
+parou esperando o "manda" do Breno e o fluxo travou.
+
+1. `herdr-can-send <remetente>`. Código 0: siga para o passo 2 e envie sem perguntar. Códigos 1, 2 ou
+   3 (rascunho, diálogo, agent ocupado): espere e tente de novo; só leve ao Breno se persistir.
+2. `herdr agent prompt <remetente> "<mensagem>"` no formato abaixo.
+3. Se não puder responder (falta dado ou decisão), responda ao remetente do mesmo jeito dizendo o que
+   falta e com quem está. Silêncio não é resposta.
+
+Formato da resposta (remetente, assunto e a resposta em si):
+
+```
+[de <seu-nome> para <remetente>] Assunto: <assunto do pedido>
+<a resposta em si>
+```
+
+Só fica com o Breno o que for **decisão dele**: gasto, publicar ou expor algo, apagar, mudar escopo,
+ou o que o próprio pedido disser que depende dele. Quem PEDE informação também não deve escrever
+"responda ou deixe com o Breno": peça a resposta direta e diga a decisão que fica com ele, se houver.
+
 ## Safety and coordination rules
 
 - Use `--no-focus` for background work unless the user asked to switch context.
@@ -338,3 +362,44 @@ campo.
 - Never run `herdr server stop` from an active session unless the user explicitly intends to stop the server and its pane processes.
 - Never kill the main Herdr process. Use named test sessions for experiments that need an isolated server.
 - CLI server errors are JSON on stderr with exit status 1. CLI syntax errors exit with status 2.
+
+
+## Conversas acompanhadas por ledger e outbox
+
+O CLI canônico fica em `/home/brenoperucchi/Devs/herdr-mesh-tools/bin/herdr-message`.
+Com supervisor saudável, `send <alvo> --subject <assunto> --file <arquivo-absoluto> --key <chave>`
+registra um pedido e retorna `queued` com ID. Use `--notice` para informação sem obrigação de
+retorno. Repita uma chave apenas para o mesmo pedido congelado.
+
+Ao receber cabeçalho `herdr-message` com ID de pedido, use o `Reply-Command` entregue,
+preservando `--route` e `--state-dir`, e substitua o arquivo de resposta por seu caminho
+absoluto. No contexto padrão, a forma é `reply <ID> --file <arquivo-absoluto> --key reply:<ID>`. `reply_recorded` confirma que a resposta está salva; o worker entrega
+quando a origem passar pelas guardas. Escrever só no buffer não registra resposta. Não faça
+`--wait`, `sleep` em foreground ou laço de retentativa para aguardar o colega.
+
+`status <ID>` e `inbox` mostram pendências; `show <ID>` mostra o corpo aos participantes
+observados. `return_pending_origin_busy` significa que a resposta existe e aguarda a origem.
+`unknown` significa que pode ter havido envio; não repita automaticamente. Sessão substituída,
+rascunho, diálogo e estado não permitido impedem entrega. Nenhum comando interrompe shell,
+limpa composição ou usa `allow-working`.
+
+A atribuição do caller cruza ancestralidade local com processos do pane. Ela falha fechada
+quando não é verificável; não autentica um agent contra outro processo hostil do mesmo UID.
+Nome e cwd integram a política estrita de destino congelado: mudança exige diagnóstico, sem
+redirecionamento automático. O wrapper mantém a corrida residual da checagem externa.
+
+`health` informa disponibilidade do worker. `worker_unavailable` recusa novos envios;
+`reply` ainda preserva uma resposta pendente. Instalar ou ativar supervisor exige a confirmação
+de Breno registrada pelo coordenador. O arquivo de exemplo não ativa nada. Até essa ativação,
+não apresente a entrega automática como operacional. Mensagens legadas sem ID seguem a regra
+anterior, sem acompanhamento retroativo. Revisões e consultas continuam por `herdr-review` e
+`herdr-ask`, com artefatos cegos; não as substitua por pedidos genéricos do ledger.
+
+Se `send` falhar com `worker_unavailable`, nada foi enfileirado. O canal legado guardado
+(`herdr-can-send` código 0 e `herdr agent prompt`) permanece disponível; recusa da guarda
+exige preservar o texto e informar a pendência, sem espera bloqueante. Depois de `queued`,
+`reply_recorded` ou resultado incerto, não faça esse fallback nem repita a mensagem manualmente.
+
+O aviso de alvo OpenCode depende de o comando bloqueante aparecer em `foreground_processes`.
+Sua eficácia contra um tool ativo do OpenCode ainda não foi validada. Ele não percorre todos
+os descendentes nem observa toda a shell; ausência do aviso não demonstra ausência de bloqueio.

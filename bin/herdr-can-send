@@ -66,6 +66,11 @@ def main():
     except RuntimeError as exc:
         print(f"INDETERMINADO: agent/pane {args.alvo!r} nao encontrado ({exc})")
         sys.exit(4)
+    try:
+        from _herdr_coordination_warnings import emit as coordination_warning
+        coordination_warning('herdr-can-send', target=info, query=core.api)
+    except Exception:
+        pass  # optional diagnostic must not change guard/dispatcher semantics
     code, rotulo, detalhe, tipo, texto = decidir(info, args.allow_working)
     if args.json:
         print(json.dumps({"alvo": args.alvo, "pane": info["pane_id"], "pode_enviar": code == 0, "codigo": code,

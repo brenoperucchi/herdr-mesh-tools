@@ -45,7 +45,8 @@ DRY = "--dry-run" in sys.argv
 # Default trocado em 2026-09-29 (pedido do Breno): Codex em gpt-6-sol medium.
 # 2026-10-04 (Breno): rev-1 Codex gpt-6.1-sol de xhigh para LOW: "esta muito lento".
 # O rev-2 (Claude xhigh) e o override por space nao mudam.
-REV_EFFORT = ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=low"]
+# 2026-10-15 (Breno): rev-1 Codex gpt-6.1-sol de LOW para HIGH.
+REV_EFFORT = ["--model", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]
 
 # Matriz normativa: a seleção de um papel depende somente do modelo. O
 # reasoning_effort continua explícito quando a CLI é iniciada, mas não cria
@@ -157,8 +158,8 @@ SPACES = [
     # cai no fallback "phase=legacy" de sempre. O exec foi trocado para
     # Claude Sonnet 5 em 2026-09-15; manter o perfil aqui evita que uma
     # restauração sem pane-base reverta o swap.
-    ("DRE", f"{HOME}/Devs/Khronos/DRE", ("dre-exec", "claude", EXEC_ARGS_SONNET_5),
-        ("dre-scout", "codex", SCOUT_ARGS), "dre", {"lean": True}),
+    ("khr-dre", f"{HOME}/Devs/Khronos/DRE", ("khr-dre-exec", "claude", EXEC_ARGS_SONNET_5),
+        ("khr-dre-scout", "codex", SCOUT_ARGS), "khr-dre", {"lean": True}),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so
     # broker.sqlite/tokens.json) - achado 2026-08-29: claude-bridge-exec
@@ -173,25 +174,25 @@ SPACES = [
     # scout continua Codex (nao fez parte daquele swap, confirmado ao vivo).
     # Enxuto desde 2026-10-03 (migracao dos spaces para o modo lean, primeiro space migrado):
     # so o exec fica ligado; rev-1, rev-2 e scout sobem sob demanda e saem com herdr-release.
-    ("claude-bridge", f"{HOME}/Devs/claude-bridge", ("claude-bridge-exec", "claude", EXEC_ARGS),
-        ("claude-bridge-scout", "codex", SCOUT_ARGS), "claude-bridge", {"lean": True}),
+    ("guardian", f"{HOME}/Devs/guardian", ("guardian-exec", "claude", EXEC_ARGS),
+        ("guardian-scout", "codex", SCOUT_ARGS), "guardian", {"lean": True}),
     # exec trocado pra Claude no mesmo batch-swap de 2026-08-31 (ver
     # claude-bridge acima) - mesma correcao de tabela stale.
     # Workspace e todos os agents foram renomeados de
     # "content-insights-collector"/"content-insights-collector-*" pra
     # "cic"/"cic-*" fora desta sessao - achado 2026-09-04 (dry-run ia criar
     # um workspace DUPLICADO porque o label aqui nao batia mais com o real).
-    ("cic", f"{HOME}/Devs/content-insights-collector",
-        ("cic-exec", "claude", EXEC_ARGS), None, "cic", {"lean": True}),
+    ("seed", f"{HOME}/Devs/CIC",
+        ("seed-exec", "claude", EXEC_ARGS), None, "seed", {"lean": True}),
     # llm-gateway: label do workspace que o usuario ja tinha criado na mao
     # (llm-exec ja vivo la antes deste script rodar) - slug "llm" (5o
     # elemento) porque foi assim que o usuario nomeou os revisores
     # pedidos (llm-rev/llm-rev-2/llm-scout, nao llm-gateway-rev). rev/rev-2
     # mais caros que o default (ver REV_OVERRIDES) e scout customizado (Sol
     # xhigh) - pedido explicito do usuario 2026-09-02.
-    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-exec", "codex", EXEC_ARGS_CODEX),
-        ("llm-scout", "codex", SCOUT_ARGS),   # 2026-10-05: padrao da tabela (era gpt-5.6-sol xhigh)
-        "llm", {"lean": True}),
+    ("llm-gateway", f"{HOME}/Devs/llm-gateway", ("llm-gateway-exec", "codex", EXEC_ARGS_CODEX),
+        ("llm-gateway-scout", "codex", SCOUT_ARGS),   # 2026-10-05: padrao da tabela (era gpt-5.6-sol xhigh)
+        "llm-gateway", {"lean": True}),
     # llm-bench: workspace e exec ja existiam na mao (pane sem nome, so
     # renomeado pra "llm-bench-exec" 2026-09-04) - label e slug batem aqui,
     # sem divergencia (diferente do llm-gateway acima). rev/rev-2/scout com
@@ -259,8 +260,8 @@ SPACES = [
     # healthcare_ai: Piloto IA-first de healthcare (Khronos); plano em
     # HEALTHCARE_IA_FIRST_PLANO_PILOTO.md
     # Registrado por herdr-add-space em 2026-09-22.
-    ("healthcare_ai", f"{HOME}/Devs/Khronos/healthcare_ai", ("healthcare-exec", "claude", EXEC_ARGS),
-        ("healthcare-scout", "codex", SCOUT_ARGS), "healthcare", {"lean": True}),
+    ("khr-healthcare", f"{HOME}/Devs/Khronos/healthcare", ("khr-healthcare-exec", "claude", EXEC_ARGS),
+        ("khr-healthcare-scout", "codex", SCOUT_ARGS), "khr-healthcare", {"lean": True}),
     # nixoFiscal: TODO por que este space existe (registrado
     # por herdr-add-space em 2026-09-25, sem --note). Uma entrada muda
     # aqui vira uma decisao que ninguem consegue reconstruir depois.
@@ -310,8 +311,12 @@ SPACES = [
     # Space ENXUTO: so o exec.
     # Registrado por herdr-add-space em 2026-10-09.
     # Renomeado de opencode-strata para strata-opencode em 2026-10-09 (Breno; pasta e workspace tambem).
-    ("strata-opencode", f"{HOME}/Devs/strata-opencode", ("strata-opencode-exec", "claude", EXEC_ARGS),
+    ("strata-opencode", f"{HOME}/Devs/strata-opencode", ("strata-opencode-exec", "opencode", ["-m", "llm-gateway/opencode-local/strata-swift-1.5-iq3_xxs"]),
         ("strata-opencode-scout", "codex", SCOUT_ARGS), "strata-opencode", {"lean": True}),
+    # cerebro: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-22.
+    ("cerebro", f"{HOME}/cerebro", ("cerebro-exec", "codex", EXEC_ARGS_CODEX),
+        ("cerebro-scout", "codex", SCOUT_ARGS), "cerebro", {"lean": True}),
 ]
 
 
@@ -388,6 +393,16 @@ def ensure_notify_watchers(workspace_ids=None):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+
+
+def split_argv(source_pane, direction, cwd):
+    """`pane split` com --cwd da tabela SPACES.
+
+    Sem --cwd o pane novo herda a pasta do pane de origem, e o exec pode rodar noutra pasta que
+    a da tabela (claude-bridge: exec em ~/.claude-bridge, tabela em ~/Devs/claude-bridge). O
+    revisor subia na pasta errada e o herdr-ask recusava com 'target cwd does not match the
+    invoking project' (relato do claude-bridge-exec, 2026-10-13)."""
+    return ["pane", "split", source_pane, "--direction", direction, "--cwd", cwd]
 
 
 def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=False):
@@ -717,7 +732,7 @@ def main():
             # para baixo a partir do ultimo, para nao virar colunas apertadas.
             direction = "right" if len(panes) == 1 else "down"
             print(f"  split ({direction}): {label} precisa de {len(tab1_agents)} panes na tab 1, tem {len(panes)}")
-            res = run("pane", "split", panes[-1], "--direction", direction)
+            res = run(*split_argv(panes[-1], direction, cwd))
             if DRY:
                 break
             panes.append(res["pane"]["pane_id"])

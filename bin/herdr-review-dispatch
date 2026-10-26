@@ -316,6 +316,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=1200, help="segundos de espera por revisor (default 1200)")
     args = ap.parse_args()
 
+    try:
+        from _herdr_coordination_warnings import emit as coordination_warning
+        coordination_warning('herdr-review-dispatch')
+    except Exception:
+        pass  # optional diagnostic must not change guard/dispatcher semantics
+
     # Achado 2026-09-01: $HERDR_ENV vazio nao e mais suficiente pra recusar
     # sozinho -- ver core.require_herdr_pane() pro porque (sandbox de exec
     # do Codex esconde env vars HERDR_*, confirmado ao vivo).
