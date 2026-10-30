@@ -783,20 +783,6 @@ def main():
         # never let a scout/board pane from another tab fill a reviewer slot.
         tab1_id = f"{ws_id}:t1"
         panes = [p["pane_id"] for p in panes_by_ws.get(ws_id, []) if p.get("tab_id") == tab1_id]
-        while len(panes) < len(tab1_agents):
-            # 1o pane extra abre a direita (wide->right); os seguintes empilham
-            # para baixo a partir do ultimo, para nao virar colunas apertadas.
-            direction = "right" if len(panes) == 1 else "down"
-            print(f"  split ({direction}): {label} precisa de {len(tab1_agents)} panes na tab 1, tem {len(panes)}")
-            res = run(*split_argv(panes[-1], direction, cwd))
-            if DRY:
-                break
-            new_panes[res["pane"]["pane_id"]] = startup.created_pane_receipt(startup_runtime(),res["pane"],cwd)
-            panes.append(res["pane"]["pane_id"])
-
-        if lean_scout:
-            scout = None        # enxuto: sem scout (nem tab propria) ate ser chamado
-        all_names = [n for (n, _, _) in tab1_agents] + ([scout[0]] if scout else [])
         # A ordem de `pane list` não representa papéis. Primeiro associe por
         # nome já observado; só panes livres podem receber um papel ausente.
         named_tab_agents = {
@@ -819,8 +805,41 @@ def main():
             print(f"  {pane_id}: revisor sem nome encontrado; restaurando '{unnamed_name}' sem reiniciar")
             if not DRY:
                 run("agent", "rename", pane_id, unnamed_name)
-                named_tab_agents[unnamed_name] = unnamed_pane
+            named_tab_agents[unnamed_name] = unnamed_pane
             assigned.add(pane_id)
+
+        # Selective recovery may omit a live sibling from tab1_agents.
+        # Count available capacity, not the number of requested role tuples.
+        tab_agents = named_tab_agents
+        missing_roles = [name for name, _kind, _extra in tab1_agents
+                         if name not in tab_agents and (not args.role or name in requested)]
+        while sum(p not in busy for p in panes) < len(missing_roles):
+            next_name = missing_roles[sum(p not in busy for p in panes)]
+            sibling_name = (next_name[:-5] + "rev-2" if next_name.endswith("rev-1")
+                            else next_name[:-5] + "rev-1" if next_name.endswith("rev-2") else None)
+            if next_name.endswith("-rev"):
+                sibling_name = next_name + "-2"
+            sibling = tab_agents.get(sibling_name)
+            # The legacy first reviewer is named <slug>-rev.
+            if sibling is None and next_name.endswith("-rev-2"):
+                sibling = tab_agents.get(next_name[:-2])
+            anchor = sibling.get("pane_id") if sibling else panes[-1]
+            direction = "down" if sibling or len(panes) > 1 else "right"
+            needed = sum(p in busy for p in panes) + len(missing_roles)
+            print(f"  split ({direction}): {label} precisa de {needed} panes na tab 1; criando capacidade para {next_name}")
+            res = run(*split_argv(anchor, direction, cwd))
+            if DRY:
+                break
+            new_id = res["pane"]["pane_id"]
+            new_panes[new_id] = startup.created_pane_receipt(startup_runtime(),res["pane"],cwd)
+            # Do not swap here: pane swap can focus the new shell. The CLI
+            # only supports down/right, so a recovered rev-1 may remain below
+            # rev-2; ordering is cosmetic and must not steal human input.
+            panes.append(new_id)
+
+        if lean_scout:
+            scout = None        # enxuto: sem scout (nem tab propria) ate ser chamado
+        all_names = [n for (n, _, _) in tab1_agents] + ([scout[0]] if scout else [])
 
         for name, kind, extra_args in tab1_agents:
             if args.role and name not in requested:
