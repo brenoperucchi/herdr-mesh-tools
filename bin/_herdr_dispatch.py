@@ -330,20 +330,20 @@ def _agent_restore_lock(slug):
             os.close(fd)
 
 
-def ensure_required_agents(slug, cwd, required_names):
+def ensure_required_agents(slug, cwd, required_names, *, selected_only=False):
     """Serializa e executa a recuperação de papéis obrigatórios ausentes."""
     group = review_groups.get_group(slug)
     if group is not None:
         try:
             binding = review_groups.resolve_binding(group, _group_runtime(), cwd)
-            review_groups.existing_members(binding, _group_runtime())
+            review_groups.existing_members(binding, _group_runtime(), names=required_names if selected_only else None)
         except RuntimeError as exc:
             raise AgentRestoreError(str(exc)) from exc
     with _agent_restore_lock(slug):
-        return _ensure_required_agents_locked(slug, cwd, required_names)
+        return _ensure_required_agents_locked(slug, cwd, required_names, selected_only=selected_only)
 
 
-def _ensure_required_agents_locked(slug, cwd, required_names):
+def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=False):
     """Garante que os papéis obrigatórios existem antes de criar uma rodada.
 
     A tabela única de ``herdr-bootstrap`` é a fonte dos perfis usados quando
@@ -390,6 +390,12 @@ def _ensure_required_agents_locked(slug, cwd, required_names):
             if name not in group.roles():
                 raise AgentRestoreError(f"papel não declarado no grupo: {name}")
             command.extend(["--role", group.roles()[name][0]])
+    elif selected_only:
+        for name in missing:
+            role = "rev-1" if name.endswith(("-rev", "-rev-1")) else "rev-2" if name.endswith("-rev-2") else None
+            if role is None:
+                raise AgentRestoreError(f"recuperação seletiva não suporta {name}")
+            command.extend(["--role", role])
     elif any(n.endswith(("-rev", "-rev-1", "-rev-2")) for n in missing):
         command.append("--with-reviewers")
     if group is None and any(n.endswith("-scout") for n in missing):
@@ -2505,7 +2511,7 @@ def reset_reviewer_context(name, timeout_s=1200):
 
 def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                                 *, expected_agents=None, check_composition=True,
-                                allow_working=False, group_binding=None):
+                                allow_working=False, group_binding=None, partial_preflight=False):
     """Manda o prompt e espera cada agent assentar (idle/done) via
     `agent prompt --wait`, um subprocesso concorrente por nome — um agent
     lento ou travado não atrasa a detecção dos outros. Ancorado na submissão,
@@ -2590,9 +2596,10 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
             require_can_send(name, expected_pane=expected.get("pane_id"))
             if group_binding is not None:
                 review_groups.revalidate(group_binding, _group_runtime())
-                current = get_agent_info(name)
-                if _dispatch_differences(expected, current, include_lifecycle=False):
-                    raise RuntimeError("identidade mudou durante herdr-can-send")
+            if expected_agents is not None:
+                _dispatch_observe(name, expected_agents[name],
+                                  check_composition=check_composition,
+                                  allow_working=allow_working)
         except RuntimeError as exc:
             raise DispatchPreflightError(name, str(exc)) from exc
         return subprocess.Popen(
@@ -2605,24 +2612,28 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
     # A função pública mantém os locks até o ciclo terminar. Revalidar e
     # apenas iniciar Popen dentro de uma seção curta deixava outro dispatcher
     # observar o mesmo idle antes de o daemon registrar a entrega.
-    if expected_agents is not None:
-        for name in prompts:
-            preflight_observed[name] = _dispatch_observe(
-                name,
-                expected_agents[name],
-                check_composition=check_composition,
-                allow_working=allow_working,
-            )
-    # Check all recipients before the first submission. Recheck per actual
-    # submission/retry above; a late refusal is a recorded partial dispatch.
+    procs, result, info, settle_ts = {}, {}, {}, {}
+    rejected = {}
+    # Review can reject one target while preserving the other. Ask/swap keep
+    # the original all-or-nothing preflight (default False).
     for name in prompts:
         try:
+            if expected_agents is not None:
+                preflight_observed[name] = _dispatch_observe(
+                    name, expected_agents[name], check_composition=check_composition,
+                    allow_working=allow_working,
+                )
             require_can_send(name, expected_pane=(expected_agents or {}).get(name, {}).get("pane_id"))
-        except RuntimeError as exc:
-            raise DispatchPreflightError(name, str(exc)) from exc
-    procs, result, info, settle_ts = {}, {}, {}, {}
+        except (RuntimeError, OSError) as exc:
+            if not isinstance(exc, DispatchPreflightError):
+                exc = DispatchPreflightError(name, str(exc))
+            if not partial_preflight:
+                raise exc
+            rejected[name] = exc
     for name, text in prompts.items():
         try:
+            if name in rejected:
+                raise rejected[name]
             procs[name] = prompt_process(name, text)
             result[name] = None
         except DispatchPreflightError as exc:
@@ -2952,7 +2963,7 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
 
 def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
                           *, expected_agents=None, check_composition=True,
-                          allow_working=False, group_binding=None):
+                          allow_working=False, group_binding=None, partial_preflight=False):
     """Run a dispatch while reserving every expected target until settlement.
 
     The reservation spans preflight, prompt submission, retries and artifact
@@ -2961,16 +2972,38 @@ def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
     turn is still settling.
     """
     expected = None if expected_agents is None else dict(expected_agents)
+    excluded = {}
     with ExitStack() as stack:
         try:
-            stack.enter_context(review_groups.dispatch_reservation(prompts, _group_runtime(), group_binding))
-            stack.enter_context(_dispatch_submission_locks(expected))
+            if partial_preflight:
+                stack.enter_context(review_groups.dispatch_reservation(
+                    prompts, _group_runtime(), group_binding, recipient_errors=excluded))
+                for name in sorted(prompts):
+                    if name in excluded:
+                        continue
+                    try:
+                        stack.enter_context(_dispatch_submission_locks(
+                            None if expected is None else {name: expected.get(name)}))
+                    except (RuntimeError, OSError) as exc:
+                        excluded[name] = str(exc)
+            else:
+                stack.enter_context(review_groups.dispatch_reservation(prompts, _group_runtime(), group_binding))
+                stack.enter_context(_dispatch_submission_locks(expected))
         except (RuntimeError, OSError) as exc:
             if isinstance(exc, DispatchPreflightError):
                 raise
             raise DispatchPreflightError(getattr(exc, "name", next(iter(prompts), "group")), str(exc)) from exc
-        return _dispatch_and_wait_all_impl(
-            prompts, timeout_s, required_artifacts, expected_agents=expected,
+        admitted = {n: text for n, text in prompts.items() if n not in excluded}
+        artifacts = None if required_artifacts is None else {
+            n: p for n, p in required_artifacts.items() if n not in excluded}
+        admitted_expected = None if expected is None else {n: p for n, p in expected.items() if n not in excluded}
+        result, info, settled = _dispatch_and_wait_all_impl(
+            admitted, timeout_s, artifacts, expected_agents=admitted_expected,
             check_composition=check_composition, allow_working=allow_working,
-            group_binding=group_binding,
+            group_binding=group_binding, partial_preflight=partial_preflight,
         )
+        for name, reason in excluded.items():
+            result[name] = "preflight_aborted"
+            info[name] = DispatchPreflightError(name, reason).as_dict()
+            settled[name] = now_iso()
+        return result, info, settled

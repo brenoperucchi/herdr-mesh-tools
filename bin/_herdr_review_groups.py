@@ -153,11 +153,11 @@ def _check_member_topology(binding, name, info):
     return info
 
 
-def existing_members(binding, core):
+def existing_members(binding, core, names=None):
     group = get_group(binding["slug"])
     members = {}
     # A declarative group never imports or rewrites legacy migration state.
-    for name in [f"{group.slug}-rev", *group.roles()]:
+    for name in [f"{group.slug}-rev", *(group.roles() if names is None else names)]:
         try:
             info = core.get_agent_info(name)
         except RuntimeError as exc:
@@ -194,7 +194,7 @@ def group_lock(group, core):
 
 
 @contextmanager
-def dispatch_reservation(prompts, core, binding=None):
+def dispatch_reservation(prompts, core, binding=None, recipient_errors=None):
     groups = {g.slug: g for name in prompts if (g := group_for_agent(name)) is not None}
     if not groups:
         yield
@@ -207,9 +207,14 @@ def dispatch_reservation(prompts, core, binding=None):
     with group_lock(group, core):
         binding = binding or resolve_binding(group, core)
         revalidate(binding, core)
-        existing_members(binding, core)
+        existing_members(binding, core, names=[] if recipient_errors is not None else None)
         for name in prompts:
-            validate_member(binding, name, core.get_agent_info(name), core)
+            try:
+                validate_member(binding, name, core.get_agent_info(name), core)
+            except RuntimeError as exc:
+                if recipient_errors is None:
+                    raise
+                recipient_errors[name] = str(exc)
         yield
 
 

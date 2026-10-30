@@ -26,6 +26,10 @@ processo do agent tendo-a de verdade). Se o check acima falhar, confirme com
 para o achado completo e o critério de quando realmente concluir que está
 fora do Herdr.
 
+A escolha de nível 1/2 e o resultado parcial pertencem a `herdr-review-dispatch`.
+Esta consulta de design mantém suas opções e seu contrato atuais; não aplica
+`--nivel`, `--justificativa`, `--revisor` ou `--gatilho`.
+
 ## Quando usar
 
 Antes de construir algo com mais de uma abordagem plausível, ou antes de

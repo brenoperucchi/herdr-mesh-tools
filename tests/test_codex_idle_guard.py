@@ -99,7 +99,7 @@ class GuardWiringTests(unittest.TestCase):
 
     def test_herdr_review_dispatch_usa_status_efetivo(self):
         src = self._fonte("herdr-review-dispatch")
-        self.assertIn("core.effective_agent_status(name)", src)
+        self.assertIn("core.effective_status(info)", src)
 
 
 if __name__ == "__main__":

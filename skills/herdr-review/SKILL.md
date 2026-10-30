@@ -1,13 +1,14 @@
 ---
 name: herdr-review
-description: "Dispara uma rodada de revisão cega e paralela pros dois revisores (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável, com terceira análise automática pelo <slug>-scout quando o exec julgar necessário após seis rodadas. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
+description: "Dispara revisão por unidade em nível 1 (um revisor, com justificativa) ou nível 2 (dois revisores cegos, padrão) (<slug>-rev-1, <slug>-rev-2) de um space do Herdr, depois de terminar uma unidade de trabalho revisável, com terceira análise automática pelo <slug>-scout quando o exec julgar necessário após seis rodadas. Use quando você mesmo (o exec) decidir que algo está pronto pra revisão, ou quando o usuário pedir explicitamente pra revisar/mandar pra revisão. Requer HERDR_ENV=1 e rodar dentro de um pane cujo agent se chama <slug>-exec."
 ---
 
 # herdr-review
 
-Sistematiza o que antes era feito na mão: pedir revisão cega e paralela pros dois
-revisores de um projeto, classificar divergência, decidir o que corrigir sozinho e
-o que escalar.
+O exec escolhe o nível por unidade. Nível 1 usa um revisor e exige justificativa.
+Nível 2 é o padrão, usa dois revisores cegos e é obrigatório nos gatilhos abaixo.
+O exec lê os pareceres, classifica divergências, decide a correção e registra o
+encaminhamento. Resultado operacional completo não aprova a mudança por si só.
 
 Antes de qualquer coisa, confirme que está num pane do Herdr:
 
@@ -46,67 +47,90 @@ for a in data['result']['agents']:
 ")
 ```
 
-## Disparar a rodada
+## Escolher o nível e disparar sem bloquear o exec
 
 ```bash
-herdr-review-dispatch "$slug" --description "o que foi feito, por que, e o que é fora de escopo"
+herdr-review-dispatch "$slug" --nivel 2 --description "unidade e escopo"
+herdr-review-dispatch "$slug" --nivel 1 --justificativa "correção textual local" --description "unidade e escopo"
 ```
 
-Isso congela o diff atual (`git diff` contra `HEAD`, incluindo untracked) em
-`.herdr/review/<slug>-<n>/`, cria uma **pasta por revisor** dentro dela
-(`<slug>-<n>/<slug>-rev-1/`, `<slug>-<n>/<slug>-rev-2/`), escreve o `request.md`
-de cada um (protocolo genérico + `.herdr/reviewer.md` do projeto, se existir, +
-sua descrição), dispara `<slug>-rev-1` e `<slug>-rev-2` em paralelo, cegos um do
-outro, e espera os dois assentarem. Exige os dois `idle` **ou** `done` antes de
-rodar — se algum estiver `working`/`blocked`, o script recusa em vez de
-enfileirar.
+`--nivel` aceita 1 ou 2; omiti-lo mantém 2. Nível 1 exige `--justificativa` não
+vazia, registrada em cada `request.md` e no `metrics.json`. Escolhe o primeiro
+revisor idle/done entre rev-1 e rev-2. `--revisor rev-1|rev-2` escolhe explicitamente.
+Se não houver revisor pronto, recupera somente um papel ausente; nunca interrompe
+um working/blocked. Não sobe o segundo revisor no nível 1.
 
-Sem repo git (script solto, por exemplo)? Use `--files <path> [<path> ...]` em
-vez de deixar o modo git tentar e falhar — revisa os arquivos listados
-diretamente do disco, sem diff. `--base <ref>` muda a base do diff (default
-`HEAD`). `--timeout <segundos>` muda o teto de espera por revisor (default
-**1200 = 20 minutos**) — o script fica em silêncio dentro desse tempo se algum
-revisor estiver `blocked` de verdade, então não estranhe demora sem output.
+Use nível 2 se houver chave/segredo/.env, dado privado (Guardian, MFC, cerebro),
+migração de dados/pasta/serviço, produção (systemd, gateway, deploy), ou
+protocolo/schema/contrato entre agents. `--gatilho <nome>` declara essa condição
+e pode ser repetido. Qualquer gatilho recusa nível 1. Na dúvida, use 2; a
+detecção por caminho não substitui a declaração do exec sobre o conteúdo.
 
-O script bloqueia até terminar e sai com **código 0 só se os dois** revisores
-produziram veredito utilizável; qualquer `BLOCKED`/`TIMEOUT`/veredito
-ausente-ou-vazio sai com 1 — não confie só no texto do stdout, cheque o exit
-code se for encadear isso em algo automático.
+Os padrões globais estão em `bin/_herdr_review_policy.py`. O projeto pode somar
+padrões em `.herdr/review-gatilhos.json`, sem remover os globais:
 
-O lifecycle do Herdr não acompanha a escrita do turno: `agent prompt --wait`
-pode devolver `done` antes de o revisor publicar `verdict.md`. O dispatcher
-trata `idle`/`done` como candidato e só assenta depois de observar um
-`verdict.md` regular, não vazio e novo (ou alterado) desde o disparo. Se o
-prazo terminar sem o artefato, registra `artifact_missing` e falha; não há
-aprovação com `verdict_bytes: 0`. O `metrics.json` é publicado por um
-temporário no mesmo diretório e `os.replace`, evitando que uma leitura
-concorrente veja JSON pela metade.
+```json
+{"version": 1, "gatilhos": {"pagamentos": ["billing/*", "src/checkout.py"]}}
+```
 
-Antes de cada entrega, inclusive aos revisores headless, execute
-`herdr-can-send <alvo>`. Só código 0 permite enviar; códigos 1–4 recusam.
-Sugestão automática não é rascunho. Não descarte composição para contornar
-uma recusa. O dispatcher não reseta revisores automaticamente.
+Os globs comparam caminho relativo, basename e caminho absoluto canônico, sem
+distinguir maiúsculas. O caminho absoluto participa em todas as categorias:
+um projeto gateway ou privado permanece nível 2 mesmo numa edição textual.
+Configuração inválida ou inventário incerto recusa nível 1; nível 2 registra a
+incerteza. O inventário inclui índice, worktree, untracked e origem de rename.
 
-Antes de criar os prompts, o dispatcher revalida sob lock curto o snapshot
-capturado de cada alvo: status, pane, workspace, cwd, sessão, revision e
-`state_change_seq`, além da ausência de diálogo. Qualquer mudança aborta sem
-enviar e fica registrada em `preflight_error`. Se `agent_prompt --wait` retornar
-`agent_prompt_stalled`, a mesma checagem ocorre antes do único retry; um alvo já
-`working`, ou cuja sequência avançou, recebe `agent wait` e não um segundo
-prompt. O reenvio só ocorre com a identidade e o estado idle/done inalterados.
+O comando congela o diff contra HEAD (ou `--base <ref>`) em
+`.herdr/review/<slug>-<n>/`, com uma pasta por revisor selecionado, request e
+verdict separados. `--files <path> [<path> ...]` congela arquivos sem exigir diff.
+No modo diff, os revisores leem também index.patch (base para índice staged) e
+worktree.patch (índice para diretório de trabalho); as camadas independentes
+preservam alterações que se cancelam no diff líquido.
+Revisores de nível 2 continuam cegos: nunca leem a pasta ou o parecer do colega.
 
-Se `rev-1` ou `rev-2` não estiver registrado, o dispatcher tenta a recuperação
-idempotente por `herdr-bootstrap --slug <slug>` antes de criar a rodada, espera
-o papel novo ficar pronto e revalida seu projeto. A tabela define modelo/kind/
-raciocínio apenas para uma inicialização sem pane-base; o dispatcher não limpa
-um pane já em uso para aplicar defaults. Uma recriação deliberada usa
-`herdr-swap`, copia o handoff e registra o perfil efetivo como evidência. Se a
-recuperação realmente falhar, o erro é controlado e a rodada não é parcialmente
-enviada.
+O dispatcher espera artefatos. Execute-o em processo separado com stdin fechado,
+log e arquivo de exit code, e devolva o controle ao usuário. Não use sleep,
+polling ou espera de revisão em primeiro plano. `--timeout <segundos>` mantém o
+teto por revisor (padrão 1200); expirar não interrompe o agent nem seu shell.
+
+## Resultado completo, parcial ou falha
+
+- Exit 0, `review_status: "completa"`: todos os revisores exigidos produziram
+  parecer utilizável. O exec ainda precisa avaliar os achados.
+- Exit 3, `review_status: "parcial"`: houve parecer utilizável, mas faltou outro.
+  Métricas registram quem faltou e o motivo. Parcial NUNCA é aprovação.
+- Exit 1, `review_status: "falha"`: nenhum parecer utilizável ou material
+  congelado alterado durante a rodada; não há cobertura válida concluída. Erro de argumentos/política pode sair com 2.
+
+No nível 2, BLOCKED, TIMEOUT, artifact_missing, ausência no registro ou recusa do
+can-send de um revisor não descartam o parecer do outro. Antes de encerrar uma
+unidade com gatilho como revisada, repita o revisor faltante ou consulte Breno.
+Use `--complementar <round_dir>` (com `--revisor rev-1|rev-2` opcional) para
+repetir só o faltante de nível 2 parcial. O complemento usa o mesmo material e
+requests congelados, confere hashes e não entrega o parecer do colega. Não
+altera o número da rodada, não reduz o nível e registra a tentativa nas métricas.
+Mudança de material, parecer anterior ou resultado ambíguo interrompido exige
+diagnóstico; não há reenvio automático. Rodadas antigas sem hashes não podem
+ser complementadas: refaça o nível 2 ou consulte Breno.
+Uma nova rodada nível 1 não completa automaticamente uma rodada nível 2 parcial.
+`--verify` continua uma checagem fechada de achados anteriores; suas métricas
+marcam `coverage_scope: "verification_only"`, sem convertê-la em revisão nova
+de nível 2 ou aprovação de uma unidade parcial.
+
+`idle`/`done` só é candidato: precisa de `verdict.md` regular, não vazio e novo
+ou alterado desde o disparo. Sem artefato no prazo, `artifact_missing`. As
+métricas são publicadas atomicamente. `approval: false` distingue cobertura da
+decisão do exec sobre o conteúdo dos pareceres.
+
+Antes de cada entrega, inclusive a headless, herdr-can-send precisa retornar 0;
+códigos 1 a 4 recusam, sem limpar composição. Cada alvo conserva sua validação
+sob lock e snapshot de identidade/status/sequência. Um alvo recusado não recebe
+prompt; os outros podem seguir. Retry só com identidade e estado idle/done
+inalterados. Alvo working ou sequência avançada recebe espera do dispatcher,
+sem segundo prompt. Não há reset implícito; recriação deliberada usa herdr-swap.
 
 ## Ler e classificar
 
-Leia os dois `verdict.md` que o comando apontou — cada um dentro da pasta do
+Leia os `verdict.md` disponíveis dos revisores selecionados que o comando apontou — cada um dentro da pasta do
 seu próprio revisor (`<round_dir>/<slug>-rev-1/verdict.md`,
 `<round_dir>/<slug>-rev-2/verdict.md`). Não use `agent read` nos panes dos
 revisores pra isso — é scrape de tela, lossy; os arquivos são a fonte de
@@ -117,7 +141,7 @@ O contrato canônico dos campos de encaminhamento fica em
 request de cada rodada. Use esse contrato literalmente para que um achado não
 seja entregue sem solução/validação ou uma declaração explícita de lacuna.
 
-Monte uma tabela por achado, em três classes:
+No nível 1, os achados têm uma única lente. No nível 2, monte uma tabela por achado, em três classes:
 
 | Classe | Quando | Quem trata |
 |---|---|---|

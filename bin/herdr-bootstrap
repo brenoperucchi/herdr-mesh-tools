@@ -521,7 +521,18 @@ def bootstrap_review_group(group, args):
     from contextlib import nullcontext
     with (nullcontext() if DRY else review_groups.group_lock(group, core)):
         review_groups.revalidate(binding, core)
-        members = review_groups.existing_members(binding, core)
+        selective = bool(args.role) and not args.with_reviewers and not args.with_scout
+        members = review_groups.existing_members(binding, core, names=names if selective else None)
+        if selective:
+            # Healthy siblings may anchor layout. An invalid, unrequested
+            # sibling is never an authority or source for a split.
+            for other in group.roles():
+                if other in names:
+                    continue
+                try:
+                    members[other] = review_groups.validate_member(binding, other, core.get_agent_info(other), core)
+                except RuntimeError:
+                    continue
         owner = binding["coordinator"]
         print(f"grupo {group.slug}: coordenador {group.coordinator_name}, "
               f"tab {owner['tab_id']}, raiz {binding['root']}")
@@ -620,7 +631,7 @@ def main():
                     help="sobe tambem o SCOUT dos spaces enxutos nesta execucao (so quando "
                          "alguem o requisitou: `--with-reviewers` nao o liga)")
     ap.add_argument("--role", action="append", default=[], choices=["rev-1", "rev-2", "scout"],
-                    help="cria somente este papel de um grupo (repetível)")
+                    help="cria somente este revisor (--slug) ou papel de grupo (repetível)")
     ap.add_argument("--hydrate-initial", choices=["rev-1", "rev-2", "scout"],
                     help="somente o primeiro turno de um Codex existente sem sessão")
     ap.add_argument("--pane", help="pane explicitamente autorizado para --hydrate-initial")
@@ -652,8 +663,10 @@ def main():
             print(f"erro: {exc}", file=sys.stderr)
             return 1
 
-    if args.role:
-        ap.error("--role exige um grupo registrado")
+    if args.role and (not args.slug or args.with_reviewers or args.with_scout):
+        ap.error("--role exige --slug e não combina com --with-reviewers/--with-scout")
+    if "scout" in args.role:
+        ap.error("--role scout exige um grupo registrado")
 
     workspaces = {w["label"]: w for w in api("workspace", "list")["workspaces"]}
     panes_by_ws = {}
@@ -715,6 +728,15 @@ def main():
         tab1_agents = ([exec_agent] if exec_agent else []) + (
             [] if lean else build_rev_agents(slug, migration_cwd))
 
+        if args.role:
+            # Selective recovery never starts a sibling, scout or exec.
+            reviewer_entries = build_rev_agents(slug, migration_cwd)
+            requested = {name for name, _kind, _extra in reviewer_entries
+                         if ("rev-1" in args.role and name.endswith(("-rev", "-rev-1")))
+                         or ("rev-2" in args.role and name.endswith("-rev-2"))}
+            tab1_agents = ([exec_agent] if exec_agent else []) + [
+                entry for entry in reviewer_entries if entry[0] in requested]
+            lean_scout = True
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")
             res = run("workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")
@@ -770,6 +792,10 @@ def main():
             assigned.add(pane_id)
 
         for name, kind, extra_args in tab1_agents:
+            if args.role and name not in requested:
+                if name in named_tab_agents:
+                    assigned.add(named_tab_agents[name].get("pane_id"))
+                continue
             existing = named_tab_agents.get(name)
             if existing is not None:
                 assigned.add(existing.get("pane_id"))

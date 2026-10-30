@@ -133,7 +133,7 @@ class DispatchPreflightTests(unittest.TestCase):
         def popen_from_iterator(_args, **_kwargs):
             return next(processes)
 
-        with mock.patch.object(self.core, "get_agent_info", side_effect=[baseline, working]), \
+        with mock.patch.object(self.core, "get_agent_info", side_effect=[baseline, baseline, working]), \
              mock.patch.object(self.core, "pane_looks_busy_with_human_input", return_value=(False, None)), \
              mock.patch.object(
                  self.core.subprocess,
@@ -163,7 +163,7 @@ class DispatchPreflightTests(unittest.TestCase):
         second = self._settled_proc("idle")
         processes = iter((first, second))
 
-        with mock.patch.object(self.core, "get_agent_info", side_effect=[baseline, baseline]), \
+        with mock.patch.object(self.core, "get_agent_info", side_effect=[baseline, baseline, baseline, baseline]), \
              mock.patch.object(self.core, "pane_looks_busy_with_human_input", return_value=(False, None)), \
              mock.patch.object(
                  self.core.subprocess,
@@ -187,3 +187,75 @@ class DispatchPreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartialReviewPreflightTests(DispatchPreflightTests):
+    def test_review_can_send_refusal_keeps_other_recipient_and_never_prompts_refused(self):
+        expected = {'a': _agent_info(), 'b': _agent_info(pane='w:p2')}
+        def guard(name, **kwargs):
+            if name == 'b': raise RuntimeError('herdr-can-send 3: working')
+        with mock.patch.object(self.core, 'require_can_send', side_effect=guard), \
+             mock.patch.object(self.core, 'get_agent_info', side_effect=lambda n: expected[n]), \
+             mock.patch.object(self.core, 'pane_looks_busy_with_human_input', return_value=(False, None)), \
+             mock.patch.object(self.core.subprocess, 'Popen', return_value=self._settled_proc()) as popen, \
+             mock.patch.object(self.core.time, 'sleep'):
+            result, info, _ = self.core.dispatch_and_wait_all(
+                {'a': 'request', 'b': 'request'}, 30,
+                expected_agents=expected, partial_preflight=True)
+        self.assertEqual(result, {'a': 'idle', 'b': 'preflight_aborted'})
+        self.assertIn('working', info['b']['reason'])
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(popen.call_args.args[0][3], 'a')
+
+    def test_review_identity_change_isolated_without_rebaselining_or_prompt(self):
+        expected = {'a': _agent_info(), 'b': _agent_info(pane='w:p2')}
+        observed = {'a': expected['a'], 'b': _agent_info(pane='w:replacement', session='new')}
+        with mock.patch.object(self.core, 'get_agent_info', side_effect=lambda n: observed[n]), \
+             mock.patch.object(self.core, 'pane_looks_busy_with_human_input', return_value=(False, None)), \
+             mock.patch.object(self.core.subprocess, 'Popen', return_value=self._settled_proc()) as popen, \
+             mock.patch.object(self.core.time, 'sleep'):
+            result, info, _ = self.core.dispatch_and_wait_all(
+                {'a': 'request', 'b': 'request'}, 30,
+                expected_agents=expected, partial_preflight=True)
+        self.assertEqual(result['b'], 'preflight_aborted')
+        self.assertIn('pane_id', info['b']['reason'])
+        self.assertEqual(popen.call_count, 1)
+
+    def test_review_busy_submission_lock_does_not_discard_other_recipient(self):
+        from contextlib import contextmanager
+        expected = {'a': _agent_info(), 'b': _agent_info(pane='w:p2')}
+        @contextmanager
+        def lock(agents):
+            if 'b' in agents: raise self.core.DispatchLockBusyError('b', 'reserved')
+            yield
+        with mock.patch.object(self.core, '_dispatch_submission_locks', side_effect=lock), \
+             mock.patch.object(self.core, 'get_agent_info', side_effect=lambda n: expected[n]), \
+             mock.patch.object(self.core, 'pane_looks_busy_with_human_input', return_value=(False, None)), \
+             mock.patch.object(self.core.subprocess, 'Popen', return_value=self._settled_proc()) as popen, \
+             mock.patch.object(self.core.time, 'sleep'):
+            result, info, _ = self.core.dispatch_and_wait_all(
+                {'a': 'request', 'b': 'request'}, 30,
+                expected_agents=expected, partial_preflight=True)
+        self.assertEqual(result, {'a': 'idle', 'b': 'preflight_aborted'})
+        self.assertIn('reserved', info['b']['reason'])
+        self.assertEqual(popen.call_count, 1)
+
+    def test_legacy_recipient_changed_during_guard_is_not_prompted(self):
+        expected = {'a': _agent_info(), 'b': _agent_info(pane='w:p2')}
+        observed = dict(expected)
+        counts = {'a': 0}
+        def guard(name, **kwargs):
+            if name == 'a':
+                counts[name] += 1
+                if counts[name] == 2:
+                    observed['a'] = _agent_info(session='replacement')
+        with mock.patch.object(self.core, 'require_can_send', side_effect=guard), \
+             mock.patch.object(self.core, 'get_agent_info', side_effect=lambda n: observed[n]), \
+             mock.patch.object(self.core, 'pane_looks_busy_with_human_input', return_value=(False, None)), \
+             mock.patch.object(self.core.subprocess, 'Popen', return_value=self._settled_proc()) as popen, \
+             mock.patch.object(self.core.time, 'sleep'):
+            result, info, _ = self.core.dispatch_and_wait_all(
+                {'a': 'request', 'b': 'request'}, 30, expected_agents=expected, partial_preflight=True)
+        self.assertEqual(result, {'a': 'preflight_aborted', 'b': 'idle'})
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(popen.call_args.args[0][3], 'b')
