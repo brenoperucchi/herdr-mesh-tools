@@ -97,7 +97,9 @@ class BootstrapKindArgsTests(unittest.TestCase):
                 prompts.append(args[2:])
             return {}
 
-        with mock.patch.object(boot, "run", side_effect=fake_run):
+        with mock.patch.object(boot, "run", side_effect=fake_run), \
+             mock.patch.object(boot.startup, "finish_start", return_value=False), \
+             mock.patch.object(boot.trust, "ensure_trusted", return_value={"status":"already_trusted"}):
             boot.start_agent_with_role(
                 "wX:p1", "herdr-sim-rev-2", "claude", [],
                 "herdr-sim", "/home/brenoperucchi/Devs/herdr-simulation", [],

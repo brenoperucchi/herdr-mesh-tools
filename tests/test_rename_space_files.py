@@ -261,3 +261,16 @@ class SpacesBlocoTests(unittest.TestCase):
         a = types.SimpleNamespace(de="cic", label="cic", slug="cic")
         r = mod.edita_spaces(a, {"slug_velho": "cic"}, "/home/u/Devs/CIC", True, os.path.join(self.tmp.name, "b"))
         self.assertIn('("cic", f"{HOME}/Devs/CIC", ("cic-exec"', open(mod.BOOTSTRAP).read())
+
+
+class ClaudeTrustMergeRegressionTests(Base):
+    def test_absorbed_true_is_never_overwritten_by_false_at_destination(self):
+        path = self.escreve('.claude.json', json.dumps({'other': {'keep': 1}, 'projects': {
+            self.velho: {'hasTrustDialogAccepted': True, 'source': 7},
+            self.novo: {'hasTrustDialogAccepted': False, 'destination': 8}}}))
+        rn.migra_claude_json(self.home,self.mapa,{self.velho},self.bkp,True)
+        data=json.loads(open(path).read())
+        self.assertIs(data['projects'][self.novo]['hasTrustDialogAccepted'],True)
+        self.assertEqual(data['projects'][self.novo]['source'],7)
+        self.assertEqual(data['projects'][self.novo]['destination'],8)
+        self.assertEqual(data['other'],{'keep':1})

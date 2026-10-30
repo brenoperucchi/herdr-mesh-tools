@@ -247,7 +247,11 @@ def migra_claude_json(home, mapa, apagar_antigas, pasta_backup, aplicar):
             continue
         rel["chaves"].append((chave, novo))
         if novo in proj:
-            proj[novo] = {**proj[chave], **proj[novo]}   # o que ja existe no destino vence
+            source_trusted = proj[chave].get("hasTrustDialogAccepted") is True
+            target_trusted = proj[novo].get("hasTrustDialogAccepted") is True
+            proj[novo] = {**proj[chave], **proj[novo]}   # demais chaves do destino vencem
+            if source_trusted or target_trusted:
+                proj[novo]["hasTrustDialogAccepted"] = True
         else:
             proj[novo] = proj[chave] if chave in apagar_antigas else json.loads(json.dumps(proj[chave]))
         if chave in apagar_antigas:

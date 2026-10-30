@@ -49,6 +49,8 @@ _DEFAULT_BOOTSTRAP = os.path.join(
 BOOTSTRAP = os.environ.get("HERDR_BOOTSTRAP_PATH") or _DEFAULT_BOOTSTRAP
 BOOTSTRAP = os.path.realpath(os.path.expanduser(BOOTSTRAP))
 HOME = os.path.expanduser("~")
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _herdr_trust as trust
 
 
 def die(msg):
@@ -603,6 +605,8 @@ def main():
         fh.write(new_source)
     print(f"herdr-add-space: {BOOTSTRAP} atualizado (nao commitado)\n", flush=True)
 
+    # Registration precedes authorization: trust only the now-declared cwd.
+    trust.ensure_trusted(cwd, args.exec_kind)
     rc = subprocess.run([sys.executable, BOOTSTRAP]).returncode
     if rc != 0:
         die(f"herdr-bootstrap saiu com {rc} — a entrada ficou no arquivo, "

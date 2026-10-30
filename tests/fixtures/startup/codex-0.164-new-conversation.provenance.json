@@ -1,0 +1,7 @@
+{
+  "captured_at": "2026-10-26T04:04:16Z",
+  "codex_version_reported": "0.164",
+  "supplied_by": "herdr-exec",
+  "source_command": "herdr pane read w9:p4X --lines 25",
+  "note": "Text excerpt from a real pane-read result, not a live detection capture by mesh-tools-exec. Runtime uses agent read --source detection --format text."
+}

@@ -19,6 +19,9 @@ import _herdr_dispatch as core
 import _herdr_migration as migration
 import _herdr_review_groups as review_groups
 import _herdr_initial_hydration as initial_hydration
+import _herdr_trust as trust
+import _herdr_startup as startup
+from types import SimpleNamespace
 
 HERDR = core.HERDR  # compatibilidade para consumidores que importam o módulo
 HOME = os.path.expanduser("~")
@@ -409,7 +412,11 @@ def split_argv(source_pane, direction, cwd):
     return ["pane", "split", source_pane, "--direction", direction, "--cwd", cwd]
 
 
-def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=False):
+def startup_runtime():
+    return SimpleNamespace(api=api, get_agent_info=core.get_agent_info, herdr_argv=core.herdr_argv)
+
+
+def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=False, new_pane=None):
     """Sobe (name, kind) no pane_id e, se subir de verdade, manda o reforço de
     papel — usado tanto pro loop de split da tab 1 quanto pra tab do scout,
     pra não duplicar a mesma lógica dos dois lugares. Os argumentos de model e
@@ -425,6 +432,9 @@ def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, 
         full_extra = core.codex_launch_flags(full_extra)
     print(f"  {pane_id}: iniciando {kind} como '{name}'" + (f" ({' '.join(full_extra)})" if full_extra else ""))
     started_ok = False
+    not_ready = False
+    if not DRY:
+        trust.ensure_trusted(cwd, kind)
     try:
         args = ["agent", "start", name, "--kind", kind, "--pane", pane_id]
         if full_extra:
@@ -432,13 +442,19 @@ def start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, 
         run(*args)
         started_ok = True
     except RuntimeError as exc:
-        # agent_not_ready = subiu mas parou num prompt (ex: trust do diretorio).
-        # Nao e falha: segue, mas nao manda reforco de papel - o agent nao
-        # esta pronto pra receber prompt ainda.
         if "agent_not_ready" in str(exc):
-            print(f"  {pane_id}: {name} subiu mas aguarda input humano")
+            not_ready = True
         else:
             raise
+    if not DRY:
+        if new_pane is not None:
+            print(f"  {pane_id}: idade do recibo de subida: {startup.time.monotonic() - new_pane.created_at:.1f}s")
+        confirmed = startup.finish_start(startup_runtime(),new_pane,pane=pane_id,name=name,kind=kind)
+        if confirmed:
+            core._wait_restored_agent(name, startup_confirmed=True)
+        elif not_ready:
+            core._wait_restored_agent(name)
+        started_ok = True
 
     if started_ok:
         prompt = core.role_reinforcement_prompt(name, slug, cwd, siblings, lean=lean)
@@ -570,6 +586,7 @@ def bootstrap_review_group(group, args):
                     members[name] = {"pane_id": f"<novo-pane-{name}>"}
                     continue
                 pane = created["pane"]["pane_id"]
+                new_pane = startup.created_pane_receipt(startup_runtime(), created["pane"], binding["root"])
                 # Do not close a possibly occupied pane on failure. Report the
                 # returned ID so an operator can inspect this partial creation.
                 try:
@@ -578,8 +595,17 @@ def bootstrap_review_group(group, args):
                                                      for f in ("tab_id", "workspace_id")):
                         raise RuntimeError("split não pertence ao vínculo esperado")
                     review_groups.revalidate(binding, core)
-                    run("agent", "start", name, "--kind", kind, "--pane", pane, "--", *extra)
-                    core._wait_restored_agent(name)
+                    trust.ensure_trusted(binding["root"], kind)
+                    try:
+                        run("agent", "start", name, "--kind", kind, "--pane", pane, "--", *extra)
+                    except RuntimeError as exc:
+                        if "agent_not_ready" not in str(exc):
+                            raise
+                    confirmed = startup.finish_start(startup_runtime(),new_pane,pane=pane,name=name,kind=kind)
+                    if confirmed:
+                        core._wait_restored_agent(name, startup_confirmed=True)
+                    else:
+                        core._wait_restored_agent(name)
                     current = core.get_agent_info(name)
                     first_turn = kind == "codex" and current.get("agent_session") is None
                     if first_turn:
@@ -677,7 +703,9 @@ def main():
     existing_agent_names = {a.get("name") for a in agents if a.get("name")}
 
     matched_target = args.space is None and args.slug is None
+    startup_failures = []
     processed_workspace_ids = set()
+    new_panes = {}
     for entry in SPACES:
         label, cwd, exec_agent, scout = entry[:4]
         # 5o elemento opcional: slug explicito, quando o label do workspace
@@ -743,6 +771,8 @@ def main():
             if DRY:
                 continue
             ws_id = res["workspace"]["workspace_id"]
+            root_pane = res["root_pane"]
+            new_panes[root_pane["pane_id"]] = startup.created_pane_receipt(startup_runtime(),root_pane,cwd)
             panes_by_ws[ws_id] = [{"pane_id": res["root_pane"]["pane_id"], "tab_id": f"{ws_id}:t1"}]
         else:
             ws_id = ws["workspace_id"]
@@ -761,6 +791,7 @@ def main():
             res = run(*split_argv(panes[-1], direction, cwd))
             if DRY:
                 break
+            new_panes[res["pane"]["pane_id"]] = startup.created_pane_receipt(startup_runtime(),res["pane"],cwd)
             panes.append(res["pane"]["pane_id"])
 
         if lean_scout:
@@ -811,7 +842,16 @@ def main():
                       file=sys.stderr)
                 continue
             siblings = [n for n in all_names if n != name]
-            start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=lean)
+            # Reserve even a failed start: a blocked process is not a free pane.
+            assigned.add(pane_id)
+            busy.add(pane_id)
+            try:
+                start_agent_with_role(pane_id, name, kind, extra_args, slug, cwd, siblings, lean=lean,
+                                      new_pane=new_panes.get(pane_id))
+            except (startup.StartupDialogRefused, core.AgentRestoreError) as exc:
+                startup_failures.append((name, pane_id))
+                print(f"  {name}: {exc}", file=sys.stderr)
+                continue
             assigned.add(pane_id)
             busy.add(pane_id)
             named_tab_agents[name] = {"pane_id": pane_id}
@@ -836,7 +876,14 @@ def main():
                     if not DRY:
                         scout_pane_id = res["root_pane"]["pane_id"]
                         siblings = [n for n in all_names if n != scout_name]
-                        start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, slug, cwd, siblings)
+                        new_pane = startup.created_pane_receipt(startup_runtime(),res["root_pane"],cwd)
+                        busy.add(scout_pane_id)
+                        try:
+                            start_agent_with_role(scout_pane_id, scout_name, scout_kind, scout_extra, slug, cwd, siblings,
+                                                  new_pane=new_pane)
+                        except (startup.StartupDialogRefused, core.AgentRestoreError) as exc:
+                            startup_failures.append((scout_name, scout_pane_id))
+                            print(f"  {scout_name}: {exc}", file=sys.stderr)
 
     if not matched_target:
         alvo_texto = args.space or args.slug
@@ -844,8 +891,16 @@ def main():
         return 1
 
     ensure_notify_watchers(processed_workspace_ids if not (args.space is None and args.slug is None) else None)
+    if startup_failures:
+        print("herdr-bootstrap: agents parados: " + ", ".join(
+            f"{name} ({pane})" for name, pane in startup_failures), file=sys.stderr)
+        return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError) as exc:
+        print(f"herdr-bootstrap: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Audit SPACES trust without writes; --apply only changes registered paths."""
+import argparse
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _herdr_trust as trust
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--apply', action='store_true', help='aplica confiança somente a SPACES; requer aval do owner')
+    args = parser.parse_args()
+    try:
+        store = trust.TrustStore()
+        report = store.audit()
+        if args.apply:
+            report['applied'] = [trust.ensure_trusted(e['directory'], e['kind'], store=store)
+                                 for e in report['entries'] if e['status'] == 'missing']
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if (report['warnings'] or any(e['status'] in ('warning', 'refused') for e in report.get('applied', []))
+                     or (args.apply and any(e['status'] == 'refused' for e in report['entries']))) else 0
+    except (OSError, ValueError, trust.TrustError) as exc:
+        print(f'herdr-trust-sync: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -226,3 +226,15 @@ do coordenador vivo; a raiz de `cwd` e `foreground_cwd` deve coincidir.
 Para fechar o par após o resultado: `herdr-release guardian2 --only reviewers`.
 O grupo recusa liberação de agent ocupado, vínculo divergente ou rodada
 incompleta mesmo com `--force`. Bia não tem grupo registrado nesta entrega.
+
+
+## Confiança durante recuperação de papéis
+
+A recuperação por bootstrap prepara a confiança somente para cwd autorizado em
+SPACES, antes da subida. Isso não dá permissão para responder a diálogos de um
+consultor já existente. Claude em diálogo de confiança é recusado com pane e
+texto, sem tecla. A confirmação da opção 1 do Codex pertence apenas ao recibo
+efêmero de pane físico recém-criado na própria subida, com seleção e identidade
+validadas; ela não altera o herdr-can-send nem autoriza reset, descarte de
+composição ou allow-working. Não use --apply do trust-sync como diagnóstico:
+a aplicação real fica com o coordenador depois do aval do Breno.

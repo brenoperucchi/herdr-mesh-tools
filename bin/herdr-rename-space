@@ -40,6 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _herdr_dispatch as core  # noqa: E402
 import _herdr_probe_cache as probe_cache  # noqa: E402
 import _herdr_rename as rn  # noqa: E402
+import _herdr_trust as trust
+import _herdr_startup as startup
 
 HOME = os.path.realpath(os.environ.get("HERDR_RENAME_HOME") or os.path.expanduser("~"))
 STATE_DIR = os.environ.get("HERDR_MESH_STATE_DIR") or os.path.join(HOME, ".local", "state", "herdr-mesh")
@@ -235,23 +237,39 @@ def religar(a, f, rs, novo_dir):
     saida = []
     for ag in f["agentes"]:
         pane, nome = ag["pane"], ag["novo_nome"]
+        trust.ensure_trusted(novo_dir, ag["kind"])
         subprocess.run(core.herdr_argv("pane", "run", pane, f"cd {shell_quote(novo_dir)}"),
                        capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
         time.sleep(1.0)
         args = ["agent", "start", nome, "--kind", ag["kind"], "--pane", pane, "--timeout", "90000", "--",
                 *rs.start_args(ag["kind"], ag["sessao"], ag["model"], ag["effort"], ag["argv"])]
-        ultimo, ok = "", False
+        ultimo, ok, not_ready = "", False, False
         for _ in range(6):
             r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)
             ultimo = (r.stderr or r.stdout).strip()
             if r.returncode == 0:
                 ok = True
                 break
+            if "agent_not_ready" in ultimo:
+                not_ready = True
+                break
             time.sleep(2.5)
-        extra = rs.tratar_dialogos(pane, ag["kind"]) if ok else []
-        trust = ok and ag["kind"] == "claude" and "Yes, I trust this folder" in rs.tela(pane)
-        saida.append({"nome": nome, "pane": pane, "ok": ok, "erro": None if ok else ultimo[:160],
-                      "dialogos": extra, "trust": trust})
+        extra = []  # Existing panes never acquire automatic dialog-key permission.
+        refused_dialog = False
+        if ok or not_ready:
+            try:
+                # Rename resumes in an EXISTING pane: it never gets a fresh
+                # pane capability and cannot confirm the worktree chooser.
+                startup.finish_start(core, None, pane=pane, name=nome, kind=ag["kind"])
+                if not_ready:
+                    core._wait_restored_agent(nome)
+                    ok = True
+            except (RuntimeError, OSError) as exc:
+                ultimo, ok, refused_dialog = str(exc), False, True
+        trust_waiting = ag["kind"] == "claude" and "confiança Claude" in ultimo
+        saida.append({"nome": nome, "pane": pane, "ok": ok,
+                      "erro": None if ok else (ultimo if refused_dialog else ultimo[:160]),
+                      "dialogos": extra, "trust": trust_waiting})
     return saida
 
 

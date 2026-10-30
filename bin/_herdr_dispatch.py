@@ -266,7 +266,7 @@ def _is_agent_not_found(exc):
     return "agent_not_found" in str(exc).casefold()
 
 
-def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S):
+def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S, *, startup_confirmed=False):
     """Espera um agent criado pelo bootstrap chegar a um estado assentado.
 
     ``herdr agent start`` pode retornar enquanto o reforço de papel ainda está
@@ -275,6 +275,7 @@ def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S):
     uma falha real e continua sendo tratado como tal.
     """
     deadline = time.monotonic() + timeout_s
+    startup_grace = time.monotonic() + 3 if startup_confirmed else 0
     last = None
     while True:
         try:
@@ -296,9 +297,12 @@ def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S):
         if status in ("idle", "done"):
             return info
         if status == "blocked":
-            raise AgentRestoreError(
-                f"agent '{name}' foi restaurado, mas ficou blocked; confira o diálogo antes de continuar"
-            )
+            if startup_confirmed and time.monotonic() < startup_grace:
+                time.sleep(0.1)
+                continue
+            import _herdr_startup as startup
+            raise AgentRestoreError(f"agent '{name}' foi restaurado, mas ficou blocked; "
+                                    + startup.blocked_diagnostic(_group_runtime(), info))
         if time.monotonic() >= deadline:
             raise AgentRestoreError(
                 f"agent '{name}' não chegou a idle/done em {timeout_s}s após a recuperação "
@@ -364,6 +368,9 @@ def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=F
     for name in names:
         try:
             observed[name] = get_agent_info(name)
+            if observed[name].get("agent") == "claude" and observed[name].get("agent_status") == "blocked":
+                import _herdr_startup as startup
+                raise AgentRestoreError(startup.blocked_diagnostic(_group_runtime(), observed[name]))
         except RuntimeError as exc:
             if _is_agent_not_found(exc):
                 missing.append(name)
@@ -381,6 +388,8 @@ def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=F
         return result
 
     bootstrap = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
+    # Bootstrap performs trust preflight and inspects only its own new-pane
+    # startup receipts; review/ask recovery must not synthesize such receipts.
     command = [sys.executable, bootstrap, "--slug", slug]
     # Sobe so o que falta: spaces enxutos (`lean`) ignoram o papel que nao for ligado
     # explicitamente, e o scout NAO deve subir quando so um revisor foi requisitado.

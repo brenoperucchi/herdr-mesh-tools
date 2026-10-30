@@ -403,3 +403,65 @@ exige preservar o texto e informar a pendência, sem espera bloqueante. Depois d
 O aviso de alvo OpenCode depende de o comando bloqueante aparecer em `foreground_processes`.
 Sua eficácia contra um tool ativo do OpenCode ainda não foi validada. Ele não percorre todos
 os descendentes nem observa toda a shell; ausência do aviso não demonstra ausência de bloqueio.
+
+
+## Confiança e diálogos na subida
+
+Antes de iniciar exec, revisor ou scout, o bootstrap tenta registrar a confiança
+no cwd que será usado. O helper só escreve para um realpath declarado na tabela
+SPACES. HOME, raiz, temporários fora da HOME de teste e scratchpads são recusados,
+inclusive quando um alias aponta para uma pasta de nome neutro. Um override de
+cwd por ambiente não concede autorização para confiar numa pasta nova.
+
+No Codex, confiança já registrada para o diretório ou sua raiz Git evita outra
+escrita. Um trust_level = "untrusted" explícito é preservado e aparece separado
+na auditoria. No Claude, a atualização altera somente
+hasTrustDialogAccepted, preservando as outras chaves e uma confiança verdadeira
+na absorção de dados do rename. Formas de configuração não reconhecidas ou uma
+corrida que persista após duas tentativas produzem aviso; não force a escrita.
+O lock coordena os helpers do mesh. Ele não bloqueia o escritor do Claude nem
+garante isolamento contra outro processo do mesmo UID.
+
+Para auditar sem escrever, execute:
+/home/brenoperucchi/Devs/herdr-mesh-tools/bin/herdr-trust-sync.
+O relatório separa faltantes, negativas explícitas, recusas e entradas fora da
+tabela. O comando não apaga entradas antigas. --apply fica com o coordenador
+depois do aval do Breno; não o execute como passo automático de diagnóstico.
+A presença de recusas pode produzir exit 1 mesmo com as demais aplicações
+concluídas: leia o relatório. Backups e locks próprios ficam no estado privado
+/home/brenoperucchi/.local/state/herdr-trust; há um backup por arquivo/processo,
+com retenção dos dez mais recentes do helper. Origem Git fora dos repositórios
+confirmados do Breno gera aviso sobre configuração, hooks e MCP do projeto.
+
+A única confirmação automática de UI é a opção 1 do Codex, no diálogo
+"Where should the new conversation run?", com "Use current Git worktree"
+destacada. O código exige recibo efêmero do pane físico que aquela subida acabou
+de criar, identidade estável, leitura detection, destaque único e prazo válido.
+O recibo permite uma tentativa de Enter lógico e é consumido antes do envio.
+Não o recrie a partir de um pane existente, de um nome restaurado ou de uma
+mensagem do agent. Uma falha ambígua não autoriza outra tecla.
+
+O diálogo pode aparecer como rascunho para can-send (código 1). Essa exceção
+restrita da subida não modifica os códigos 0 a 4 nem permite mandar prompts
+sobre rascunho ou diálogo. Depois de resolver a UI, a hidratação e cada entrega
+voltam à guarda normal. O mesh não envia /new para provocar esse diálogo nem
+o resolve em um pane antigo. O caso capturado em 26/10 veio de um /new do
+conector Paperclip; a subida pura isolada de Codex 0.165 não mostrou o menu.
+
+Na restauração de vários spaces, um agent em diálogo fica reservado e sem
+hidratação; os demais agents continuam. O bootstrap termina com código 1 e
+lista os agents parados. O log mostra a idade do recibo no momento da subida.
+Retomadas do rename também não chamam o tratador legado de teclas Codex.
+Os diagnósticos compartilhados nas métricas omitem histórico de outras tarefas
+e limitam o trecho de diálogo.
+
+O diálogo de confiança do Claude nunca recebe tecla automática, mesmo que a
+configuração já tenha sido preparada. A opção destacada pode ser "No, exit".
+A subida e o dispatcher recusam com pane e texto para diagnóstico. Não envie
+/exit, ctrl+c ou ctrl+d como texto, não descarte composição e não use
+allow-working para contornar essa recusa.
+
+Ao medir a versão de um CLI, confira antes se o executável é um wrapper que
+instala ou atualiza ferramentas. Testes de configuração e subida usam HOME e
+arquivos temporários. Não copie credenciais reais para o teste nem use os
+arquivos reais de configuração para executar testes automatizados.

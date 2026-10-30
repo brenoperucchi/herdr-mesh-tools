@@ -104,6 +104,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core,'pane_looks_busy_with_human_input',lambda *a,**kw:(False,None))
     monkeypatch.setattr(core,'require_can_send',lambda *a,**kw:None)
     boot=load('herdr-bootstrap')
+    monkeypatch.setattr(boot.startup,'finish_start',lambda *a,**kw:False)
+    monkeypatch.setattr(boot.trust,'ensure_trusted',lambda *a,**kw:{'status':'already_trusted'})
     monkeypatch.setattr(boot,'api',fake.api)
     monkeypatch.setattr(boot,'SPACES',[])
     monkeypatch.setattr(boot,'DRY',False)
@@ -662,3 +664,78 @@ def test_initial_stall_observes_without_resubmitting(env,initial,monkeypatch,nat
     assert receipt['state']==('complete' if native_after_stall else 'ambiguous')
     assert receipt['delivery_error']=='agent_prompt_stalled'
     assert len(fake.calls)==1
+
+
+def test_review_partial_group_missing_session_does_not_block_other(env, monkeypatch):
+    root, group, fake, boot, args = env
+    boot.bootstrap_review_group(group, args)
+    fake.agents['sample-rev-2']['agent_session'] = None
+    review = load('herdr-review-dispatch')
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(core, 'require_herdr_pane', lambda: None)
+    monkeypatch.setattr(review, 'runtime_profile_evidence', lambda *a, **kw: {})
+    def dispatch(prompts, timeout, required_artifacts, **kwargs):
+        fake.artifacts = required_artifacts
+        with mock.patch.object(core.subprocess, 'Popen', fake.popen):
+            return core.dispatch_and_wait_all(prompts, timeout, required_artifacts, **kwargs)
+    monkeypatch.setattr(review, 'dispatch_and_wait_all', dispatch)
+    file = root / 'readme.txt'; file.write_text('fixture')
+    monkeypatch.setattr(sys, 'argv', ['herdr-review-dispatch', 'sample', '--description', 'fixture',
+                                    '--files', str(file)])
+    with pytest.raises(SystemExit) as result: review.main()
+    assert result.value.code == 3
+    assert [c for c in fake.calls if c[0] == 'submission'] == [('submission', 'sample-rev-1')]
+    metrics = json.loads((root / '.herdr/review/sample-1/metrics.json').read_text())
+    assert metrics['review_status'] == 'parcial' and metrics['approval'] is False
+
+
+def test_review_group_recipient_disappearing_during_reservation_is_isolated(env, monkeypatch):
+    root, group, fake, boot, args = env
+    boot.bootstrap_review_group(group, args)
+    binding = groups.resolve_binding(group, core)
+    expected = {n: fake.get(n) for n in group.roles()}
+    fake.agents.pop('sample-rev-2')
+    fake.artifacts = {'sample-rev-1': str(root / 'verdict.md')}
+    with mock.patch.object(core.subprocess, 'Popen', fake.popen):
+        result, info, _ = core.dispatch_and_wait_all(
+            {n: 'fixture' for n in expected}, 30, expected_agents=expected,
+            group_binding=binding, partial_preflight=True)
+    assert result['sample-rev-1'] in ('idle', 'done')
+    assert result['sample-rev-2'] == 'preflight_aborted'
+    assert 'agent_not_found' in info['sample-rev-2']['reason']
+    assert [c for c in fake.calls if c[0] == 'submission'] == [('submission', 'sample-rev-1')]
+
+
+@pytest.mark.parametrize('invalid_role', ['rev-2', 'scout'])
+def test_selective_group_bootstrap_ignores_invalid_unrequested_member(env, monkeypatch, invalid_role):
+    root, group, fake, boot, args = env
+    if invalid_role == 'scout':
+        from dataclasses import replace
+        group = replace(group, scout_kind='codex')
+        monkeypatch.setattr(groups, 'GROUPS', {'sample': group}); fake.group = group
+    invalid = 'sample-' + invalid_role
+    fake.agents[invalid] = agent(invalid, root, pane='w9:p99', tab='w9:tC',
+                                kind=group.roles()[invalid][1])
+    fake.agents[invalid]['agent_session'] = None
+    fake.panes['w9:p99'] = dict(fake.agents[invalid])
+    args.with_reviewers = False; args.role = ['rev-1']
+    assert boot.bootstrap_review_group(group, args) == 0
+    assert 'sample-rev-1' in fake.agents
+    assert fake.agents[invalid]['agent_session'] is None
+    splits = [c for c in fake.calls if c[:2] == ('pane', 'split')]
+    assert len(splits) == 1 and splits[0][2] == fake.get(group.coordinator_name)['pane_id']
+
+
+def test_new_group_start_receipt_belongs_only_to_created_pane(env,monkeypatch):
+    root,group,fake,boot,args=env;observed=[]
+    def receipt(runtime,record,cwd):
+        pane=record['pane_id']
+        assert any(call[:2]==('pane','split') for call in fake.calls)
+        return boot.startup.NewPane(pane,'terminal-fixture',cwd,boot.startup.time.monotonic())
+    monkeypatch.setattr(boot.startup,'created_pane_receipt',receipt)
+    def finish(runtime,token,**kw):
+        assert token is not None and token.pane_id==kw['pane']
+        observed.append(kw['name']);return False
+    monkeypatch.setattr(boot.startup,'finish_start',finish)
+    assert boot.bootstrap_review_group(group,args)==0
+    assert observed==['sample-rev-1','sample-rev-2']
