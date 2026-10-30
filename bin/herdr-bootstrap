@@ -317,6 +317,10 @@ SPACES = [
     # Registrado por herdr-add-space em 2026-10-22.
     ("cerebro", f"{HOME}/cerebro", ("cerebro-exec", "codex", EXEC_ARGS_CODEX),
         ("cerebro-scout", "codex", SCOUT_ARGS), "cerebro", {"lean": True}),
+    # magicwalls: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-28.
+    ("magicwalls", f"{HOME}/Devs/miqueias/magicwalls", ("magicwalls-exec", "claude", EXEC_ARGS),
+        ("magicwalls-scout", "codex", SCOUT_ARGS), "magicwalls", {"lean": True}),
 ]
 
 
