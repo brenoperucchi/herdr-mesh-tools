@@ -23,6 +23,7 @@ class ReviewGroup:
     rev1_kind: str = "codex"
     rev2_kind: str = "claude"
     scout_kind: str | None = None
+    coordinator_cwd: str | None = None
 
     def roles(self):
         roles = {"rev-1": self.rev1_kind, "rev-2": self.rev2_kind}
@@ -33,17 +34,20 @@ class ReviewGroup:
 
 GROUPS = {
     "guardian2": ReviewGroup(
-        "guardian2", "guardian2-exec", "/home/brenoperucchi/Devs/guardian-2/agents/pedro",
+        "guardian2", "guardian2-pedro", "/home/brenoperucchi/Devs/guardian-2",
+        coordinator_cwd="/home/brenoperucchi/Devs/guardian-2/agents/pedro",
         coordinator_kind="codex", scout_kind="codex"
     ),
     # Caio (dev júnior, espelho do Guardian 2), worktree própria; Breno 18/10 08:06
     "caio": ReviewGroup(
-        "caio", "guardian2-caio", "/home/brenoperucchi/Devs/guardian-2/agents/caio",
+        "caio", "guardian2-caio", "/home/brenoperucchi/Devs/guardian-2",
+        coordinator_cwd="/home/brenoperucchi/Devs/guardian-2/agents/caio",
         coordinator_kind="codex", scout_kind="codex"
     ),
     # Supervisor (Xavier) revisa as próprias mudanças no conector; Breno 18/10 14:09
     "supervisor": ReviewGroup(
-        "supervisor", "guardian-supervisor", "/home/brenoperucchi/Devs/guardian-2/agents/supervisor",
+        "supervisor", "guardian-supervisor", "/home/brenoperucchi/Devs/guardian-2",
+        coordinator_cwd="/home/brenoperucchi/Devs/guardian-2/agents/supervisor",
         scout_kind="codex"
     ),
 }
@@ -65,6 +69,10 @@ def validate_registry(legacy_spaces=()):
         root = group.project_root
         if not os.path.isabs(root) or os.path.realpath(root) != root:
             raise RuntimeError(f"raiz do grupo deve ser absoluta e canônica: {root}")
+        if group.coordinator_cwd is not None and (
+                not os.path.isabs(group.coordinator_cwd)
+                or os.path.realpath(group.coordinator_cwd) != group.coordinator_cwd):
+            raise RuntimeError(f"cwd do coordenador deve ser absoluto e canônico: {group.coordinator_cwd}")
         names = [group.coordinator_name, *group.roles()]
         if len(set(names)) != len(names):
             raise RuntimeError(f"coordenador não pode ser papel descartável: {key}")
@@ -121,11 +129,17 @@ def resolve_binding(group, core, invoking_root=None):
     root = core.project_root(group.project_root)
     if root != group.project_root or (invoking_root is not None and core.project_root(invoking_root) != root):
         raise RuntimeError(f"grupo {group.slug}: raiz da invocação diverge de {group.project_root}")
+    cwd = group.coordinator_cwd
+    if cwd is not None and core.project_root(cwd) != root:
+        raise RuntimeError(f"grupo {group.slug}: cwd cadastrado fora da raiz {root}")
     info = core.get_agent_info(group.coordinator_name)
     check_project(info, root, core)
+    if cwd is not None and any(not info.get(field) or os.path.realpath(info[field]) != cwd
+                               for field in ("cwd", "foreground_cwd")):
+        raise RuntimeError(f"grupo {group.slug}: cwd do coordenador diverge de {cwd}")
     if info.get("name") != group.coordinator_name or info.get("agent") != group.coordinator_kind:
         raise RuntimeError(f"coordenador do grupo {group.slug} não coincide com o registro")
-    return {"slug": group.slug, "root": root, "coordinator": identity(info)}
+    return {"slug": group.slug, "root": root, "coordinator_cwd": cwd, "coordinator": identity(info)}
 
 
 def revalidate(binding, core):

@@ -192,10 +192,12 @@ entre posições.
 
 Grupos registrados usam um `coordinator_name` explícito; o nome não precisa
 terminar em `-exec`. Use o slug configurado, sem inferi-lo do label da tab.
-O primeiro grupo é `guardian2`, coordenado por `guardian2-exec`, com raiz real
-`/home/brenoperucchi/Devs/guardian2`. Rode a partir dessa raiz e use o slug
-`guardian2` na chamada normal. Revisores ausentes sobem somente na tab atual
-do coordenador vivo; a raiz de `cwd` e `foreground_cwd` deve coincidir.
+O grupo `guardian2` é coordenado por `guardian2-pedro`, com raiz Git real
+`/home/brenoperucchi/Devs/guardian-2` e cwd do coordenador em
+`/home/brenoperucchi/Devs/guardian-2/agents/pedro`. Use o slug `guardian2`
+na chamada normal. Revisores ausentes sobem somente na tab atual do
+coordenador vivo; `cwd` e `foreground_cwd` dele devem coincidir, por realpath,
+com o diretório do coordenador cadastrado.
 Para fechar o par após o resultado: `herdr-release guardian2 --only reviewers`.
 O grupo recusa liberação de agent ocupado, vínculo divergente ou rodada
 incompleta mesmo com `--force`. Bia não tem grupo registrado nesta entrega.

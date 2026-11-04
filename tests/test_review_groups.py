@@ -63,11 +63,12 @@ class FakeHerdr:
             origin = self.panes[args[2]]
             assert '--no-focus' in args
             pane = f'w9:p{self.next}'; self.next += 1
-            self.panes[pane] = dict(pane_id=pane, tab_id=origin['tab_id'], workspace_id='w9')
+            self.panes[pane] = dict(pane_id=pane, tab_id=origin['tab_id'], workspace_id='w9',
+                                    cwd=args[args.index('--cwd') + 1])
             return {'pane':self.panes[pane]}
         if args[:2] == ('agent','start'):
             name=args[2]; pane=args[args.index('--pane')+1]; kind=args[args.index('--kind')+1]
-            info=agent(name, self.agents[self.group.coordinator_name]['cwd'], pane,
+            info=agent(name, self.panes[pane]['cwd'], pane,
                        self.panes[pane]['tab_id'],kind)
             self.agents[name]=info; self.panes[pane]=dict(info)
             return {'agent':info}
@@ -739,3 +740,92 @@ def test_new_group_start_receipt_belongs_only_to_created_pane(env,monkeypatch):
     monkeypatch.setattr(boot.startup,'finish_start',finish)
     assert boot.bootstrap_review_group(group,args)==0
     assert observed==['sample-rev-1','sample-rev-2']
+
+
+def test_explicit_coordinator_cwd_inside_git_repo(env, monkeypatch):
+    """A registered agent subdirectory is not itself a Git root."""
+    from dataclasses import replace
+    import subprocess
+    root, group, fake, boot, args = env
+    subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+    cwd = root / 'agents' / 'pedro'; cwd.mkdir(parents=True)
+    group = replace(group, coordinator_cwd=str(cwd))
+    monkeypatch.setattr(groups, 'GROUPS', {'sample': group})
+    fake.group = group
+    fake.agents[group.coordinator_name].update(cwd=str(cwd), foreground_cwd=str(cwd))
+    binding = groups.resolve_binding(group, core, str(cwd))
+    assert binding['root'] == str(root)
+    assert binding['coordinator_cwd'] == str(cwd)
+    assert boot.bootstrap_review_group(group, args) == 0
+    for call in fake.calls:
+        if call[:2] == ('pane', 'split'):
+            assert call[call.index('--cwd') + 1] == str(root)
+
+
+@pytest.mark.parametrize('field', ['cwd', 'foreground_cwd'])
+def test_explicit_coordinator_cwd_rejects_other_directory_in_same_repo(env, monkeypatch, field):
+    from dataclasses import replace
+    import subprocess
+    root, group, fake, _, _ = env
+    subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+    cwd = root / 'agents' / 'pedro'; cwd.mkdir(parents=True)
+    other = root / 'agents' / 'caio'; other.mkdir()
+    group = replace(group, coordinator_cwd=str(cwd))
+    fake.agents[group.coordinator_name].update(cwd=str(cwd), foreground_cwd=str(cwd))
+    fake.agents[group.coordinator_name][field] = str(other)
+    with pytest.raises(RuntimeError, match='cwd'):
+        groups.resolve_binding(group, core, str(root))
+
+
+def test_explicit_coordinator_cwd_accepts_realpath_alias_but_not_escape(env):
+    from dataclasses import replace
+    import subprocess
+    root, group, fake, _, _ = env
+    subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+    cwd = root / 'agents'; cwd.mkdir()
+    alias = root.parent / 'agent-alias'; alias.symlink_to(cwd, target_is_directory=True)
+    group = replace(group, coordinator_cwd=str(cwd))
+    fake.agents[group.coordinator_name].update(cwd=str(alias), foreground_cwd=str(alias))
+    assert groups.resolve_binding(group, core)['coordinator_cwd'] == str(cwd)
+    outside = root.parent / 'external'; outside.mkdir()
+    alias.unlink(); alias.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError): groups.resolve_binding(group, core)
+
+
+def test_explicit_coordinator_worktree_is_its_own_root(env, monkeypatch):
+    from dataclasses import replace
+    import subprocess
+    root, group, fake, _, _ = env
+    subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture', '-c',
+                    'user.email=fixture@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'fixture'], check=True)
+    worktree = root.parent / 'worktree'
+    subprocess.run(['git', '-C', str(root), 'worktree', 'add', '--quiet', '--detach', str(worktree)], check=True)
+    cwd = worktree / 'agents'; cwd.mkdir()
+    group = replace(group, project_root=str(worktree), coordinator_cwd=str(cwd))
+    fake.agents[group.coordinator_name].update(cwd=str(cwd), foreground_cwd=str(cwd))
+    assert groups.resolve_binding(group, core, str(cwd))['root'] == str(worktree)
+    with pytest.raises(RuntimeError): groups.resolve_binding(group, core, str(root))
+
+
+def test_explicit_coordinator_cwd_change_invalidates_binding(env, monkeypatch):
+    from dataclasses import replace
+    root, group, fake, _, _ = env
+    # No repository needed: this tests frozen configuration, not Git behavior.
+    group = replace(group, coordinator_cwd=str(root))
+    monkeypatch.setattr(groups, 'GROUPS', {'sample': group})
+    binding = groups.resolve_binding(group, core)
+    child = root / 'new'; child.mkdir()
+    monkeypatch.setattr(groups, 'GROUPS', {'sample': replace(group, coordinator_cwd=str(child))})
+    with pytest.raises(RuntimeError): groups.revalidate(binding, core)
+
+
+def test_guardian2_pedro_is_coordinator_with_unchanged_reviewer_roles():
+    """Pedro's identity changes; the group and disposable role names do not."""
+    group=groups.get_group('guardian2')
+    assert group.coordinator_name=='guardian2-pedro'
+    assert set(group.roles())=={'guardian2-rev-1','guardian2-rev-2','guardian2-scout'}
+    assert groups.group_for_agent('guardian2-pedro')==group
+    assert groups.group_for_agent('guardian2-exec') is None
+    assert core._infer_role('guardian2-pedro')=='exec'
+    groups.validate_registry(load('herdr-bootstrap').SPACES)
