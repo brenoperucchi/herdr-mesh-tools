@@ -36,6 +36,7 @@ import _herdr_dispatch as core
 import _herdr_migration as migration
 import _herdr_review_policy as review_policy
 import _herdr_review_complement as complement
+import _herdr_review_scope as review_scope
 
 now_iso = core.now_iso
 api = core.api
@@ -326,6 +327,7 @@ def review_candidate(name, cwd):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
+    ap.add_argument("--repo", default=None, help="raiz Git alvo cadastrada no space")
     desc_group = ap.add_mutually_exclusive_group()
     desc_group.add_argument("--description", default=None)
     desc_group.add_argument("--description-file", default=None)
@@ -351,6 +353,17 @@ def main():
     if args.reviewer and not args.verify:
         ap.error("--reviewer exige --verify; use --revisor no nível 1")
 
+    core.require_herdr_pane()
+    try:
+        scope = review_scope.resolve(args.slug, args.repo, os.getcwd(), core)
+        with review_scope.reservation(scope, core):
+            return run(args, scope)
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run(args, scope):
     try:
         from _herdr_coordination_warnings import emit as coordination_warning
         coordination_warning('herdr-review-dispatch')
@@ -360,8 +373,6 @@ def main():
     # Achado 2026-09-01: $HERDR_ENV vazio nao e mais suficiente pra recusar
     # sozinho -- ver core.require_herdr_pane() pro porque (sandbox de exec
     # do Codex esconde env vars HERDR_*, confirmado ao vivo).
-    core.require_herdr_pane()
-
     if args.verify and args.files:
         print("erro: --verify não combina com --files (verificação encadeia diff de git)", file=sys.stderr)
         sys.exit(2)
@@ -381,11 +392,19 @@ def main():
         with open(args.description_file) as f:
             description = f.read()
 
-    cwd = core.project_root(os.getcwd())
+    cwd = scope['target'] if scope else core.project_root(os.getcwd())
+    agent_root = scope['base'] if scope else cwd
+    args.review_scope = scope
+    args.review_agent_root = agent_root
+    if scope:
+        review_scope.validate_files(cwd, args.files)
+        if args.verify or args.complementar:
+            review_scope.validate_round(cwd, args.verify or args.complementar, args.slug)
+
 
     if args.complementar:
         try:
-            gate = migration.space_gate_message(cwd, args.slug)
+            gate = migration.space_gate_message(agent_root, args.slug)
             if gate:
                 raise RuntimeError(gate)
             sys.exit(complement.run(argparse.Namespace(**globals()), args, cwd))
@@ -400,14 +419,14 @@ def main():
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    gate_msg = migration.space_gate_message(cwd, args.slug)
+    gate_msg = migration.space_gate_message(agent_root, args.slug)
     if gate_msg is not None:
         print(f"erro: {gate_msg}", file=sys.stderr)
         sys.exit(1)
 
     try:
         group = review_groups.get_group(args.slug)
-        rev_name = f"{args.slug}-rev-1" if group else migration.resolve_reviewer_name(cwd, args.slug, allow_missing=True)
+        rev_name = f"{args.slug}-rev-1" if group else migration.resolve_reviewer_name(agent_root, args.slug, allow_missing=True)
     except RuntimeError as exc:
         print(f"erro: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -428,7 +447,7 @@ def main():
             ready, missing = [], []
             for name in required_names:
                 try:
-                    info = review_candidate(name, cwd)
+                    info = review_candidate(name, agent_root)
                     if core.effective_status(info) in ("idle", "done"):
                         ready.append(name)
                 except RuntimeError as exc:
@@ -460,9 +479,10 @@ def main():
     # recovery contract; normal rounds restore only the requested role.
     if args.verify:
         try:
-            agent_restore = core.ensure_required_agents(args.slug, cwd, required_names)
+            agent_restore = core.ensure_required_agents(args.slug, agent_root, required_names,
+                                                       **({"review_repo": cwd} if scope else {}))
             for name in required_names:
-                validated_info[name] = validate_agent_project(name, cwd)
+                validated_info[name] = validate_agent_project(name, agent_root)
         except RuntimeError as exc:
             discard_unsubmitted_round()
             print(f"erro: {exc}", file=sys.stderr)
@@ -470,8 +490,9 @@ def main():
     else:
         for name in required_names:
             try:
-                agent_restore[name] = core.ensure_required_agents(args.slug, cwd, [name], selected_only=True)
-                info = review_candidate(name, cwd)
+                agent_restore[name] = core.ensure_required_agents(args.slug, agent_root, [name], selected_only=True,
+                                                                 **({"review_repo": cwd} if scope else {}))
+                info = review_candidate(name, agent_root)
                 if group:
                     review_groups.validate_member(group_binding, name, info, core)
                 if core.effective_status(info) not in ("idle", "done"):
@@ -547,7 +568,8 @@ def main():
                     f.write(f"\n## Contexto adicional\n\n{description}\n")
             print("request.md de verificação escrito")
         elif args.files:
-            snapshot_map = freeze_files(args.files, round_dir)
+            snapshot_map = (review_scope.freeze_files(args.files, round_dir, cwd)
+                            if scope else freeze_files(args.files, round_dir))
             for name in target_names:
                 write_request_files(cwd, verdict_dirs[name], sibling_dir_for(name), description, args.files, snapshot_map, coordinator_name=review_groups.coordinator_name(args.slug))
             print(f"{len(args.files)} arquivo(s) congelado(s) em {round_dir}/_snapshot/, request.md escrito para os revisores selecionados")
@@ -557,7 +579,7 @@ def main():
             for name in target_names:
                 write_request(cwd, verdict_dirs[name], sibling_dir_for(name), description, head_sha, args.base, coordinator_name=review_groups.coordinator_name(args.slug))
             print("request.md escrito para os revisores selecionados")
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"erro preparando a rodada: {exc}", file=sys.stderr)
         shutil.rmtree(round_dir, ignore_errors=True)
         sys.exit(1)
@@ -599,6 +621,9 @@ def main():
                         "Leia diff.patch (base para worktree), index.patch (base para índice staged) "
                         "e worktree.patch (índice para worktree), na pasta acima. As três camadas "
                         "são material da revisão, inclusive quando uma cancela a outra.\n")
+        if scope:
+            content += (f"\n## Vínculo da rodada\n\nCoordenador: {scope['coordinator']['name']}"
+                        f"\nCwd/base dos agents: {agent_root}\nRepositório alvo: {cwd}\n")
         content += (f"\n## Nível de revisão: {args.nivel}\n\n"
                     f"Justificativa: {policy['justificativa'] or '(nível 2 padrão)'}\n\n"
                     f"Gatilhos: {json.dumps(policy['gatilhos'], ensure_ascii=False)}\n")
@@ -659,6 +684,7 @@ def main():
         name: os.path.join(verdict_dirs[name], "verdict.md")
         for name in active_names
     }
+    review_scope.revalidate(scope, core)
     try:
         result, wait_info, settle_ts = dispatch_and_wait_all(
             prompts,
@@ -668,6 +694,7 @@ def main():
             check_composition=False,
             group_binding=group_binding,
             **({"partial_preflight": True} if not args.verify else {}),
+            **({"submission_check": lambda: review_scope.revalidate(scope, core)} if scope else {}),
         ) if prompts else ({}, {}, {})
     except core.DispatchPreflightError as exc:
         print(f"erro: preflight dos revisores abortou o dispatch: {exc}", file=sys.stderr)
@@ -684,6 +711,7 @@ def main():
         "round_dir": round_dir,
         "slug": args.slug,
         "group_binding": group_binding,
+        "review_scope": scope,
         "mode": "verify" if args.verify else ("files" if args.files else "diff"),
         "head_sha": head_sha,
         "agent_restore": agent_restore,

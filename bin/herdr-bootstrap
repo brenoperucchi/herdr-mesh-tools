@@ -21,6 +21,7 @@ import _herdr_review_groups as review_groups
 import _herdr_initial_hydration as initial_hydration
 import _herdr_trust as trust
 import _herdr_startup as startup
+import _herdr_space_repositories as space_repositories
 from types import SimpleNamespace
 
 HERDR = core.HERDR  # compatibilidade para consumidores que importam o módulo
@@ -281,12 +282,10 @@ SPACES = [
         ("strata-scout", "codex", SCOUT_ARGS), "strata", {"lean": True}),
     # inventory: space do Breno (descricao omitida neste repo publico).
     # Registrado por herdr-add-space em 2026-10-03.
-    ("inventory", f"{HOME}/Devs/inventory", ("inventory-exec", "claude", EXEC_ARGS),
-        ("inventory-scout", "codex", SCOUT_ARGS), "inventory", {"lean": True}),
-    # digest: space do Breno (descricao omitida neste repo publico).
-    # Registrado por herdr-add-space em 2026-10-03.
-    ("digest", f"{HOME}/Devs/digest", ("digest-exec", "claude", EXEC_ARGS),
-        ("digest-scout", "codex", SCOUT_ARGS), "digest", {"lean": True}),
+    ("painel", f"{HOME}/Devs/inventory", ("painel-exec", "claude", EXEC_ARGS),
+        ("painel-scout", "codex", SCOUT_ARGS), "painel", {"lean": True,
+            "additional_repositories": [f"{HOME}/Devs/digest", f"{HOME}/Devs/reports",
+                                        f"{HOME}/Devs/psu-monitor", f"{HOME}/Devs/http-server"]}),
     # agf-renda: space do Breno (descricao omitida neste repo publico).
     # Registrado por herdr-add-space em 2026-10-05.
     ("agf-renda", f"{HOME}/Devs/trading/agf-renda", ("agf-renda-exec", "claude", EXEC_ARGS),
@@ -324,14 +323,32 @@ SPACES = [
     # Registrado por herdr-add-space em 2026-10-28.
     ("magicwalls", f"{HOME}/Devs/miqueias/magicwalls", ("magicwalls-exec", "claude", EXEC_ARGS),
         ("magicwalls-scout", "codex", SCOUT_ARGS), "magicwalls", {"lean": True}),
+    # lastro-rust: space do Breno (descricao omitida neste repo publico).
+    # Registrado por herdr-add-space em 2026-10-31.
+    ("lastro-rust", f"{HOME}/Devs/lastro-rust", ("lastro-rust-exec", "claude", EXEC_ARGS),
+        ("lastro-rust-scout", "codex", SCOUT_ARGS), "lastro-rust", {"lean": True}),
+
 ]
 
 
 def entry_opts(entry):
     """6o elemento opcional de uma entrada de SPACES: dict de opcoes do space.
-    Hoje so `{"lean": True}`. Exige o slug explicito (5o elemento)."""
+    Opções: lean e additional_repositories. Exige o slug explícito (5o elemento)."""
     return entry[5] if len(entry) > 5 and isinstance(entry[5], dict) else {}
 
+
+
+def launch_args(entry,name,kind,extra,*,review_repo=None):
+    return space_repositories.launch_args(entry,name,kind,extra,review_repo=review_repo)
+
+
+def catalog_entry(entry):
+    label,cwd,exec_agent,scout=entry[:4]
+    slug=entry[4] if len(entry)>4 else label.lower()
+    roles=([exec_agent] if exec_agent else [])+build_rev_agents(slug,core.project_root(cwd))+([scout] if scout else [])
+    roots=space_repositories.repositories(entry)
+    return dict(label=label,slug=slug,cwd=roots[0],repositories=roots,
+                additional_repositories=roots[1:],agents=[dict(name=n,kind=k) for n,k,_ in roles])
 
 def is_lean(entry, with_reviewers=False):
     """Space enxuto: so o exec sobe por padrao. Revisores e scout continuam
@@ -642,6 +659,8 @@ def bootstrap_review_group(group, args):
 def main():
     global DRY
     ap = argparse.ArgumentParser(description="garante os agents definidos na tabela SPACES")
+    ap.add_argument("--catalog", action="store_true", help="lista cadastro e repositórios em JSON, sem acessar Herdr")
+    ap.add_argument("--review-repo", default=None, help="raiz alvo cadastrada para novo revisor Claude")
     ap.add_argument("--dry-run", action="store_true",
                     help="mostra o plano sem criar workspace, pane, tab ou agent")
     alvo = ap.add_mutually_exclusive_group()
@@ -663,6 +682,18 @@ def main():
     ap.add_argument("--pane", help="pane explicitamente autorizado para --hydrate-initial")
     args = ap.parse_args()
     DRY = args.dry_run
+    if args.catalog:
+        selected=[e for e in SPACES if (args.space is None or e[0]==args.space)
+                  and (args.slug is None or (e[4] if len(e)>4 else e[0].lower())==args.slug)]
+        catalog=[]
+        for entry in selected:
+            try:catalog.append(catalog_entry(entry))
+            except (RuntimeError,OSError,ValueError) as exc:
+                catalog.append(dict(label=entry[0],slug=entry[4] if len(entry)>4 else entry[0].lower(),error=str(exc)))
+        print(json.dumps(catalog,ensure_ascii=False,indent=2))
+        return 1 if any(item.get('error') for item in catalog) else 0
+    if args.review_repo and (not args.slug or (not args.role and not args.with_reviewers)):
+        ap.error('--review-repo exige --slug e --role/--with-reviewers')
     if args.hydrate_initial or args.pane:
         if (not args.hydrate_initial or not args.pane or not args.group
                 or args.with_reviewers or args.with_scout or args.role):
@@ -722,6 +753,10 @@ def main():
         if args.slug is not None and slug != args.slug:
             continue
         matched_target = True
+        review_repo=getattr(args,'review_repo',None)
+        if review_repo:
+            # Validate the target before any creation or trust preparation.
+            launch_args(entry,f'{slug}-rev-2','claude',[],review_repo=review_repo)
         # project_root(), não o cwd cru da tupla — achado P3-1 herdr-7: o
         # mesmo path pode ser lido de formas diferentes por herdr-migrate-rev
         # (que usa o cwd real do agent vivo) e por aqui (valor estático de
@@ -765,6 +800,26 @@ def main():
             tab1_agents = ([exec_agent] if exec_agent else []) + [
                 entry for entry in reviewer_entries if entry[0] in requested]
             lean_scout = True
+        # Never inspect/reapply startup arguments of a registered live agent.
+        # A bad pending launch belongs to this entry, not to other spaces.
+        prepared_agents=[]
+        preparing=slug
+        try:
+            for name,kind,extra in tab1_agents:
+                preparing=name
+                selected=not args.role or name in requested
+                if selected and name not in existing_agent_names:
+                    extra=launch_args(entry,name,kind,extra,review_repo=review_repo
+                                      if not exec_agent or name!=exec_agent[0] else None)
+                prepared_agents.append((name,kind,extra))
+            if scout and not lean_scout and scout[0] not in existing_agent_names:
+                preparing=scout[0]
+                scout=(scout[0],scout[1],launch_args(entry,*scout))
+        except (RuntimeError,OSError,ValueError) as exc:
+            startup_failures.append((preparing,'configuração'))
+            print(f"  {preparing}: argumentos de subida recusados: {exc}",file=sys.stderr)
+            continue
+        tab1_agents=prepared_agents
         if ws is None:
             print(f"space {label}: criando (cwd={cwd})")
             res = run("workspace", "create", "--label", label, "--cwd", cwd, "--no-focus")

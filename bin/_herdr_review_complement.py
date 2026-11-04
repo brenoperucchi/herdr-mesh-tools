@@ -54,6 +54,8 @@ def reservation(root):
 def run(runtime, args, cwd):
     """runtime is the dispatcher module; all delivery uses its existing core."""
     core = runtime.core
+    agent_root = getattr(args, "review_agent_root", cwd)
+    scope = getattr(args, "review_scope", None)
     root = Path(args.complementar).resolve()
     if root.parent != Path(cwd).resolve() / '.herdr' / 'review' or not root.is_dir():
         raise RuntimeError('complemento deve apontar para rodada do próprio projeto')
@@ -72,6 +74,8 @@ def run(runtime, args, cwd):
             raise RuntimeError('histórico de complementos inválido')
         if any(a.get('status') == 'in_progress' for a in attempts):
             raise RuntimeError('complemento anterior sem resultado confirmado (unknown); não reenviar')
+        if metrics.get('review_scope') != scope:
+            raise RuntimeError('vínculo/raiz da rodada parcial mudou')
         names = [f'{args.slug}-rev-1', f'{args.slug}-rev-2']
         if (metrics.get('slug') != args.slug or metrics.get('nivel') != 2
                 or metrics.get('review_status') != 'parcial'
@@ -106,8 +110,9 @@ def run(runtime, args, cwd):
         expected, refused, restores = {}, {}, {}
         for name in selected:
             try:
-                restores[name] = core.ensure_required_agents(args.slug, cwd, [name], selected_only=True)
-                info = runtime.review_candidate(name, cwd)
+                restores[name] = core.ensure_required_agents(args.slug, agent_root, [name], selected_only=True,
+                                                            **({"review_repo": cwd} if scope else {}))
+                info = runtime.review_candidate(name, agent_root)
                 if group:
                     runtime.review_groups.validate_member(binding, name, info, core)
                 if core.effective_status(info) not in ('idle', 'done'):
@@ -119,6 +124,8 @@ def run(runtime, args, cwd):
                    'restore': restores, 'refused': refused, 'status': 'in_progress'}
         metrics.setdefault('complements', []).append(attempt)
         try:
+            if scope:
+                runtime.review_scope.revalidate(scope, core)
             if manifest(root) != frozen:
                 raise RuntimeError('material mudou antes do complemento; envio recusado')
         except (OSError, RuntimeError) as exc:
@@ -134,7 +141,8 @@ def run(runtime, args, cwd):
                 result, detail, settled = runtime.dispatch_and_wait_all(
                     prompts, args.timeout, required_artifacts=artifacts,
                     expected_agents=expected, check_composition=False,
-                    group_binding=binding, partial_preflight=True)
+                    group_binding=binding, partial_preflight=True,
+                    **({"submission_check": lambda: runtime.review_scope.revalidate(scope, core)} if scope else {}))
             except core.DispatchPreflightError as exc:
                 result = {n: 'preflight_aborted' for n in expected}
                 detail = {n: exc.as_dict() for n in expected}

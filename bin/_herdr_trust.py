@@ -84,9 +84,23 @@ def registered_directories(bootstrap, home, refused=None):
         if not isinstance(entry, ast.Tuple) or len(entry.elts) < 2:
             raise TrustError('entrada SPACES inválida')
         try:
-            value = literal(entry.elts[1])
-            if not os.path.isabs(value): raise TrustError('cwd relativo em SPACES')
-            paths.add(str(validate_path_policy(value, home)))
+            candidates=[literal(entry.elts[1])]
+            if len(entry.elts)>5:
+                options=entry.elts[5]
+                if not isinstance(options,ast.Dict):raise TrustError('opções dinâmicas em SPACES')
+                seen=set()
+                for key,value in zip(options.keys,options.values):
+                    if not isinstance(key,ast.Constant) or not isinstance(key.value,str) or key.value in seen:
+                        raise TrustError('chaves de opções inválidas em SPACES')
+                    seen.add(key.value)
+                    if key.value=='additional_repositories':
+                        if not isinstance(value,ast.List):raise TrustError('additional_repositories deve ser lista literal')
+                        candidates.extend(literal(item) for item in value.elts)
+            normalized=set()
+            for value in candidates:
+                if not os.path.isabs(value):raise TrustError('cwd relativo em SPACES')
+                normalized.add(str(validate_path_policy(value,home)))
+            paths.update(normalized)
         except TrustError as exc:
             if refused is not None:
                 label = entry.elts[0].value if isinstance(entry.elts[0], ast.Constant) else '(desconhecido)'

@@ -90,7 +90,8 @@ def existing_labels(source):
     return labels
 
 
-def render_entry(label, cwd, slug, exec_kind, scout_kind, note, lean=False):
+def render_entry(label, cwd, slug, exec_kind, scout_kind, note, lean=False,
+                 *, options=None, additional_repositories=None):
     """The tuple as it will read in the file, comment first."""
     today = datetime.date.today().isoformat()
     lines = []
@@ -131,10 +132,15 @@ def render_entry(label, cwd, slug, exec_kind, scout_kind, note, lean=False):
     exec_args = profile_expr(exec_kind, "exec")
     scout_part = (f'("{slug}-scout", "{scout_kind}", '
                   f'{profile_expr(scout_kind, "scout")})' if scout_kind else "None")
-    # `lean` e' o 6o elemento da tupla e exige o slug explicito (5o), mesmo igual ao label.
-    slug_part = f', "{slug}"' if (slug != label.lower() or lean) else ""
-    if lean:
-        slug_part += ', {"lean": True}'
+    opts=dict(options or {})
+    if additional_repositories is not None:
+        if not isinstance(additional_repositories,list) or not all(
+                isinstance(p,str) and os.path.isabs(p) for p in additional_repositories):
+            raise ValueError('additional_repositories deve ser lista de caminhos absolutos')
+        opts['additional_repositories']=list(additional_repositories)
+    if lean:opts['lean']=True
+    slug_part=f', "{slug}"' if (slug!=label.lower() or opts) else ''
+    if opts:slug_part+=', {'+', '.join(json.dumps(k,ensure_ascii=False)+': '+repr(v) for k,v in opts.items())+'}'
 
     lines.append(f'    ("{label}", {cwd_expr}, ("{exec_name}", "{exec_kind}", {exec_args}),')
     lines.append(f"        {scout_part}{slug_part}),")
@@ -480,6 +486,8 @@ def main():
     ap.add_argument("--guardian", action="store_true",
                     help="poe o exec no foco do Guardian (guardian/visao-fases.json). "
                          "SEM esta flag o space NAO entra na monitoracao do Guardian.")
+    ap.add_argument("--additional-repo", action="append", default=None, metavar="PATH",
+                    help="repositório adicional declarado para este space (repetível)")
     ap.add_argument("--exec-kind", default="claude")
     ap.add_argument("--scout-kind", default="codex")
     ap.add_argument("--dry-run", action="store_true",
@@ -533,7 +541,20 @@ def main():
         print(f"herdr-add-space: workspace '{label}' ja existe — registrando na "
               f"tabela para o bootstrap saber recria-lo (ele nao vai duplicar)")
 
-    entry = render_entry(label, cwd, slug, args.exec_kind, scout_kind, args.note, lean=args.lean)
+    additional=None
+    if args.additional_repo:
+        import _herdr_space_repositories as space_repos
+        import _herdr_review_scope as review_scope
+        try:
+            # Multi-repository review requires the base itself to be a Git
+            # root. Do not initialize it as a side effect of this validation.
+            base_root=review_scope._repository(cwd)
+            additional=[review_scope._repository(p) for p in args.additional_repo]
+            roots=space_repos.repositories((label,base_root,None,None,slug,{'additional_repositories':additional}))
+            additional=roots[1:]
+        except RuntimeError as exc:die(str(exc))
+    entry = render_entry(label, cwd, slug, args.exec_kind, scout_kind, args.note, lean=args.lean,
+                         additional_repositories=additional)
     print("herdr-add-space: entrada a inserir\n", flush=True)
     print(entry, flush=True)
 

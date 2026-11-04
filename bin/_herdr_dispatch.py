@@ -334,7 +334,7 @@ def _agent_restore_lock(slug):
             os.close(fd)
 
 
-def ensure_required_agents(slug, cwd, required_names, *, selected_only=False):
+def ensure_required_agents(slug, cwd, required_names, *, selected_only=False, review_repo=None):
     """Serializa e executa a recuperação de papéis obrigatórios ausentes."""
     group = review_groups.get_group(slug)
     if group is not None:
@@ -344,10 +344,10 @@ def ensure_required_agents(slug, cwd, required_names, *, selected_only=False):
         except RuntimeError as exc:
             raise AgentRestoreError(str(exc)) from exc
     with _agent_restore_lock(slug):
-        return _ensure_required_agents_locked(slug, cwd, required_names, selected_only=selected_only)
+        return _ensure_required_agents_locked(slug, cwd, required_names, selected_only=selected_only, review_repo=review_repo)
 
 
-def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=False):
+def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=False, review_repo=None):
     """Garante que os papéis obrigatórios existem antes de criar uma rodada.
 
     A tabela única de ``herdr-bootstrap`` é a fonte dos perfis usados quando
@@ -407,6 +407,8 @@ def _ensure_required_agents_locked(slug, cwd, required_names, *, selected_only=F
             command.extend(["--role", role])
     elif any(n.endswith(("-rev", "-rev-1", "-rev-2")) for n in missing):
         command.append("--with-reviewers")
+    if group is None and review_repo is not None:
+        command.extend(["--review-repo", review_repo])
     if group is None and any(n.endswith("-scout") for n in missing):
         command.append("--with-scout")
     try:
@@ -1176,13 +1178,21 @@ def classify_composition(pane_id, lines=12):
     rascunho (strata-exec, 2026-10-01: produto parado 8 min esperando confirmacao)."""
     try:
         out = subprocess.run(
-            herdr_argv("pane", "read", pane_id, "--source", "detection", "--lines", str(lines)),
+            herdr_argv("pane", "read", pane_id, "--source", "detection", "--lines", str(max(lines, 60))),
             capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return "indeterminado", "", "timeout lendo o pane"
     if out.returncode != 0:
         return "indeterminado", "", f"falha lendo o pane: {out.stderr.strip()[:80]}"
-    text = out.stdout
+    screen = out.stdout
+    # Observed in isolated Codex 0.166: a centered modal can sit well above
+    # the compose footer. Recognize the whole bounded detection window;
+    # ordinary composition still uses the caller's original tail size.
+    if (re.search(r"(?im)replace goal\?", screen)
+            and re.search(r"(?m)1\.\s*Replace current goal\b", screen)
+            and re.search(r"(?m)^.*2\.\s*Cancel\s+Keep the current goal", screen)):
+        return "dialogo", "", "Codex Replace goal pendente"
+    text = "\n".join(screen.splitlines()[-lines:])
     lowered = "\n".join(text.splitlines()[-8:]).lower()
     for marker in _PENDING_MARKERS:
         if marker in lowered:
@@ -2520,7 +2530,7 @@ def reset_reviewer_context(name, timeout_s=1200):
 
 def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                                 *, expected_agents=None, check_composition=True,
-                                allow_working=False, group_binding=None, partial_preflight=False):
+                                allow_working=False, group_binding=None, partial_preflight=False, submission_check=None):
     """Manda o prompt e espera cada agent assentar (idle/done) via
     `agent prompt --wait`, um subprocesso concorrente por nome — um agent
     lento ou travado não atrasa a detecção dos outros. Ancorado na submissão,
@@ -2609,7 +2619,9 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
                 _dispatch_observe(name, expected_agents[name],
                                   check_composition=check_composition,
                                   allow_working=allow_working)
-        except RuntimeError as exc:
+            if submission_check is not None:
+                submission_check()
+        except (RuntimeError, OSError) as exc:
             raise DispatchPreflightError(name, str(exc)) from exc
         return subprocess.Popen(
             herdr_argv("agent", "prompt", name, text,
@@ -2972,7 +2984,7 @@ def _dispatch_and_wait_all_impl(prompts, timeout_s, required_artifacts=None,
 
 def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
                           *, expected_agents=None, check_composition=True,
-                          allow_working=False, group_binding=None, partial_preflight=False):
+                          allow_working=False, group_binding=None, partial_preflight=False, submission_check=None):
     """Run a dispatch while reserving every expected target until settlement.
 
     The reservation spans preflight, prompt submission, retries and artifact
@@ -3010,6 +3022,7 @@ def dispatch_and_wait_all(prompts, timeout_s, required_artifacts=None,
             admitted, timeout_s, artifacts, expected_agents=admitted_expected,
             check_composition=check_composition, allow_working=allow_working,
             group_binding=group_binding, partial_preflight=partial_preflight,
+            **({"submission_check": submission_check} if submission_check is not None else {}),
         )
         for name, reason in excluded.items():
             result[name] = "preflight_aborted"

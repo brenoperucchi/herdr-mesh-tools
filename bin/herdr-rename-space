@@ -26,6 +26,7 @@ herdr-bootstrap, config/*.json do inventário e a lista `foco` do Guardian. O re
 plugins.json do Herdr) só é LISTADO no fim, para revisão.
 """
 import argparse
+import ast
 import datetime
 import difflib
 import json
@@ -163,8 +164,25 @@ def edita_spaces(a, f, novo_dir, aplicar, bkp):
             linhas[fim].startswith(recuo) and re.match(r"[(#]", linhas[fim][len(recuo):])):
         fim += 1
     bloco = "".join(linhas[ini:fim])
+    # Keep the sixth field byte-for-byte: generic name substitutions must
+    # never rewrite custom option values or additional repository paths.
+    prefix='ENTRY = '
+    wrapped=prefix+bloco.lstrip()
+    parsed=ast.parse(wrapped).body[0].value
+    if isinstance(parsed,ast.Tuple) and len(parsed.elts)==1 and isinstance(parsed.elts[0],ast.Tuple):
+        parsed=parsed.elts[0]
+    suffix=''
+    if isinstance(parsed,ast.Tuple) and len(parsed.elts)>5:
+        option=parsed.elts[5]
+        raw=wrapped.encode('utf-8').splitlines(keepends=True)
+        offset=sum(len(line) for line in raw[:option.lineno-1])+option.col_offset-len(prefix)
+        leading=len(bloco.encode('utf-8'))-len(bloco.lstrip().encode('utf-8'))
+        cut=leading+offset
+        head=bloco.encode('utf-8')[:cut].decode('utf-8')
+        suffix=bloco.encode('utf-8')[cut:].decode('utf-8')
+    else:head=bloco
     sv, sn = f["slug_velho"], a.slug
-    novo = bloco.replace(f'("{a.de}",', f'("{a.label}",', 1)
+    novo = head.replace(f'("{a.de}",', f'("{a.label}",', 1)
     novo = novo.replace(f'"{sv}-exec"', f'"{sn}-exec"').replace(f'"{sv}-scout"', f'"{sn}-scout"')
     novo = re.sub(r'"' + re.escape(sv) + r'"(?=,\s*\{|\s*,|\s*\))', f'"{sn}"', novo)
     rel = novo_dir[len(HOME) + 1:] if novo_dir.startswith(HOME + "/") else None
@@ -179,6 +197,7 @@ def edita_spaces(a, f, novo_dir, aplicar, bkp):
             avisos.append("nao achei o f\"{HOME}/...\" do cwd no bloco; ajuste a mao")
     else:
         avisos.append("a nova pasta esta fora de $HOME; ajuste o cwd do bloco a mao")
+    novo+=suffix
     out = {"achou": True, "muda": novo != bloco, "avisos": avisos, "antes": bloco, "depois": novo}
     if aplicar and novo != bloco:
         rn.backup(None, BOOTSTRAP, bkp)
