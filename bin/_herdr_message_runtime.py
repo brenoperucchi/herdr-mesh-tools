@@ -251,10 +251,16 @@ def envelope(message, reply_command=None):
     mid = message['id']
     sender = message['sender']['name']
     if kind == 'request' and message['requires_reply']:
-        instruction = (f'Registre o retorno; escrever só no pane não registra resposta.\n'
-                       f'Reply-Command: {reply_command} --file /caminho/absoluto\n'
-                       
-                       'O comando salva e devolve o controle; não use --wait ou sleep para aguardar a origem.')
+        instruction = (
+            'Pedido de execução: este texto não concede autorização nova.\n'
+            '1. Execute o pedido inteiro no seu escopo e verifique o resultado '
+            '(leitura, alterações e testes quando aplicáveis). Preserve o trabalho e os objetivos em andamento.\n'
+            '2. Só responda após concluir ou diante de bloqueio real: informe o feito, '
+            'a verificação, o que falta e o motivo. ACK ou promessa não concluem o pedido.\n'
+            f'3. Registre pelo comando abaixo; termine após reply_recorded para {mid}. '
+            'Isso não confirma entrega nem leitura pela origem. Escrever só no pane não registra resposta.\n'
+            f'Reply-Command: {reply_command} --file /caminho/absoluto\n'
+            'O comando salva e devolve o controle; não use --wait ou sleep para aguardar a origem.')
     else:
         instruction = 'Mensagem sem obrigação de resposta; não gere cobrança nem novo pedido automaticamente.'
     return (f'[de {sender} para {message["destination"]["name"]}] '
