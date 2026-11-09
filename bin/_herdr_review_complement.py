@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import uuid
 
@@ -30,7 +31,35 @@ def manifest(round_dir):
     for path in paths:
         if any(parent.is_symlink() for parent in path.parents if parent != root.parent):
             raise RuntimeError('material congelado atravessa diretório symlink')
-    return {str(p.relative_to(root)): digest(p) for p in sorted(paths)}
+    result = {}
+    for path in sorted(paths):
+        relative = str(path.relative_to(root))
+        if path.is_relative_to(snapshot):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise RuntimeError(f'arquivo regular esperado: {path}')
+                sha = hashlib.file_digest(source, 'sha256').hexdigest()
+                after = os.fstat(source.fileno())
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                    before.st_ctime_ns, before.st_mode) != (after.st_dev, after.st_ino,
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
+                    raise RuntimeError('material congelado mudou durante leitura')
+                result[relative] = {'sha256': sha, 'mode': stat.S_IMODE(before.st_mode)}
+        else:
+            result[relative] = digest(path)
+    return result
+
+
+def validate_manifest(root, frozen):
+    if isinstance(frozen, dict) and any(
+        key.startswith('_snapshot/') and isinstance(value, str)
+        for key, value in frozen.items()
+    ):
+        raise RuntimeError('manifesto legado sem modo; abra rodada nova')
+    if not frozen or manifest(root) != frozen:
+        raise RuntimeError('material congelado mudou ou não possui hashes; não complementar')
 
 
 def success(entry):
@@ -84,8 +113,7 @@ def run(runtime, args, cwd):
             raise RuntimeError('complemento exige rodada nível 2 parcial de unidade do mesmo slug')
         names = list(metrics['reviewers'])
         frozen = metrics.get('material_manifest')
-        if not frozen or manifest(root) != frozen:
-            raise RuntimeError('material congelado mudou ou não possui hashes; não complementar')
+        validate_manifest(root, frozen)
         missing = [n for n in names if not success(metrics['reviewers'][n])]
         if len(missing) != 1 or set(missing) != set(metrics.get('missing_reviewers', [])):
             raise RuntimeError('métricas de faltantes inconsistentes')

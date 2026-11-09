@@ -262,3 +262,51 @@ def test_copy_oserror_cleans_round_before_any_submission(scoped_cli,monkeypatch,
     files=[str(file)]*(2 if case=='duplicate' else 1)
     assert run('--description','fixture','--files',*files)==1
     assert not sent and not list(target.glob('.herdr/review/*'))
+
+@pytest.mark.parametrize('mode',[0o755,0o644])
+def test_scoped_freeze_preserves_descriptor_permissions(scope_env,tmp_path,mode):
+    scope, _, _, target, _ = scope_env
+    source=Path(target)/'mode-test';source.write_bytes(b'content');source.chmod(mode)
+    snapshot=Path(scope.freeze_files([str(source)],tmp_path/'round',target)[str(source)])
+    assert snapshot.read_bytes()==b'content'
+    assert snapshot.stat().st_mode & 0o7777 == mode
+
+
+def test_scoped_freeze_rejects_source_mode_change_during_copy(scope_env,tmp_path,monkeypatch):
+    scope, _, _, target, _ = scope_env
+    source=Path(target)/'changing-mode';source.write_bytes(b'content');source.chmod(0o755)
+    copy=scope.shutil.copyfileobj
+    def mutate(inp,out):
+        copy(inp,out);source.chmod(0o644)
+    monkeypatch.setattr(scope.shutil,'copyfileobj',mutate)
+    with pytest.raises(RuntimeError,match='mudou'):
+        scope.freeze_files([str(source)],tmp_path/'round',target)
+
+
+def test_manifest_detects_snapshot_permission_change(tmp_path):
+    import _herdr_review_complement as complement
+    file=tmp_path/'_snapshot'/'test';file.parent.mkdir();file.write_bytes(b'content');file.chmod(0o755)
+    before=complement.manifest(tmp_path)
+    file.chmod(0o644)
+    assert complement.manifest(tmp_path) != before
+
+
+def test_scoped_freeze_private_during_copy(scope_env,tmp_path,monkeypatch):
+    scope, _, _, target, _ = scope_env
+    source=Path(target)/'private';source.write_bytes(b'private');source.chmod(0o600)
+    copy=scope.shutil.copyfileobj
+    def inspect(inp,out):
+        assert scope.os.fstat(out.fileno()).st_mode & 0o077 == 0
+        copy(inp,out)
+    monkeypatch.setattr(scope.shutil,'copyfileobj',inspect)
+    dest=Path(scope.freeze_files([str(source)],tmp_path/'round',target)[str(source)])
+    assert dest.stat().st_mode & 0o7777 == 0o600
+
+
+def test_manifest_legacy_refused_with_specific_reason(tmp_path):
+    import _herdr_review_complement as complement
+    file=tmp_path/'_snapshot'/'test';file.parent.mkdir();file.write_bytes(b'content')
+    new=complement.manifest(tmp_path)
+    old={k:(v['sha256'] if isinstance(v,dict) else v) for k,v in new.items()}
+    with pytest.raises(RuntimeError,match='manifesto legado sem modo'):
+        complement.validate_manifest(tmp_path,old)

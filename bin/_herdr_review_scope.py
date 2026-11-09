@@ -161,12 +161,17 @@ def freeze_files(files, round_dir, target):
             contained()
             dest=Path(round_dir)/'_snapshot'/str(Path(original).absolute()).lstrip(os.sep)
             dest.parent.mkdir(parents=True,exist_ok=True)
-            with dest.open('xb') as output:
+            dest_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(dest_fd, 'wb') as output:
                 shutil.copyfileobj(source,output)
+                output.flush()
+                os.fchmod(output.fileno(), stat.S_IMODE(before.st_mode))
+                if stat.S_IMODE(os.fstat(output.fileno()).st_mode) != stat.S_IMODE(before.st_mode):
+                    raise RuntimeError('modo do snapshot diverge da fonte')
             after=os.fstat(source.fileno())
             contained()
-            if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)!=(
-                    after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns):
+            if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns,before.st_mode)!=(
+                    after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns,after.st_mode):
                 raise RuntimeError('fonte mudou durante congelamento')
             mapping[original]=str(dest)
     return mapping
