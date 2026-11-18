@@ -13,6 +13,7 @@ Saida (primeira linha) e codigo de saida:
   2  NAO ENVIE     dialogo/pergunta pendente no pane
   3  NAO ENVIE     agent working/blocked (use --allow-working se enviar assim e' ok)
   4  INDETERMINADO falha ao ler; trate como NAO ENVIE e pergunte ao humano
+  5  NAO ENVIE     o pane virou shell (agent morreu): recrie o pane; nada do que se digitar chega a um agent
 Nunca escreve no pane.
 """
 import argparse
@@ -37,6 +38,9 @@ def resolver(alvo):
 def decidir(info, allow_working=False):
     """(codigo, rotulo, detalhe, tipo, texto)"""
     status = core.effective_status(info)
+    shell = core.pane_shell_signal(info["pane_id"])
+    if shell:
+        return 5, "NAO ENVIE", shell, "shell", ""
     tipo, texto, motivo = core.classify_composition(info["pane_id"])
     if tipo == "indeterminado":
         return 4, "INDETERMINADO", motivo, tipo, texto

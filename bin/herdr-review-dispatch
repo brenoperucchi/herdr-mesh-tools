@@ -841,7 +841,7 @@ def run(args, scope):
         elif status == "artifact_missing":
             print(f"  {name}: ARTIFACT_MISSING ({args.timeout}s) — o lifecycle terminou, mas verdict.md não foi publicado" + (f" (verdict.md existe, {size}b — confira a corrida da rodada)" if size else ""))
         elif status == "stalled":
-            print(f"  {name}: STALLED — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado")
+            print(f"  {name}: STALLED (não processou, sem reenvio) — sem nenhuma mudança de estado nos primeiros 5s após o prompt ({wait_info.get(name)}) — pane pode estar travado ou ter virado shell")
         elif status == "preflight_aborted":
             print(f"  {name}: PREFLIGHT_ABORTED — alvo mudou antes de qualquer reenvio ({wait_info.get(name)})")
         elif status == "error":

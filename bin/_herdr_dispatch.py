@@ -1204,6 +1204,49 @@ def _log_compose_block(pane_id, compose, motivo):
         pass
 
 
+_SHELL_NAMES = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "nu"})
+_SHELL_TAIL_RE = re.compile(r"\[ble: exit \d+\]|: command not found\b|: comando não encontrado\b", re.IGNORECASE)
+
+
+def pane_shell_signal(pane_id, lines=8):
+    """Motivo (str) se o pane virou um shell; None se nao ha sinal ou se a leitura falhou (leitura indeterminada nao bloqueia
+    aqui: o resto da guarda continua).
+    Prova primaria: `pane process-info`. Todos os processos em primeiro plano sendo shell = virou shell. Se a consulta devolve
+    algum processo que NAO e' shell (agent, wrapper node, grupo shell+agent), NAO ha sinal, mesmo que a tela cite
+    `command not found` ou `[ble: exit N]` (r211: resposta/log do agent vivo nao pode declarar o agent morto).
+    Fallback textual so quando a consulta nao traz processo algum (indeterminada): a ULTIMA linha nao vazia da tela precisa ser
+    a saida de shell e nao pode haver caixa de composicao de agent nas ultimas linhas. Nao usa interactive_ready
+    (falso-negativo conhecido)."""
+    try:
+        procs = api("pane", "process-info", "--pane", pane_id).get("process_info", {}).get("foreground_processes") or []
+    except (RuntimeError, KeyError, TypeError, ValueError, AttributeError):
+        procs = []
+    if procs:
+        names = []
+        for proc in procs:
+            argv = proc.get("argv") or []
+            names.append(os.path.basename(argv[0]).lstrip("-") if argv else str(proc.get("name") or ""))
+        if all(n in _SHELL_NAMES for n in names):
+            return f"só o shell ({', '.join(sorted(set(names)))}) está em primeiro plano: pane virou shell, recrie o pane"
+        return None
+    try:
+        out = subprocess.run(
+            herdr_argv("pane", "read", pane_id, "--source", "detection", "--lines", "60"),
+            capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    tail = [ln for ln in out.stdout.splitlines()[-lines:] if ln.strip()]
+    if not tail or any(_COMPOSE_LINE_RE.match(ln.strip()) for ln in tail):
+        return None
+    m = _SHELL_TAIL_RE.search(tail[-1])
+    if m:
+        return (f"processos do pane indeterminados e a última linha é saída de shell ({m.group(0)!r}): "
+                "pane virou shell, recrie o pane")
+    return None
+
+
 def classify_composition(pane_id, lines=12):
     """Classifica o que ha na caixa de composicao de um pane, para um agent decidir
     se pode enviar. Devolve (tipo, texto, motivo):
