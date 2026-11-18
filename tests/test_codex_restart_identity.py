@@ -31,6 +31,7 @@ def world(tmp_path,monkeypatch):
     monkeypatch.setenv('HOME',str(home));monkeypatch.setenv('CODEX_HOME',str(root))
     monkeypatch.setenv('HERDR_MESH_STATE_DIR',str(home/'mesh-state'))
     monkeypatch.delenv('HERDR_PANE_ID',raising=False)
+    monkeypatch.delenv('HERDR_MESH_CACHE_DIR',raising=False)
     ca=home/'a';ca.mkdir();cb=home/'b';cb.mkdir()
     path=root/'state_5.sqlite'
     with sqlite3.connect(path) as db:
@@ -621,3 +622,213 @@ def test_last_form_appearing_after_stop_blocks_religamento_with_recovery(world,m
     assert w.invoke()[0]==1
     out=capsys.readouterr().out
     assert '201' in out and 'Recuperação manual' in out and not w.calls
+
+
+# --- cópia do índice fora do /tmp (pedido do coordenador d9d640a0; /tmp é tmpfs/RAM) -------------------------------
+
+def _copies(home):
+    base=home/'.cache'/'herdr-mesh-tools'/'tmp'
+    return base,(sorted(p.name for p in base.iterdir()) if base.exists() else [])
+
+
+def test_index_copy_lives_under_the_cache_dir_never_in_tmp_and_is_removed_after_use(world,monkeypatch,tmp_path):
+    ident=world.m.restart_identity
+    seen=[];kwargs=[]
+    real=ident.tempfile.TemporaryDirectory
+    def spy(*a,**k):
+        d=real(*a,**k);seen.append(d.name);kwargs.append(k);return d
+    monkeypatch.setattr(ident.tempfile,'TemporaryDirectory',spy)
+    home=Path(__import__('os').environ['HOME'])
+    with ident.thread_index() as (db,cols):
+        assert db.execute('SELECT count(*) FROM threads').fetchone()[0]==3
+        base,names=_copies(home)
+        assert len(names)==1 and names[0].startswith('herdr-restart-index-')
+    assert seen and all(s.startswith(str(base)+'/') for s in seen)
+    assert kwargs and all(k.get('dir')==base for k in kwargs)       # o diretorio e' passado explicitamente (nunca o padrao /tmp)
+    assert _copies(home)[1]==[]
+    assert oct(base.stat().st_mode & 0o777)=='0o700'
+
+
+def test_index_copy_is_removed_when_the_consumer_fails_or_the_copy_fails(world,monkeypatch):
+    ident=world.m.restart_identity;home=Path(__import__('os').environ['HOME'])
+    with pytest.raises(RuntimeError):
+        with ident.thread_index():
+            raise RuntimeError('consumidor')
+    assert _copies(home)[1]==[]
+    with pytest.raises(ident.Refused):
+        with ident.thread_index():
+            raise sqlite3.OperationalError('consulta')
+    assert _copies(home)[1]==[]
+    # falha inesperada DURANTE a copia (nao OSError/sqlite/Refused): a copia parcial tambem some
+    monkeypatch.setattr(ident.sqlite3,'connect',mock.Mock(side_effect=RuntimeError('inesperado')))
+    with pytest.raises(RuntimeError):
+        with ident.thread_index():
+            pass
+    assert _copies(home)[1]==[]
+
+
+def test_size_ceiling_is_kept_and_leaves_no_copy(world,monkeypatch):
+    ident=world.m.restart_identity;home=Path(__import__('os').environ['HOME'])
+    monkeypatch.setattr(ident,'MAX_COPY_BYTES',10)
+    with pytest.raises(ident.Refused):
+        with ident.thread_index():
+            pass
+    assert _copies(home)[1]==[]
+
+
+def test_stale_copies_from_dead_calls_are_swept_but_fresh_or_foreign_names_are_kept(world):
+    ident=world.m.restart_identity;home=Path(__import__('os').environ['HOME'])
+    base=ident.copy_base()
+    old=base/'herdr-restart-index-dead';old.mkdir();(old/'state_5.sqlite').write_bytes(b'x')
+    fresh=base/'herdr-restart-index-live';fresh.mkdir()
+    other=base/'outra-coisa';other.mkdir()
+    long_ago=__import__('time').time()-7200
+    for d in (old,other):__import__('os').utime(d,(long_ago,long_ago))
+    with ident.thread_index():
+        pass
+    assert not old.exists() and fresh.exists() and other.exists()
+
+
+def test_cache_dir_must_be_absolute_and_unwritable_base_is_refused(world,monkeypatch,tmp_path):
+    ident=world.m.restart_identity
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR','relativo')
+    with pytest.raises(ident.Refused,match='absoluto'):
+        ident.copy_base()
+    blocker=tmp_path/'arquivo';blocker.write_text('x')
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(blocker))
+    with pytest.raises(ident.Refused,match='indisponível'):
+        ident.copy_base()
+
+
+def test_live_copy_survives_the_sweep_even_when_old_and_before_sqlite_opens_it(world,monkeypatch):
+    # r207/rev-1 P2: idade nao prova abandono; a reserva (flock) da chamada viva protege a copia, tambem antes do connect
+    ident=world.m.restart_identity;home=Path(__import__('os').environ['HOME'])
+    real=ident.sqlite3.connect
+    def connect_after_sweep(path,*a,**k):
+        base=ident.copy_base()
+        for d in base.iterdir():
+            __import__('os').utime(d,(1,1))                  # envelhecida
+        now=__import__('time').time()
+        monkeypatch.setattr(ident.time,'time',lambda:now+7200)
+        ident.sweep_stale(base)
+        assert any(d.name.startswith('herdr-restart-index-') for d in base.iterdir())
+        return real(path,*a,**k)
+    monkeypatch.setattr(ident.sqlite3,'connect',connect_after_sweep)
+    with ident.thread_index() as (db,cols):
+        assert db.execute('SELECT count(*) FROM threads').fetchone()[0]==3
+        base=ident.copy_base()
+        assert len(list(base.iterdir()))==1                  # ainda viva durante o consumidor
+    assert _copies(home)[1]==[]
+
+
+def test_old_orphan_with_a_free_reservation_is_removed_but_a_held_one_is_not(world):
+    ident=world.m.restart_identity
+    base=ident.copy_base();os=__import__('os');time=__import__('time')
+    dead=base/'herdr-restart-index-dead';dead.mkdir(mode=0o700)
+    held=base/'herdr-restart-index-held';held.mkdir(mode=0o700)
+    for d in (dead,held):os.utime(d,(time.time()-7200,)*2)
+    fd=ident.hold_copy(held)
+    try:
+        ident.sweep_stale(base)
+        assert not dead.exists() and held.exists()
+    finally:os.close(fd)
+    ident.sweep_stale(base)
+    assert not held.exists()
+
+
+def test_preexisting_group_or_world_writable_base_is_refused_before_any_copy(world):
+    ident=world.m.restart_identity;home=Path(__import__('os').environ['HOME'])
+    base=ident.copy_base()
+    for mode in (0o777,0o770,0o722):
+        base.chmod(mode)
+        with pytest.raises(ident.Refused,match='gravável'):
+            with ident.thread_index():
+                pass
+        assert list(base.iterdir())==[]
+    base.chmod(0o700);ident.copy_base()
+    link=Path(__import__('os').environ['HOME'])/'.cache'/'herdr-mesh-tools'/'tmp'
+    link.rmdir();link.symlink_to(home)
+    with pytest.raises(ident.Refused):
+        ident.copy_base()
+
+
+def test_writable_ancestor_of_the_cache_is_refused_before_any_copy(world,monkeypatch,tmp_path):
+    # r208/rev-1 P2: um pai gravavel por terceiros permite trocar a base 0700 por symlink depois de validada
+    ident=world.m.restart_identity;os=__import__('os')
+    root=tmp_path/'cache-root';(root/'tmp').mkdir(parents=True,mode=0o700)
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(root))
+    root.chmod(0o777)
+    with pytest.raises(ident.Refused,match='ancestral.*gravável'):
+        with ident.thread_index():
+            pass
+    assert list((root/'tmp').iterdir())==[]
+    root.chmod(0o770)
+    with pytest.raises(ident.Refused,match='ancestral.*gravável'):
+        ident.copy_base()
+    root.chmod(0o1777)                                   # sticky (como /tmp): a troca por terceiros nao e' possivel
+    assert ident.copy_base()==root/'tmp'
+    root.chmod(0o700)
+    with ident.thread_index():
+        pass
+    assert list((root/'tmp').iterdir())==[]
+
+
+def test_ancestor_owned_by_another_user_or_symlink_of_a_third_party_is_refused(world,monkeypatch,tmp_path):
+    ident=world.m.restart_identity;os=__import__('os')
+    root=tmp_path/'dono';(root).mkdir(mode=0o700)
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(root))
+    ident.copy_base()
+    real=os.getuid()
+    monkeypatch.setattr(ident.os,'getuid',lambda:real+4242)     # os diretorios passam a ser "de outro dono"
+    with pytest.raises(ident.Refused,match='outro dono|inseguro'):
+        ident.copy_base()
+    monkeypatch.setattr(ident.os,'getuid',lambda:real)
+    target=tmp_path/'alvo';target.mkdir(mode=0o700)
+    link=tmp_path/'elo';link.symlink_to(target)
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(link))
+    assert ident.copy_base()==link/'tmp'                         # symlink NOSSO para diretorio nosso e' aceito
+    real_lstat=Path.lstat
+    def lstat(self,*a,**k):
+        r=real_lstat(self,*a,**k)
+        if self==link:
+            return os.stat_result((r.st_mode,r.st_ino,r.st_dev,r.st_nlink,real+4242,r.st_gid,r.st_size,0,0,0))
+        return r
+    monkeypatch.setattr(Path,'lstat',lstat)
+    with pytest.raises(ident.Refused,match='symlink de terceiro'):
+        ident.copy_base()
+
+
+def test_our_symlink_to_a_private_dir_under_a_writable_physical_parent_is_refused(world,monkeypatch,tmp_path):
+    # r209: so o alvo final do symlink era inspecionado; o pai fisico gravavel do alvo passava
+    ident=world.m.restart_identity;os=__import__('os')
+    pub=tmp_path/'publico';pub.mkdir();pub.chmod(0o777)
+    dest=pub/'privado';dest.mkdir(mode=0o700)
+    link=tmp_path/'elo';link.symlink_to(dest)
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(link))
+    with pytest.raises(ident.Refused,match='gravável'):
+        with ident.thread_index():
+            pass
+    assert list((dest/'tmp').iterdir())==[]                  # nada foi copiado
+    pub.chmod(0o700)
+    assert ident.copy_base()==link/'tmp'                    # cadeia toda confiavel: aceito
+
+
+def test_relative_and_chained_links_are_followed_and_an_unsafe_middle_hop_is_refused(world,monkeypatch,tmp_path):
+    ident=world.m.restart_identity
+    safe=tmp_path/'seguro';safe.mkdir(mode=0o700);final=safe/'final';final.mkdir(mode=0o700)
+    bad=tmp_path/'ruim';bad.mkdir();bad.chmod(0o777)
+    (bad/'meio').symlink_to(final)                          # elo intermediario dentro de diretorio gravavel
+    first=tmp_path/'primeiro';first.symlink_to('ruim/meio')   # destino relativo
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(first))
+    with pytest.raises(ident.Refused,match='gravável'):
+        ident.copy_base()
+    bad.chmod(0o700)
+    assert ident.copy_base()==first/'tmp'                   # encadeado e relativo, tudo confiavel
+    loop_a=tmp_path/'a';loop_b=tmp_path/'b'
+    loop_a.symlink_to('b');loop_b.symlink_to('a')
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(loop_a))
+    with pytest.raises(ident.Refused):
+        ident.copy_base()
+    monkeypatch.setenv('HERDR_MESH_CACHE_DIR',str(tmp_path/'x'/'..'/'y'))
+    with pytest.raises(ident.Refused,match='\\.\\.'):
+        ident.copy_base()

@@ -4,16 +4,99 @@ SQLite only opens a private copy: even mode=ro may create source WAL/SHM.
 This is a precondition check, not a lease against concurrent external starts.
 """
 from contextlib import contextmanager
+import fcntl
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import stat
 import tempfile
+import time
 
 from _herdr_restart_argv import _option, VALUE_OPTIONS, SWITCHES, SELECTORS, COMMANDS
 
 MAX_COPY_BYTES=512*1024*1024
+COPY_PREFIX='herdr-restart-index-'
+STALE_COPY_S=3600
 PROC_ROOT=Path('/proc')
+
+
+def _trusted_dir(p,t):
+    me=os.getuid()
+    if not stat.S_ISDIR(t.st_mode) or t.st_uid not in (0,me):raise Refused(f'ancestral do cache de outro dono: {p}')
+    if t.st_mode&0o022 and not t.st_mode&stat.S_ISVTX:raise Refused(f'ancestral do cache gravável por grupo/outros: {p}')
+
+
+def check_ancestors(path):
+    """Recusa cadeia em que um terceiro possa trocar um componente por symlink depois da validacao (r208/r209).
+    Resolve o caminho componente a componente, SEGUINDO cada symlink (relativos, encadeados, com limite de 8): todo
+    diretorio fisico visitado precisa ter dono root ou nosso e nao ser gravavel por grupo/outros (exceto com sticky, como /tmp);
+    todo symlink encontrado precisa ter dono root ou nosso. `..` e ciclos sao recusados (conservador)."""
+    me=os.getuid();cur=Path('/');links=0
+    try:_trusted_dir(cur,cur.stat())
+    except OSError as exc:raise Refused(f'ancestral do cache ilegível: {cur}: {exc}') from exc
+    pending=list(path.parts[1:])
+    while pending:
+        part=pending.pop(0)
+        if part in ('','.'):continue
+        if part=='..':raise Refused(f'caminho do cache com ..: {path}')
+        nxt=cur/part
+        try:
+            l=nxt.lstat()
+            if stat.S_ISLNK(l.st_mode):
+                if l.st_uid not in (0,me):raise Refused(f'symlink de terceiro no caminho do cache: {nxt}')
+                links+=1
+                if links>8:raise Refused(f'symlinks demais no caminho do cache: {path}')
+                target=os.readlink(nxt)
+                if os.path.isabs(target):cur=Path('/')
+                pending=[x for x in Path(target).parts if x!='/']+pending
+                continue
+            _trusted_dir(nxt,l)
+        except OSError as exc:raise Refused(f'ancestral do cache ilegível: {nxt}: {exc}') from exc
+        cur=nxt
+
+
+def copy_base():
+    """Diretorio das copias do indice: nunca o /tmp (tmpfs = RAM, ate 512 MB por chamada)."""
+    root=Path(os.environ.get('HERDR_MESH_CACHE_DIR') or Path.home()/'.cache'/'herdr-mesh-tools')
+    if not root.is_absolute():raise Refused('HERDR_MESH_CACHE_DIR deve ser absoluto')
+    base=root/'tmp'
+    try:
+        base.mkdir(parents=True,exist_ok=True,mode=0o700)
+        s=base.lstat()
+    except OSError as exc:raise Refused(f'diretório de cópias indisponível: {exc}') from exc
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid!=os.getuid():raise Refused('diretório de cópias inseguro')
+    if s.st_mode&0o022:raise Refused('diretório de cópias gravável por grupo/outros; recuse em vez de corrigir em silêncio')
+    check_ancestors(base)
+    return base
+
+
+def hold_copy(path):
+    """Reserva de uso da copia: flock exclusivo no proprio diretorio, solto pelo kernel se o processo morrer."""
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd);raise
+    return fd
+
+
+def sweep_stale(base):
+    """Remove sobras de chamadas mortas (SIGKILL/queda de energia): so diretorios proprios com o prefixo, nao-symlink,
+    parados ha mais de 1 h E cuja reserva de uso (flock) esteja livre. Uma chamada viva, mesmo pausada por horas,
+    segura a reserva e nunca e' apagada (a idade sozinha nao prova que a chamada morreu)."""
+    try:entries=list(base.iterdir())
+    except OSError:return
+    for e in entries:
+        fd=None
+        try:
+            s=e.lstat()
+            if not (e.name.startswith(COPY_PREFIX) and stat.S_ISDIR(s.st_mode) and s.st_uid==os.getuid()
+                    and time.time()-s.st_mtime>STALE_COPY_S):continue
+            fd=hold_copy(e)             # ocupada (BlockingIOError) = chamada viva: pula
+            shutil.rmtree(e,ignore_errors=True)
+        except OSError:continue
+        finally:
+            if fd is not None:os.close(fd)
 
 
 class Refused(ValueError):
@@ -41,10 +124,12 @@ def signature(path,optional=False):
 def thread_index():
     source=index_path();wal=Path(str(source)+'-wal');journal=Path(str(source)+'-journal')
     last=None
+    base=copy_base();sweep_stale(base)
     for _ in range(2):
-        tmp=tempfile.TemporaryDirectory(prefix='herdr-restart-index-')
-        db=None
+        tmp=tempfile.TemporaryDirectory(prefix=COPY_PREFIX,dir=base)
+        db=None;lock=None
         try:
+            lock=hold_copy(tmp.name)    # reserva de uso por TODO o contexto (copia + consumidor)
             before=(signature(source),signature(wal,True),signature(journal,True))
             if before[2] is not None:raise Refused('journal SQLite presente; não é seguro escolher sessão')
             if sum(x[2] for x in before if x)>MAX_COPY_BYTES:raise Refused('snapshot SQLite muito grande')
@@ -72,7 +157,14 @@ def thread_index():
         except (OSError,sqlite3.Error,Refused) as exc:
             if db is not None:db.close()
             tmp.cleanup();last=exc
+            if lock is not None:os.close(lock)
             continue
+        except BaseException:
+            # qualquer outra falha na copia tambem apaga a copia (a limpeza vale em todo caminho)
+            if db is not None:db.close()
+            tmp.cleanup()
+            if lock is not None:os.close(lock)
+            raise
         # Do not catch a consumer's validation error as a copy retry: a
         # contextmanager must yield exactly once, including failure paths.
         try:
@@ -80,7 +172,7 @@ def thread_index():
         except sqlite3.Error as exc:
             raise Refused(f'consulta de sessão recusada: {exc}') from exc
         finally:
-            db.close();tmp.cleanup()
+            db.close();tmp.cleanup();os.close(lock)
         return
     raise Refused(f'não foi possível ler índice de sessão: {last}')
 
