@@ -122,7 +122,14 @@ def main(argv=None):
         return 3 if result['code'] == 'worker_unavailable' else 0
     except (MessageError, OSError, UnicodeError, sqlite3.Error) as exc:
         # Never print subprocess output, payload or human composition in errors.
-        detail = str(exc) if isinstance(exc, MessageError) else type(exc).__name__
+        # sqlite3.Error leva so a mensagem do proprio SQLite ("database is locked"), que nao
+        # cita payload, caminho nem texto humano; ela distingue trava de corrupcao (11:27-11:30).
+        if isinstance(exc, MessageError):
+            detail = str(exc)
+        elif isinstance(exc, sqlite3.Error):
+            detail = f"{type(exc).__name__}: {exc}"
+        else:
+            detail = type(exc).__name__
         print(json.dumps(dict(code='error', detail=detail)), file=sys.stderr)
         return 1
 

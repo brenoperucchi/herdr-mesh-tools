@@ -72,3 +72,27 @@ def test_no_wait_option_is_exposed():
     with pytest.raises(SystemExit) as exc:
         cli.main(['send', 'b', '--subject', 'x', '--key', 'k', '--stdin', '--wait'])
     assert exc.value.code == 2
+def test_sqlite_error_detail_names_the_failure_but_never_leaks_payload(tmp_path, monkeypatch, capsys):
+    """11:27-11:30 de 18/11: `{"detail":"OperationalError"}` sem dizer se era trava ou corrupcao."""
+    import sqlite3
+    rt = SimpleNamespace(caller=lambda: endpoint('a'), scope='test')
+    monkeypatch.setattr(cli, 'Runtime', lambda **kw: rt)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(cli, 'Ledger', locked)
+    assert cli.main(['--state-dir', str(tmp_path / 's'), 'inbox']) == 1
+    err = capsys.readouterr().err
+    assert 'OperationalError: database is locked' in err
+
+
+def test_non_sqlite_oserror_detail_stays_type_only(tmp_path, monkeypatch, capsys):
+    rt = SimpleNamespace(caller=lambda: endpoint('a'), scope='test')
+    monkeypatch.setattr(cli, 'Runtime', lambda **kw: rt)
+
+    def boom(*a, **k):
+        raise OSError('/home/secret/path with body text')
+    monkeypatch.setattr(cli, 'Ledger', boom)
+    assert cli.main(['--state-dir', str(tmp_path / 's'), 'inbox']) == 1
+    err = capsys.readouterr().err
+    assert 'OSError' in err and 'secret' not in err

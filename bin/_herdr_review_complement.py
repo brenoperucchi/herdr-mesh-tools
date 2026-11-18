@@ -24,7 +24,11 @@ def manifest(round_dir):
             paths.append(root / name)
     snapshot = root / '_snapshot'
     if snapshot.exists():
-        paths.extend(p for p in snapshot.rglob('*') if not p.is_dir())
+        # Bytecode cache nao e' material: um revisor que importa o modulo congelado (python
+        # -c / pytest dentro do snapshot) cria __pycache__/*.pyc, e isso derrubou a rodada
+        # herdr-mesh-tools-186 como "material mudou" com os dois pareceres validos.
+        paths.extend(p for p in snapshot.rglob('*')
+                     if not p.is_dir() and not (p.suffix == '.pyc' and p.parent.name == '__pycache__'))
     paths.extend(root.glob('*/request.md'))
     if not paths:
         raise RuntimeError('rodada sem material congelado')
