@@ -70,8 +70,6 @@ def _modelo(args):
 
 def _modelo_canonico(modelo):
     return {
-        "sonnet": "sonnet-5",
-        "claude-sonnet-5": "sonnet-5",
         "opus": "opus-5",
     }.get(modelo, modelo)
 

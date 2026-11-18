@@ -59,7 +59,7 @@ ALLOWED_MODELS_BY_ROLE = {
     "rev-1": ("gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "claude-opus-5-5", "gpt-6.1-sol"),
     "rev-2": ("opus-5", "claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol"),
     "scout": ("gpt-6-astra", "fable-5", "opus-5", "gpt-6-sol", "claude-opus-5-5", "gpt-6.1-sol"),
-    "exec": ("sonnet-5", "claude-sonnet-5-5", "opus-5", "gpt-5.6-luna", "claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol"),
+    "exec": (core.SONNET_LATEST, "opus-5", "gpt-5.6-luna", "claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol"),
 }
 
 # Achado 2026-09-09 (consulta herdr-8, os dois revisores + pesquisa de preco):
@@ -71,11 +71,13 @@ ALLOWED_MODELS_BY_ROLE = {
 # Dai a regra: model E effort explicitos em TODO papel, sempre.
 # Default trocado em 2026-09-29 (pedido do Breno): Claude em Opus 5.5 low.
 # 2026-10-06 (Breno): exec Claude de Opus 5.5 low para SONNET 5.5 low.
-EXEC_ARGS = ["--model", "claude-sonnet-5-5", "--effort", "low"]
+EXEC_ARGS = ["--model", core.SONNET_LATEST, "--effort", "low"]
 
-# Perfil explícito do DRE após o swap de 2026-09-15. O ID completo evita que
-# uma restauração futura dependa do alias/default global do Claude Code.
-EXEC_ARGS_SONNET_5 = ["--model", "claude-sonnet-5", "--effort", "high"]
+# Perfil explícito do DRE após o swap de 2026-09-15, também usado por
+# herdr-mesh-tools-exec e cerebro-exec. Só o effort (high) difere de EXEC_ARGS, então
+# o nome diz o effort. O modelo vem da constante única (2026-11-18: o perfil antigo
+# fixava claude-sonnet-5, sem o -5, contra a regra "só a última versão do Sonnet").
+EXEC_ARGS_SONNET_HIGH = ["--model", core.SONNET_LATEST, "--effort", "high"]
 
 # Execs migrados pra Codex (2026-09-12). A matriz normativa de exec permite
 # `gpt-5.6-luna`; o esforço abaixo continua explícito apenas como parâmetro de
@@ -162,7 +164,7 @@ SPACES = [
     # cai no fallback "phase=legacy" de sempre. O exec foi trocado para
     # Claude Sonnet 5 em 2026-09-15; manter o perfil aqui evita que uma
     # restauração sem pane-base reverta o swap.
-    ("khr-dre", f"{HOME}/Devs/Khronos/DRE", ("khr-dre-exec", "claude", EXEC_ARGS_SONNET_5),
+    ("khr-dre", f"{HOME}/Devs/Khronos/DRE", ("khr-dre-exec", "claude", EXEC_ARGS_SONNET_HIGH),
         ("khr-dre-scout", "codex", SCOUT_ARGS), "khr-dre", {"lean": True}),
     # claude-bridge: o proprio orquestrador (Fluxo B). cwd e' o repo de codigo
     # real (~/Devs/claude-bridge), nao o dir de runtime (~/.claude-bridge, so

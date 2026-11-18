@@ -1547,6 +1547,11 @@ _RUNTIME_EFFORTS = "minimal|low|medium|high|xhigh|max"
 # ``gpt-5.6-luna max · ~/repo``).  Requiring the line boundary and the footer
 # separator prevents a handoff sentence such as ``use gpt-6-astra low for ...``
 # from becoming an effective runtime reading.
+# Regra de 2026-11-18: todo Sonnet aberto, trocado ou restaurado pelo mesh
+# usa a ULTIMA versao. Esta e' a unica constante: a proxima versao e' uma troca so aqui.
+# O teste tests/test_sonnet_latest_invariant.py falha se algum caminho divergir.
+SONNET_LATEST = "claude-sonnet-5-5"
+
 _RUNTIME_MODEL = r"(?:gpt[-a-z0-9.]*[a-z0-9]|o[0-9][a-z0-9.-]*|claude[-a-z0-9.]*[a-z0-9]|sonnet[-a-z0-9.]*[a-z0-9]|opus[-a-z0-9.]*[a-z0-9])"
 _RUNTIME_FOOTER_RE = re.compile(
     rf"^\s*(?:[•●]\s*)?(?P<model>{_RUNTIME_MODEL})\s+"

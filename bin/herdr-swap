@@ -411,7 +411,7 @@ def _runtime_start_args(kind, profile, *, explicit=False):
         # Status renders friendly names (`Opus 5`, `Sonnet 5`); launch accepts
         # the stable aliases used by the bootstrap table.
         # "opus-5" deixou de ser aceito pelo CLI (2026-10-04); o status "Opus 5" passa a lançar claude-opus-5-5.
-        launch_model = {"opus5": "claude-opus-5-5", "sonnet5": "sonnet-5"}.get(
+        launch_model = {"opus5": "claude-opus-5-5", "sonnet5": core.SONNET_LATEST}.get(
             canonical, model
         )
         return ["--model", launch_model, "--effort", effort]

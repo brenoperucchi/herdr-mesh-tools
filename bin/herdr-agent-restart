@@ -36,8 +36,8 @@ import _herdr_probe_cache as probe_cache  # noqa: E402
 from _herdr_restart_argv import codex_options, explicit_cwds
 
 EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
-MODEL_OK = re.compile(r"^(claude-[a-z0-9.-]+|sonnet-5|gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*)$")
-MODELOS_MORTOS = {"opus-5"}      # o CLI do Claude recusa (2026-10-04)
+MODEL_OK = re.compile(r"^(claude-[a-z0-9.-]+|gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*)$")
+MODELOS_MORTOS = {"opus-5", "sonnet-5", "claude-sonnet-5"}  # opus-5: o CLI recusa (2026-10-04); sonnet-5*: nao e a ultima versao (2026-11-18)
 CACHE_MAX_H = 48                 # leitura de sonda mais velha que isso nao decide perfil
 FONTES_CONFIAVEIS = ("pane", "thread-confirmado")
 DEMORA_SEPARADO_S = 25
