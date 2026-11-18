@@ -12,7 +12,10 @@ O comando descobre sozinho: o pane, o id da sessão e o modelo/esforço. O perfi
 de: (1) --model/--effort; (2) o cache da sonda do `herdr-agents` (`herdr-probe`, que roda por
 timer), se a leitura é recente e confiável; (3) o argv do processo vivo; (4) a matriz do bootstrap
 para o papel. A saída diz de qual fonte veio cada valor. Nunca inventa uma sessão: sem id de sessão
-ele recusa.
+ele recusa. Para Codex, a sessão deve existir no índice threads com cwd exato
+(realpath) igual ao pane e não pode estar em outro processo resume fora dele.
+Sem sessão no agent get, só --dry-run sugere por cwd; aplicar exige --session.
+Essas guardas são obrigatórias mesmo com --force.
 
 Segurança (mesmas guardas do herdr-can-send): recusa agent working/blocked, rascunho humano ou
 diálogo na caixa; a sugestão automática do Claude NÃO conta como rascunho. O processo é encerrado
@@ -20,19 +23,27 @@ com SIGTERM, nunca por `/exit` digitado na caixa. `--force` ignora as recusas. S
 pane de quem roda o comando, o reinício sai separado e acontece cerca de 25 s depois.
 """
 import argparse
+import importlib.util
 import datetime
 import json
 import os
 import re
 import signal
+import select
+import shlex
 import subprocess
 import sys
 import time
 from importlib.machinery import SourceFileLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _herdr_dispatch as core  # noqa: E402
+import _herdr_dispatch as core
+import _herdr_review_groups as review_groups
+import _herdr_review_handshake as codex_handshake  # noqa: E402
+import _herdr_review_wake as review_wake  # noqa: E402
+import _herdr_restart_guard as restart_guard  # noqa: E402
 import _herdr_probe_cache as probe_cache  # noqa: E402
+import _herdr_restart_identity as restart_identity
 from _herdr_restart_argv import codex_options, explicit_cwds
 
 EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
@@ -45,7 +56,11 @@ DEMORA_SEPARADO_S = 25
 
 def bootstrap():
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-bootstrap")
-    return SourceFileLoader("herdr_bootstrap_for_restart", path).load_module()
+    loader = SourceFileLoader("herdr_bootstrap_for_restart", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)  # load_module() sai no Python 3.15
+    return module
 
 
 # ------------------------------------------------------------------ perfil
@@ -237,6 +252,8 @@ def sessao_de(info, argv):
     sid = (info.get("agent_session") or {}).get("value")
     if sid:
         return sid
+    if info.get('agent')=='codex':
+        return None  # Never promote a process argv selector to native session proof.
     for k in ("--resume", "resume"):
         if k in (argv or []) and (argv.index(k) + 1) < len(argv):
             return argv[argv.index(k) + 1]
@@ -266,6 +283,23 @@ def tela(pane, n=30):
     r = subprocess.run(core.herdr_argv("pane", "read", pane, "--source", "visible", "--lines", str(n)),
                        capture_output=True, text=True, timeout=core.CLI_TIMEOUT_S)
     return r.stdout
+
+
+def prender(pid):
+    """pidfd da instancia que vai ser validada: o sinal vai por ele, nunca pelo numero (reuso de PID)."""
+    return os.pidfd_open(pid)
+
+
+def soltar(handle):
+    try:os.close(handle)
+    except OSError:pass
+
+
+def encerrar_preso(handle, espera_s=15):
+    signal.pidfd_send_signal(handle, signal.SIGTERM)
+    poll = select.poll()
+    poll.register(handle, select.POLLIN)
+    return bool(poll.poll(int(espera_s * 1000)))  # legivel quando o processo termina
 
 
 def encerrar(pid, espera_s=15):
@@ -309,7 +343,7 @@ def log_restart(reg):
         pass
 
 
-def reiniciar(info, kind, session, model, effort, old_pid, old_argv):  # old_pid None = agent ja saiu
+def reiniciar(info, kind, session, model, effort, old_pid, old_argv, *, expected_process=None):  # old_pid None = agent ja saiu
     pane, name = info["pane_id"], info["name"]
     # Validate the complete launch contract BEFORE any SIGTERM.
     try:
@@ -324,21 +358,81 @@ def reiniciar(info, kind, session, model, effort, old_pid, old_argv):  # old_pid
                     raise ValueError("-C/--cd diverge da raiz observada do agent")
     except (SystemExit, ValueError) as exc:
         return False, f"restart recusado antes de encerrar o processo: {exc}"
+    handle=None
+    if kind=='codex':
+        try:
+            if old_pid is not None:
+                handle=prender(old_pid)  # antes da validacao final: a instancia validada e' a que recebe o sinal
+            witness=validar_codex(info,session,old_pid)
+            if expected_process is not None and witness['pid_start']!=expected_process['pid_start']:
+                raise restart_identity.Refused('processo alvo mudou antes de encerrar')
+        except (restart_identity.Refused,RuntimeError,OSError) as exc:
+            if handle is not None:soltar(handle)
+            return False,f'restart recusado antes de encerrar o processo: {exc}'
     args = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *extra]
+    recovery=shlex.join(core.herdr_argv(*args))
+    def failed_after_stop(reason):
+        return False,f'{reason}\nRecuperação manual: {recovery}'
     if old_pid is not None:
-        if not encerrar(old_pid):
-            return False, f"o processo {old_pid} nao saiu com SIGTERM; nada mais foi feito"
+        try:
+            stopped=encerrar_preso(handle) if handle is not None else encerrar(old_pid)
+        except OSError as exc:
+            return failed_after_stop(f'encerramento sem confirmação: {exc}')
+        finally:
+            if handle is not None:soltar(handle)
+        if not stopped:
+            return failed_after_stop(f"o processo {old_pid} não saiu em 15 s depois do SIGTERM; se sair depois, use")
         time.sleep(1.5)
     ultimo = ""
     for _ in range(6):
-        r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)
+        if kind=='codex':
+            try:
+                restart_identity.unique_session(info,session,agentes())
+                pane_info=core.api('pane','get',pane).get('pane')
+                process_info=core.api('pane','process-info','--pane',pane).get('process_info')
+                restart_identity.after_stop(witness,pane_info,process_info)
+            except Exception as exc:  # noqa: BLE001 - depois do SIGTERM nunca sair sem o comando de recuperacao
+                return failed_after_stop(f'religamento recusado pela guarda de sessão: {exc}')
+        try:
+            r = subprocess.run(core.herdr_argv(*args), capture_output=True, text=True, timeout=150)
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            return failed_after_stop(f'agent start sem resultado confirmado; não repetir automaticamente: {exc}')
         ultimo = (r.stderr or r.stdout).strip()
         if r.returncode == 0:
             return True, "ok"
+        if kind=='codex':
+            # Codigo != 0 da CLI nao prova que o start nao foi admitido (a falha pode ser do acompanhamento
+            # depois da admissao): Codex nunca repete automaticamente (achado r59/rev-1, P1).
+            return failed_after_stop(f'agent start retornou erro; resultado desconhecido, não repetir automaticamente: {ultimo[:160]}')
         time.sleep(2.5)
-    return False, (f"agent start falhou (o processo antigo JA foi encerrado; retome com "
-                   f"`--resume {session}`): {ultimo[:160]}")
+    return failed_after_stop(f'agent start falhou (o processo antigo já foi encerrado): {ultimo[:160]}')
 
+
+
+def validar_codex(info,session,old_pid):
+    observed_info=info
+    if not info.get('_orfao'):
+        current=core.get_agent_info(info['pane_id'])
+        for field in ('name','pane_id','terminal_id','workspace_id','tab_id','agent'):
+            if current.get(field)!=info.get(field):
+                raise restart_identity.Refused(f'identidade do pane mudou: {field}')
+        if restart_identity.pane_cwd(current)!=restart_identity.pane_cwd(info):
+            raise restart_identity.Refused('cwd do pane mudou antes do restart')
+        before=(info.get('agent_session') or {}).get('value')
+        after=(current.get('agent_session') or {}).get('value')
+        if before!=after and not (before is None and after==session):
+            raise restart_identity.Refused('sessão registrada mudou antes do restart')
+    else:
+        current=core.api('pane','get',info['pane_id']).get('pane')
+        if (not isinstance(current,dict) or current.get('pane_id')!=info['pane_id']
+                or restart_identity.pane_cwd(current)!=restart_identity.pane_cwd(info)
+                or current.get('agent') not in (None,'unknown') or current.get('agent_session')):
+            raise restart_identity.Refused('pane órfão não está livre no cwd esperado')
+        observed_info={**info,**{f:current.get(f) for f in ('terminal_id','workspace_id','tab_id')}}
+    process_info=core.api('pane','process-info','--pane',info['pane_id']).get('process_info')
+    witness=restart_identity.validate(observed_info,session,old_pid,process_info)
+    restart_identity.unique_session(info,session,agentes())
+    return witness
 
 def lista(agents, procs, cache):
     linhas = []
@@ -361,10 +455,17 @@ def main():
     ap.add_argument("--model", help="modelo (ex.: claude-sonnet-5-5, gpt-6.1-sol)")
     ap.add_argument("--effort", help="esforco: low|medium|high|xhigh|max")
     ap.add_argument("--list", action="store_true", help="lista o perfil que seria usado para cada agent")
-    ap.add_argument("--session", help="id da sessao a retomar (so se o agent ja saiu e o ledger nao a tem)")
+    ap.add_argument("--session", help="sessão explícita; obrigatória no Codex se agent get não tiver sessão, com cwd validado")
     ap.add_argument("--_separado", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.list or args.dry_run:
+        return run(args, None)
+    # um unico contexto de prova/rota envolve autorizacao, leitura e reinicio
+    with review_wake.proven_caller_context(os.environ) as caller_pane:
+        return run(args, caller_pane)
 
+
+def run(args, caller_pane, _snapshot=None):
     agents, procs, cache = agentes(), processos(), probe_cache.ler()
     if args.list:
         print(f"{'agent':24}{'pane':9}{'status':9}{'kind':8}{'sessao':10}{'perfil':22}fonte")
@@ -376,15 +477,56 @@ def main():
     name, pane, kind = info.get("name"), info["pane_id"], info["agent"]
     if not name:
         raise SystemExit(f"o agent do pane {pane} nao tem nome: rode `herdr-fix-names` primeiro")
+    if not args.dry_run:
+        if _snapshot is not None and (restart_guard.identity(info) != _snapshot["target"]
+                                      or restart_guard.caller_snapshot(core, caller_pane) != _snapshot["caller"]):
+            # r196 rev-1: depois do atraso, outro ocupante do pane NAO herda a autorizacao do chamador original
+            print("RECUSADO: o agent (alvo ou chamador) mudou durante o atraso; nada foi reiniciado.", file=sys.stderr)
+            return 1
+        refusal = restart_guard.authorize(name, info, caller_pane, core, codex_handshake)
+        if refusal:
+            print(f"RECUSADO: {refusal}", file=sys.stderr)
+            return 1
+        if args._separado and _snapshot is None:
+            # Helper do proprio pane: autorizado com o pai ainda vivo (prova nativa); avisa o pai, espera o
+            # atraso e RECOMECA com leituras novas, mantendo o caller provado em memoria.
+            snapshot = {"target": restart_guard.identity(info),
+                        "caller": restart_guard.caller_snapshot(core, caller_pane)}
+            restart_guard.signal_ready()
+            time.sleep(DEMORA_SEPARADO_S)
+            return run(args, caller_pane, _snapshot=snapshot)
     pid, comm, argv = procs.get(pane, (None, kind, []))
     orfao = bool(info.get("_orfao"))
-    if pid is None and not orfao:
-        raise SystemExit(f"nao achei o processo {kind} do pane {pane}")
     if orfao:
         print(f"{name} nao esta na lista (saiu): usando o ultimo estado conhecido (visto {info.get('_visto_em')})")
-    session = args.session or sessao_de(info, argv)
+    witness=None
+    registered=(info.get('agent_session') or {}).get('value') if not orfao else None
+    if kind=='codex' and not args.session and not registered:
+        if not args.dry_run:
+            raise SystemExit(f'{name}: agent get sem sessão; informe --session <id>; use --dry-run para sugestão por cwd exato')
+        try:
+            table=restart_identity.process_table()
+            try:process_info=core.api('pane','process-info','--pane',pane).get('process_info')
+            except (RuntimeError,ValueError,OSError):process_info=None
+            own=restart_identity.pane_pids(table,process_info)   # so a prova nativa; a pista de ambiente nao vira 'proprio'
+            suggestion=restart_identity.latest(info,exclude=restart_identity.sessions_in_use(info,agents,table,own),
+                                               own_pids=own,table=table)
+        except (restart_identity.Refused,OSError) as exc:raise SystemExit(str(exc)) from exc
+        if not suggestion:raise SystemExit(f'{name}: nenhuma sessão com cwd exato; informe --session <id>')
+        print(f"dry-run: sugestão por cwd exato: pane={pane} sessão={suggestion['session']} cwd={suggestion['cwd']}")
+        print(f"Para aplicar é obrigatório informar --session {suggestion['session']}; nenhuma sessão foi escolhida automaticamente.")
+        return 0
+    if kind=='codex' and args.session and registered and args.session!=registered:
+        raise SystemExit(f'{name}: --session {args.session} diverge da sessão registrada {registered}; '
+                         'nada foi encerrado (trocar de conversa deliberadamente não é suportado aqui)')
+    session = args.session or (registered if kind=='codex' else sessao_de(info,argv))
     if not session:
         raise SystemExit(f"{name} nao tem sessao registrada (nunca teve um turno?): nao ha o que retomar")
+    if pid is None and not orfao:
+        raise SystemExit(f"nao achei o processo {kind} do pane {pane}")
+    if kind=='codex':
+        try:witness=validar_codex(info,session,pid)
+        except (restart_identity.Refused,RuntimeError,OSError) as exc:raise SystemExit(f'restart recusado: {exc}') from exc
     model, effort, fonte = resolve_profile(name, kind, argv, cache.get(name), None, args.model, args.effort)
 
     print(f"agent   : {name}  ({kind}, pane {pane}, {info['agent_status']})")
@@ -404,15 +546,24 @@ def main():
         print("dry-run: nada foi encerrado.")
         return 0
 
-    if os.environ.get("HERDR_PANE_ID") == pane and not args._separado:
-        cmd = ["bash", "-c", f"sleep {DEMORA_SEPARADO_S}; exec {sys.executable} {os.path.abspath(__file__)} "
-               f"{pane} --force --model {model} --effort {effort} --_separado"]
-        subprocess.Popen(cmd, stdout=open("/dev/null", "w"), stderr=open("/dev/null", "w"),
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+    if caller_pane == pane and not args._separado:
+        delayed=[sys.executable,os.path.abspath(__file__),pane,'--force','--model',model,
+                 '--effort',effort,'--_separado']
+        if kind=='codex':delayed.extend(['--session',session])
+        # o pai fica vivo ate o helper provar a cadeia (ancestria) e a autorizacao: ver _herdr_restart_guard
+        helper = subprocess.Popen(delayed, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, start_new_session=True)
+        ok, linha = restart_guard.wait_ready(helper)
+        if not ok:
+            helper.kill()
+            print("FALHA: o reinício separado não confirmou a autorização; nada foi reiniciado."
+                  + (f" Motivo do helper: {linha}" if linha else ""), file=sys.stderr)
+            return 1
         print(f"este e' o seu proprio pane: o reinicio sai separado, em ~{DEMORA_SEPARADO_S} s. Nao digite nada ate voltar.")
         return 0
 
-    ok, msg = reiniciar(info, kind, session, model, effort, pid, argv)
+    ok, msg = reiniciar(info, kind, session, model, effort, pid, argv,
+                        **({"expected_process":witness} if kind=="codex" else {}))
     if not ok:
         print(f"FALHA: {msg}")
         log_restart({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": name, "ok": False, "msg": msg})
@@ -425,6 +576,14 @@ def main():
           f"status={novo.get('agent_status')} sessao={'igual' if sid_novo in (None, session) else sid_novo}")
     if dialogos:
         print("dialogos tratados: " + "; ".join(dialogos))
+    if kind == "codex" and sid_novo is None:
+        # Codex religado volta sem agent_session ate o primeiro turno: sem ela o herdr-message e o
+        # herdr-review recusam o agent. Faz o primeiro turno controlado agora (handshake revisado).
+        # vinculo ANTERIOR ao restart (info), nunca a leitura posterior
+        h_status, h_detail = codex_handshake.after_restart(
+            name, pane, info.get("terminal_id"), core, review_groups,
+            expected_cwd=restart_identity.pane_cwd(info))
+        print(f"handshake: {h_status}" + (f" ({h_detail})" if h_detail else ""))
     if kind == "claude" and "Yes, I trust this folder" in tela(pane):
         print("ATENCAO: o Claude pediu confianca na pasta; aprove na mao (nao aprovo por voce).")
     log_restart({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "agent": name, "pane": pane,
