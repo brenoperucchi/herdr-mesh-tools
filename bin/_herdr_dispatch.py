@@ -272,6 +272,36 @@ def _is_agent_not_found(exc):
     return "agent_not_found" in str(exc).casefold()
 
 
+def wait_quiescent(name, *, quiet_s=4.0, timeout_s=120, sleep=time.sleep, monotonic=time.monotonic):
+    """Espera um agent recem-restaurado ficar IDLE sem nenhuma mudanca de ciclo por `quiet_s`.
+
+    Achado llm-gateway-26 (2026-11-18 11:05): `_wait_restored_agent` devolve no primeiro
+    idle, mas o reforco de papel enviado pelo bootstrap pode ainda nao ter comecado a rodar.
+    O snapshot do dispatch pegava idle, o agent virava working 0,4 s depois (o proprio turno
+    de boot), a guarda de envio via mudanca de metadata e abortava (`preflight_aborted`):
+    nada entregue, revisor parado em "pronto para receber uma revisao". Exigir idle estavel
+    (mesmo state_change_seq) fecha a janela. Devolve o ultimo info observado."""
+    deadline = monotonic() + timeout_s
+    stable_since = None
+    seq = None
+    while True:
+        info = get_agent_info(name)
+        status = effective_status(info)
+        cur = info.get("state_change_seq")
+        if status in ("idle", "done") and cur == seq and stable_since is not None:
+            if monotonic() - stable_since >= quiet_s:
+                return info
+        elif status in ("idle", "done"):
+            stable_since, seq = monotonic(), cur
+        else:
+            stable_since, seq = None, None
+            if status == "blocked":
+                raise AgentRestoreError(f"agent '{name}' ficou blocked ao estabilizar após a recuperação")
+        if monotonic() >= deadline:
+            raise AgentRestoreError(f"agent '{name}' não estabilizou em idle em {timeout_s}s após a recuperação")
+        sleep(0.5)
+
+
 def _wait_restored_agent(name, timeout_s=AGENT_RESTORE_TIMEOUT_S, *, startup_confirmed=False):
     """Espera um agent criado pelo bootstrap chegar a um estado assentado.
 

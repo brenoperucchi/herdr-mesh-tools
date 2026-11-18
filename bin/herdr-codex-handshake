@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Primeiro turno controlado de UM Codex reciclado, para ele ganhar `agent_session`.
+
+Uso: herdr-codex-handshake <nome-do-agent>     (ex.: llm-gateway-exec, lastro-rust-rev-1)
+
+Um Codex reciclado volta sem `agent_session`; sem ela o herdr-message recusa o endpoint
+(`identity_unproven: session missing`) e o herdr-review recusa o revisor. Este comando faz o
+mesmo handshake que o herdr-review passou a fazer sozinho (ver _herdr_review_handshake.py):
+herdr-can-send=0, recibo por processo, um unico prompt de papel, espera a sessao nativa.
+So para Codex ocioso/pronto e sem sessao; um agent por chamada; nunca reenvia (recibo).
+Quem pode rodar: agent do PROPRIO space do alvo, herdr-exec e coordenador (recusa nos demais e se quem roda
+nao for comprovado). Rode de dentro do projeto do space do alvo (a raiz vem do diretorio atual, nao do alvo).
+Papeis de grupo registrado usam a hidratacao inicial do bootstrap, nao este comando.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__))))
+import _herdr_dispatch as core  # noqa: E402
+import _herdr_review_groups as review_groups  # noqa: E402
+import _herdr_review_handshake as hs  # noqa: E402
+import _herdr_review_wake as review_wake  # noqa: E402
+
+def split_name(name):
+    return hs.split_name(name)
+
+
+def caller_identity(pane):
+    """(nome, cwd) do agent do pane provado; (None, None) se nao der para ler."""
+    if not pane:
+        return None, None
+    try:
+        info = core.get_agent_info(pane)
+        return info.get("name"), info.get("cwd")
+    except Exception:  # noqa: BLE001 - sem leitura = nao comprovado
+        return None, None
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    name = argv[0]
+    slug, role = split_name(name)
+    if slug is None:
+        print(f"erro: '{name}' não termina em um papel conhecido {hs.ROLES}", file=sys.stderr)
+        return 2
+    # Um unico contexto de caller/rota envolve autorizacao, leitura do alvo, guarda, recibo e envio
+    # (achado r191 rev-1). So a prova nativa vale; HERDR_PANE_ID e' pista que precisa coincidir.
+    with review_wake.proven_caller_context(os.environ) as pane:
+        caller, caller_cwd = caller_identity(pane)
+        refusal = hs.authorize_caller(name, caller)
+        if refusal:
+            print(f"recusado: {refusal}", file=sys.stderr)
+            return 1
+        return run(name, slug, caller, caller_cwd)
+
+
+def run(name, slug, caller, caller_cwd):
+    try:
+        info = core.get_agent_info(name)
+        # Raiz do INVOCADOR, como o dispatcher: validate_agent_project recusa um alvo cujo cwd
+        # aponte para outro projeto (derivar do proprio alvo tornaria a checagem uma tautologia
+        # e diria ao agent que o diretorio errado e' a raiz do papel). Cross-space = cd explicito.
+        root = core.project_root(os.getcwd())
+        if caller not in hs.CROSS_SPACE_CALLERS and core.project_root(caller_cwd or "") != root:
+            # o prefixo do nome nao prova associacao ao space: o projeto do caller tem que ser o do alvo
+            print(f"recusado: o projeto de '{caller}' não é o do alvo", file=sys.stderr)
+            return 1
+        siblings = [f"{slug}-{r}" for r in ("exec", "rev-1", "rev-2") if f"{slug}-{r}" != name]
+        if not hs.needs_handshake(info):
+            print(f"{name}: nada a fazer (agent={info.get('agent')}, status={info.get('agent_status')}, "
+                  f"sessão={'presente' if info.get('agent_session') else 'ausente'}, "
+                  f"interactive_ready={info.get('interactive_ready')})")
+            return 0
+        result = hs.ensure_session(name, root, slug, siblings, core, review_groups, timeout_s=150)
+    except RuntimeError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"{name}: sessão nativa assentada: {result['agent_session']['value']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

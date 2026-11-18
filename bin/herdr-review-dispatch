@@ -33,6 +33,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_review_handshake as review_handshake
 import _herdr_review_wake as review_wake
 import _herdr_review_groups as review_groups
 import _herdr_dispatch as core
@@ -486,17 +487,8 @@ def run(args, scope):
         if args.revisor:
             required_names = [rev_name if args.revisor == "rev-1" else rev2_name]
         else:
-            ready, missing = [], []
-            for name in required_names:
-                try:
-                    info = review_candidate(name, agent_root)
-                    if core.effective_status(info) in ("idle", "done"):
-                        ready.append(name)
-                except RuntimeError as exc:
-                    if core._is_agent_not_found(exc):
-                        missing.append(name)
-                    # A mismatched existing pane is never a candidate.
-            candidates = ready or missing
+            candidates = review_handshake.select_level1_candidates(
+                required_names, agent_root, core, review_groups, review_candidate)
             if not candidates:
                 print("erro: nenhum revisor idle/done ou ausente recuperável", file=sys.stderr)
                 sys.exit(1)
@@ -534,6 +526,15 @@ def run(args, scope):
             try:
                 agent_restore[name] = core.ensure_required_agents(args.slug, agent_root, [name], selected_only=True,
                                                                  **({"review_repo": cwd} if scope else {}))
+                # Codex reciclado volta sem sessão nativa até o primeiro turno (cerebro-195,
+                # lastro-rust-280): faz o aperto de mão uma vez em vez de recusar o revisor.
+                if agent_restore[name] and agent_restore[name].get("restored"):
+                    # Recem-restaurado: espera o turno de boot assentar antes do snapshot.
+                    core.wait_quiescent(name)
+                review_handshake.ensure_session(
+                    name, agent_root, args.slug,
+                    [n for n in (f"{args.slug}-exec", rev_name, rev2_name) if n != name],
+                    core, review_groups)
                 info = review_candidate(name, agent_root)
                 if group:
                     review_groups.validate_member(group_binding, name, info, core)

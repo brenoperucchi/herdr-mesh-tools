@@ -46,6 +46,8 @@ def cli(tmp_path, monkeypatch):
             states.setdefault(name, 'idle')
         return {'restored': names}
     monkeypatch.setattr(mod.core, 'ensure_required_agents', restore)
+    # wait_quiescent tem testes proprios (test_review_handshake); aqui seria espera real.
+    monkeypatch.setattr(mod.core, 'wait_quiescent', lambda n, **k: info(n))
     def dispatch(prompts, timeout, required_artifacts, **kw):
         sent.extend(prompts)
         for name, path in required_artifacts.items():
