@@ -427,3 +427,49 @@ def test_freeze_inventory_failure_aborts_before_any_delivery(cli, monkeypatch, p
     assert len(calls) == 1
     assert not list(root.glob('.herdr/review/*/metrics.json'))
     assert not list(root.glob('.herdr/review/*/request.md'))
+
+
+def test_round_end_records_the_wake_outcome_and_keeps_the_exit_code(cli, monkeypatch):
+    # Pedido 11:50: o fim da rodada acorda o exec; sem HERDR_PANE_ID do exec, so registra "skipped".
+    monkeypatch.delenv('HERDR_PANE_ID', raising=False)
+    _, states, sent, restored, run, _ = cli
+    code, metrics = run('--nivel', '2')
+    assert code == 0 and metrics['wake']['status'] in ('skipped', 'refused')
+
+
+def test_round_end_wakes_the_owner_exec_with_the_round_summary(cli, monkeypatch):
+    mod, states, sent, restored, run, _ = cli
+    states['sample-exec'] = 'idle'
+    monkeypatch.setenv('HERDR_PANE_ID', 'w:px')
+    real_info = mod.core.get_agent_info
+    monkeypatch.setattr(mod.core, 'get_agent_info',
+                        lambda n: {**real_info('sample-rev-1'), 'name': n, 'pane_id': 'w:px'} if n == 'sample-exec' else real_info(n))
+    calls = []
+    monkeypatch.setattr(mod.core, 'api', lambda *a: calls.append(a))
+    code, metrics = run('--nivel', '2')
+    assert code == 0 and metrics['wake']['status'] == 'delivered'
+    assert calls and calls[-1][:3] == ('agent', 'prompt', 'w:px')
+    assert 'rev-1=APPROVE' in calls[-1][3] and 'completa' in calls[-1][3]
+
+
+def test_the_wake_runs_after_the_space_reservation_is_released(cli, monkeypatch):
+    # r204/rev-2: a espera de ate 300 s pelo exec nao pode prender a reserva do space
+    mod, states, sent, restored, run, _ = cli
+    state = {"open": False, "open_at_wake": None, "calls": 0}
+    import contextlib
+
+    @contextlib.contextmanager
+    def reservation(scope, core):
+        state["open"] = True
+        try:
+            yield
+        finally:
+            state["open"] = False
+    monkeypatch.setattr(mod.review_scope, "reservation", reservation)
+
+    def fake_wake_round(round_dir, slug, core, coordinator, *, own_pane, publish=None):
+        state["open_at_wake"], state["calls"] = state["open"], state["calls"] + 1
+        return {"status": "delivered"}
+    monkeypatch.setattr(mod.review_wake, "wake_round", fake_wake_round)
+    code, _metrics = run('--nivel', '2')
+    assert code == 0 and state["calls"] == 1 and state["open_at_wake"] is False

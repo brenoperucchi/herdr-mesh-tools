@@ -28,9 +28,12 @@ import os
 import re
 import shutil
 import subprocess
+import time
+from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _herdr_review_wake as review_wake
 import _herdr_review_groups as review_groups
 import _herdr_dispatch as core
 import _herdr_migration as migration
@@ -354,13 +357,48 @@ def main():
         ap.error("--reviewer exige --verify; use --revisor no nível 1")
 
     core.require_herdr_pane()
+    _PENDING_WAKE.clear()
+    code = 0
+    scope = None
     try:
         scope = review_scope.resolve(args.slug, args.repo, os.getcwd(), core)
         with review_scope.reservation(scope, core):
-            return run(args, scope)
+            run(args, scope)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     except (RuntimeError, OSError, ValueError) as exc:
         print(f"erro: {exc}", file=sys.stderr)
-        sys.exit(1)
+        code = 1
+    if _PENDING_WAKE:
+        _run_pending_wake(args, scope)
+    sys.exit(code)
+
+
+_PENDING_WAKE = {}
+
+
+def _run_pending_wake(args, scope):
+    """Aviso ao exec FORA da reserva do space (r204/rev-2). Nao altera o exit code. A gravacao em metrics.json
+    pega a reserva so por um instante (relendo e mesclando), para nao restaurar metricas antigas."""
+    round_dir, silent = _PENDING_WAKE.get("round_dir"), _PENDING_WAKE.get("silent")
+
+    def publish(wake):
+        # Reserva da RODADA (a mesma do complemento), valida tambem sem scope (r205/rev-1). Pega so aqui,
+        # depois da espera e da entrega; ocupada = tenta por ate 15 s, senao nao grava nada.
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                with complement.reservation(Path(round_dir).resolve()):
+                    return review_wake._merge_wake(os.path.join(round_dir, "metrics.json"), wake, core)
+            except RuntimeError as exc:
+                if "complemento já em andamento" not in str(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+    with review_wake.caller_context(os.environ) as own_pane:
+        wake = review_wake.wake_round(round_dir, args.slug, core, review_groups.coordinator_name(args.slug),
+                                      own_pane=own_pane, publish=publish)
+    if not silent:
+        print(f"aviso ao exec: {wake['status']}" + (f" ({wake['reason']})" if wake.get("reason") else ""))
 
 
 def run(args, scope):
@@ -407,7 +445,11 @@ def run(args, scope):
             gate = migration.space_gate_message(agent_root, args.slug)
             if gate:
                 raise RuntimeError(gate)
-            sys.exit(complement.run(argparse.Namespace(**globals()), args, cwd))
+            code = complement.run(argparse.Namespace(**globals()), args, cwd)
+            # O complemento tambem conclui rodada: acorda o exec (nao altera o resultado). O aviso roda em
+            # main(), DEPOIS de a reserva do space ser solta (a espera pelo exec pode levar minutos).
+            _PENDING_WAKE.update(round_dir=os.path.abspath(args.complementar), silent=True)
+            sys.exit(code)
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"erro: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -837,6 +879,9 @@ def run(args, scope):
     if review_status == "parcial":
         print("Revisor faltante deve ser repetido, ou a pendência levada ao Breno; parcial nunca aprova.")
     print(f"\nround dir: {round_dir}")
+    # Acorda o exec dono da rodada (ele esta parado esperando o ciclo do vigia). Nao altera o exit code.
+    # O aviso roda em main(), depois de soltar a reserva do space (a espera pelo exec pode levar minutos).
+    _PENDING_WAKE.update(round_dir=round_dir, silent=False)
     sys.exit(exit_code)
 
 

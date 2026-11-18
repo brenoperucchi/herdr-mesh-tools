@@ -180,7 +180,13 @@ def herdr_argv(*args):
 
 
 class DeliveryRefusedError(RuntimeError):
-    """A rejected read-only guard must never trigger draft-clearing cleanup."""
+    """A rejected read-only guard must never trigger draft-clearing cleanup.
+
+    `code` guarda o codigo de saida do herdr-can-send quando a recusa veio dele (3 = agent working)."""
+
+    def __init__(self, message="", code=None):
+        super().__init__(message)
+        self.code = code
 
 
 class GroupBindingRefusedError(DeliveryRefusedError):
@@ -200,7 +206,7 @@ def require_can_send(name, *, expected_pane=None):
     if result.returncode != 0:
         raise DeliveryRefusedError(
             f"herdr-can-send {name}: código {result.returncode}; envio recusado: "
-            f"{(result.stdout or result.stderr).strip()}"
+            f"{(result.stdout or result.stderr).strip()}", code=result.returncode,
         )
     if expected_pane is not None:
         try:
