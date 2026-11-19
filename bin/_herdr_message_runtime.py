@@ -11,7 +11,7 @@ import subprocess
 from contextlib import contextmanager
 
 import _herdr_dispatch as core
-from _herdr_message_ledger import MessageError, encode, endpoint, same_endpoint
+from _herdr_message_ledger import MessageError, REQUEST_SEND_TIMEOUT, encode, endpoint, human_duration, same_endpoint
 
 CONTEXT_KEYS = {'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SOCKET_PATH', 'HERDR_CONFIG_PATH',
                 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID'}
@@ -246,7 +246,7 @@ class Runtime:
         return 'submitted', None
 
 
-def envelope(message, reply_command=None):
+def envelope(message, reply_command=None, now=None):
     kind = message['kind']
     mid = message['id']
     sender = message['sender']['name']
@@ -263,7 +263,10 @@ def envelope(message, reply_command=None):
             'O comando salva e devolve o controle; não use --wait ou sleep para aguardar a origem.')
     else:
         instruction = 'Mensagem sem obrigação de resposta; não gere cobrança nem novo pedido automaticamente.'
+    # A notice can wait up to 24 h for a busy pane: say how old it is, so a late "done" is not read as current.
+    late = (f'[entrega atrasada: enviada há {human_duration(now - message["created"])}]\n'
+            if now is not None and now - message['created'] > REQUEST_SEND_TIMEOUT else '')
     return (f'[de {sender} para {message["destination"]["name"]}] '
             f'Assunto: {message["subject"]}\n'
             f'[herdr-message id={mid} tipo={kind} pedido={message["request_id"] or mid}]\n'
-            f'{message["body"]}\n\n{instruction}')
+            f'{late}{message["body"]}\n\n{instruction}')

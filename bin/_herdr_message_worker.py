@@ -4,8 +4,22 @@ import os
 import signal
 import time
 
-from _herdr_message_ledger import MessageError, same_endpoint
+from _herdr_message_ledger import MessageError, human_duration, same_endpoint
 from _herdr_message_runtime import envelope, file_lock
+
+
+def failure_text(req, last_wait=None):
+    """What the sender needs to act: which message, to whom, why, and that nobody received it."""
+    subject = ' '.join(req['subject'].split())
+    if len(subject) > 120:
+        subject = subject[:117] + '...'
+    reason = req['reason'] or 'motivo desconhecido'
+    if reason == 'delivery_deadline_exceeded':
+        span = human_duration(req['send_deadline'] - req['created'])
+        reason += (f' (prazo de {span}; último motivo de espera: {last_wait})' if last_wait
+                   else f' (prazo de {span} sem nenhuma tentativa de entrega)')
+    return (f'Falha de entrega {req["id"]}: a mensagem "{subject}" para {req["destination"]["name"]} '
+            f'NÃO foi entregue: {reason}. O destinatário não recebeu; reenvie com uma --key nova se ainda valer.')
 
 
 def owner():
@@ -37,16 +51,26 @@ class Worker:
     def __init__(self, db, runtime, *, clock=time.time, grace=20):
         self.db, self.runtime, self.clock, self.grace = db, runtime, clock, grace
         self.mode = 'unmanaged'
+        self._refused = None  # per-tick cache of destination refusals; only set inside tick()
         db.db.execute('CREATE INDEX IF NOT EXISTS monitor_messages ON messages(request_id,kind)')
+        db.db.execute('CREATE INDEX IF NOT EXISTS events_message ON events(message_id,event)')
+        # Serves the "recipient already has an open request" lookups of deliver and delivery_batch.
+        db.db.execute("CREATE INDEX IF NOT EXISTS open_requests ON messages(destination) "
+                      "WHERE kind='request' AND transport='submitted' AND response='awaiting_reply'")
 
     def monitor(self):
         db, now = self.db, self.clock()
+        # Failed notices are reported only if their failure was recorded after the cutoff set at the
+        # first tick (under the worker lock) on this ledger: history before it is not announced.
+        # Without a cutoff (monitor called outside a tick) no notice failure is reported.
+        cutoff = int(db.meta('failure_notice_after_seq') or 2**62)
         ids = [r[0] for r in db.db.execute("""SELECT q.id FROM messages q
-            WHERE q.kind='request' AND q.requires_reply=1 AND (
+            WHERE q.kind='request' AND (q.requires_reply=1 OR (q.transport='failed' AND EXISTS (
+                SELECT 1 FROM events f WHERE f.message_id=q.id AND f.event='failed' AND f.seq>?))) AND (
                 (q.transport='submitted' AND q.response='awaiting_reply') OR (
                     NOT EXISTS (SELECT 1 FROM messages n WHERE n.request_id=q.id AND n.kind='notice')
                     AND ((q.transport IN ('unknown','failed') AND q.response NOT IN ('reply_recorded','reply_submitted'))
-                        OR EXISTS (SELECT 1 FROM messages r WHERE r.request_id=q.id AND r.kind='reply' AND r.transport IN ('unknown','failed')))))""")]
+                        OR EXISTS (SELECT 1 FROM messages r WHERE r.request_id=q.id AND r.kind='reply' AND r.transport IN ('unknown','failed')))))""", (cutoff,))]
         for mid in ids:
             req = db.get(mid)
             if req['response'] in ('reply_recorded', 'reply_submitted'):
@@ -58,7 +82,7 @@ class Worker:
                 self.notice(mid, 'Resultado de envio desconhecido; a tarefa não será reenviada automaticamente.')
                 continue
             if req['transport'] == 'failed':
-                self.notice(mid, 'Falha de entrega do pedido; consulte herdr-message status ' + mid)
+                self.notice(mid, failure_text(req, db.last_deferred_reason(mid)))
                 continue
             if req['transport'] != 'submitted':
                 continue
@@ -111,6 +135,14 @@ class Worker:
         with self.db.transaction():
             self._notice(mid, body, self.clock())
 
+    def _refuse(self, mid, message, reason, now, *, cached=False):
+        if reason == 'endpoint_changed':
+            self.db.fail(mid, reason, now=now)
+            return
+        if message['kind'] != 'reply' and reason == 'origin_busy':
+            reason = 'target_busy'
+        self.db.defer(mid, reason, now=now, touch=not cached)
+
     def deliver(self, mid):
         db, now = self.db, self.clock()
         message = db.get(mid)
@@ -131,21 +163,25 @@ class Worker:
             if other:
                 db.defer(mid, 'recipient_has_open_request', now=now)
                 return
+        destination = json.dumps(message['destination'], sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+        # One refusal per destination per tick: other messages queued for the same
+        # endpoint reuse it instead of reading the same pane again.
         try:
+            # Inside the guard: a reply recorded meanwhile makes defer/fail raise MessageError.
+            if self._refused is not None and destination in self._refused:
+                self._refuse(mid, message, self._refused[destination], now, cached=True)
+                return
             with self.runtime.reservation(message['destination']):
                 allowed, reason, _ = self.runtime.prepare(message['destination'])
                 if not allowed:
-                    if reason == 'endpoint_changed':
-                        db.fail(mid, reason, now=now)
-                    else:
-                        if message['kind'] != 'reply' and reason == 'origin_busy':
-                            reason = 'target_busy'
-                        db.defer(mid, reason, now=now)
+                    if self._refused is not None:
+                        self._refused[destination] = reason
+                    self._refuse(mid, message, reason, now)
                     return
                 token = db.begin(mid, now=self.clock())
                 # Intent is committed before the only externally effectful call.
                 reply_command = self.runtime.reply_command(db.directory, mid) if message['kind'] == 'request' and message['requires_reply'] else None
-                outcome, detail = self.runtime.submit(message['destination'], envelope(message, reply_command))
+                outcome, detail = self.runtime.submit(message['destination'], envelope(message, reply_command, now))
                 db.finish(mid, token, outcome, now=self.clock(), reason=detail)
         except MessageError:
             # If intent exists, preserving in_flight is deliberate: next exclusive
@@ -154,12 +190,26 @@ class Worker:
                 db.defer(mid, 'reservation_or_observation_unavailable', now=now)
 
     def tick(self):
+        self.db.mark_failure_cutoff()  # first tick only; ticks run under the worker lock
         self.db.heartbeat({**owner(), 'mode': self.mode}, self.clock())
         self.monitor()
-        batch = [row[0] for row in self.db.db.execute("SELECT id FROM messages WHERE transport IN ('queued','deferred') ORDER BY updated,created,id LIMIT 50")]
-        for mid in batch:
-            self.db.heartbeat({**owner(), 'mode': self.mode}, self.clock())
-            self.deliver(mid)
+        # Expire first: a request deep in a long queue must not outlive its deadline unseen.
+        for mid in self.db.overdue_deliveries(self.clock()):
+            try:
+                self.deliver(mid)
+            except MessageError:
+                pass  # a reply recorded meanwhile already settled it
+        batch = self.db.delivery_batch(50)
+        self._refused = {}
+        try:
+            for mid in batch:
+                self.db.heartbeat({**owner(), 'mode': self.mode}, self.clock())
+                try:
+                    self.deliver(mid)
+                except MessageError:
+                    pass  # settled meanwhile (e.g. a reply recorded between the read and the write)
+        finally:
+            self._refused = None
         # Detect newly unknown/failed requests without waiting another full tick.
         self.monitor()
         self.db.heartbeat({**owner(), 'mode': self.mode}, self.clock())

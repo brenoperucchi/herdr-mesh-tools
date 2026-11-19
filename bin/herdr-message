@@ -13,6 +13,19 @@ from _herdr_message_runtime import Runtime
 from _herdr_message_worker import Worker, healthy
 
 
+# health --deferred: o observador vê a fila de entregas só dos destinos do piloto; qualquer
+# outro caller provado vê apenas a própria. Mesma lista e mesma regra do `overdue`
+# (DECISAO-COORDENADOR-LEITURA-PEDIDOS-ATRASADOS-20261117-1843.txt, item 2: space fora da
+# lista nunca aparece, nem como contagem). Cópia da lista de 2026-11-17; ao integrar com o
+# `overdue`, apontar as duas para a mesma constante.
+DEFERRED_OBSERVER = 'cerebro-vigia'
+DEFERRED_PILOT_DESTINATIONS = frozenset((
+    'coordenador', 'cerebro-exec', 'lastro-rust-exec', 'nixofiscal-exec',
+    'khr-dre-exec', 'acervo-exec', 'agf-renda-exec', 'herdr-mesh-tools-exec',
+    'trading-exec', 'mfc-exec',
+))
+
+
 def body(args):
     if args.file:
         p = Path(args.file)
@@ -42,7 +55,11 @@ def execute(args, db, runtime):
         Worker(db, runtime).run(once=True)
         return dict(code='reconciled')
     if args.command == 'health':
-        return dict(code='worker_healthy' if healthy(db) else 'worker_unavailable')
+        result = dict(code='worker_healthy' if healthy(db) else 'worker_unavailable')
+        if args.deferred:
+            # Counts and ages only; needs a proven caller, unlike plain health.
+            result['deferred'] = db.deferred_summary(runtime.caller(), DEFERRED_OBSERVER, DEFERRED_PILOT_DESTINATIONS)
+        return result
     caller = runtime.caller()
     if args.command == 'send':
         if not healthy(db):
@@ -82,7 +99,8 @@ def main(argv=None):
     send.add_argument('--subject', required=True)
     send.add_argument('--key', required=True, help='stable unique key; repeat only for the same frozen request')
     send.add_argument('--notice', action='store_true', help='no reply obligation')
-    send.add_argument('--send-timeout', type=float, default=900)
+    send.add_argument('--send-timeout', type=float, default=None,
+                      help='delivery deadline in seconds; default 900 for a request, 86400 for --notice')
     send.add_argument('--reply-timeout', type=float, default=900)
     reply = commands.add_parser('reply', help='persist final reply without waiting for origin')
     reply.add_argument('id')
@@ -99,7 +117,9 @@ def main(argv=None):
     worker = commands.add_parser('worker', help='foreground entrypoint for an approved supervisor, not for caller-side waiting')
     worker.add_argument('--interval', type=float, default=2)
     commands.add_parser('reconcile', help='one exclusive reconciliation pass; no service installation')
-    commands.add_parser('health', help='supervisor health; no message bodies')
+    health = commands.add_parser('health', help='supervisor health; no message bodies')
+    health.add_argument('--deferred', action='store_true',
+                        help='add deferred deliveries per destination (count and oldest age); needs a proven caller; the observer sees pilot destinations only')
     args = parser.parse_args(argv)
     try:
         if args.socket:

@@ -43,6 +43,21 @@ def positive(value):
     return value
 
 
+# Prazo de entrega: pedido com resposta vence em 15 min e o remetente é avisado;
+# --notice (sem resposta) espera 24 h, o bastante para um pane parado numa caixa de
+# diálogo por horas, e ao vencer o remetente também é avisado (worker.monitor).
+REQUEST_SEND_TIMEOUT = 900
+NOTICE_SEND_TIMEOUT = 24 * 3600
+
+
+def human_duration(seconds):
+    minutes = max(1, round(seconds / 60))
+    if minutes < 120:
+        return f'{minutes} min'
+    hours, rest = divmod(minutes, 60)
+    return f'{hours} h' + (f' {rest} min' if rest else '')
+
+
 def text(value, limit, label):
     if not isinstance(value, str) or not value.strip() or '\x00' in value or len(value.encode()) > limit:
         raise MessageError(f'invalid {label}')
@@ -125,6 +140,15 @@ class Ledger:
         row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
         return row[0] if row else None
 
+    def mark_failure_cutoff(self):
+        """Remember the last event sequence at first activation: only failures recorded after it
+        are announced. Ordered by the ledger's own sequence, not by the wall clock."""
+        if self.meta('failure_notice_after_seq') is not None:
+            return  # already set: no write transaction per tick
+        with self.transaction():
+            self.db.execute("INSERT OR IGNORE INTO meta SELECT 'failure_notice_after_seq', "
+                            "CAST(COALESCE(MAX(seq),0) AS TEXT) FROM events")
+
     def heartbeat(self, owner, now=None):
         with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
@@ -174,8 +198,10 @@ class Ledger:
         return self.get(mid)
 
     def send(self, sender, destination, subject, body, key, *, now=None,
-             requires_reply=True, send_timeout=900, reply_timeout=900):
+             requires_reply=True, send_timeout=None, reply_timeout=900):
         now = time.time() if now is None else now
+        if send_timeout is None:
+            send_timeout = REQUEST_SEND_TIMEOUT if requires_reply else NOTICE_SEND_TIMEOUT
         with self.transaction():
             return self._insert(sender, destination, subject, body, key, now,
                                 send_timeout, reply_timeout, requires_reply)
@@ -222,6 +248,47 @@ class Ledger:
         return self._insert(sender, dest, 'Conversation status', body, f'{kind}:{request_id}',
                             now, 900, 900, False, kind, request_id)
 
+    def deferred_summary(self, viewer, observer, visible, *, now=None):
+        """Per destination: how many messages wait for delivery and the age of the oldest.
+
+        Metadata only (no sender, subject or body). The observer sees only the destinations
+        in `visible`; any other proven caller sees only its own queue.
+        """
+        if not isinstance(viewer, dict) or not isinstance(viewer.get('name'), str):
+            raise MessageError('identity_unproven: caller missing')
+        now = time.time() if now is None else now
+        rows = self.db.execute("""SELECT json_extract(destination,'$.name') AS name, COUNT(*) AS n, MIN(created) AS oldest
+            FROM messages WHERE transport IN ('queued','deferred') GROUP BY name""").fetchall()
+        result = [dict(destination=r['name'], deferred=r['n'], oldest_age_seconds=max(0, int(now - r['oldest'])))
+                  for r in rows if r['name'] == viewer['name'] or (viewer['name'] == observer and r['name'] in visible)]
+        return sorted(result, key=lambda r: (-r['oldest_age_seconds'], r['destination']))
+
+    def delivery_batch(self, limit=50):
+        """Oldest first within each destination, so a long queue is never delivered out of order.
+
+        A request that cannot be submitted because another request to the same endpoint still
+        awaits its reply (the `recipient_has_open_request` rule in Worker.deliver) goes after the
+        messages that can: it must not hold the head of the queue ahead of a ready reply or notice.
+        """
+        return [r[0] for r in self.db.execute("""SELECT id FROM (
+            SELECT id, updated, created, ROW_NUMBER() OVER (PARTITION BY destination
+                ORDER BY blocked, created, id) AS position
+            FROM (SELECT m.id, m.updated, m.created, m.destination,
+                    (m.kind='request' AND m.requires_reply=1 AND EXISTS (
+                        SELECT 1 FROM messages o WHERE o.destination=m.destination AND o.id!=m.id
+                        AND o.kind='request' AND o.transport='submitted' AND o.response='awaiting_reply')) AS blocked
+                  FROM messages m WHERE m.transport IN ('queued','deferred')))
+            ORDER BY position, updated, created, id LIMIT ?""", (limit,))]
+
+    def overdue_deliveries(self, now):
+        return [r[0] for r in self.db.execute("""SELECT id FROM messages WHERE transport IN ('queued','deferred')
+            AND kind NOT IN ('reply','notice') AND send_deadline <= ? ORDER BY created,id""", (now,))]
+
+    def last_deferred_reason(self, mid):
+        row = self.db.execute("SELECT detail FROM events WHERE message_id=? AND event='deferred' ORDER BY seq DESC LIMIT 1",
+                              (mid,)).fetchone()
+        return row[0] if row else None
+
     def pending(self):
         return [r[0] for r in self.db.execute("SELECT id FROM messages WHERE transport IN ('queued','deferred') ORDER BY created,id")]
 
@@ -261,9 +328,15 @@ class Ledger:
                                     (now, m['request_id']))
             self.event(mid, outcome, now, reason)
 
-    def defer(self, mid, reason, *, now):
+    def defer(self, mid, reason, *, now, touch=True):
+        """`touch=False` is for a refusal copied from the destination's cache in the same tick:
+        nothing was observed for this message, so an unchanged deferral is not rewritten.
+        A real observation always refreshes `updated`; that is what rotates destinations in
+        delivery_batch when more of them are waiting than fit in a batch."""
         with self.transaction():
             before = self.get(mid)
+            if not touch and before['transport'] == 'deferred' and before['reason'] == reason:
+                return
             cursor = self.db.execute("UPDATE messages SET transport='deferred',reason=?,updated=? WHERE id=? AND transport IN ('queued','deferred')",
                                      (reason, now, mid))
             if cursor.rowcount != 1:
